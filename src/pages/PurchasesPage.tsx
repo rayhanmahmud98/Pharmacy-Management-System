@@ -1,6 +1,14 @@
 import React, { useEffect, useState } from 'react';
-import { Plus, RotateCcw } from 'lucide-react';
-import { apiFetch, formatBDT, formatQty } from '../lib/api';
+import Decimal from 'decimal.js';
+import { Plus, RotateCcw, Search } from 'lucide-react';
+import {
+  apiFetch,
+  checkStrictDecimalInput,
+  formatBDT,
+  formatQty,
+  getDisplayCurrencySymbol,
+  newIdempotencyKey,
+} from '../lib/api';
 import { ReasonPromptModal } from '../components/ActionModals';
 import type { AuthUser, Medicine } from '../types';
 
@@ -50,9 +58,11 @@ interface Props {
 
 export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
   const [purchases, setPurchases] = useState<PurchaseRecord[]>([]);
+  const [search, setSearch] = useState('');
   const [medicines, setMedicines] = useState<Medicine[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [showNew, setShowNew] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [returnTarget, setReturnTarget] = useState<PurchaseRecord | null>(null);
   const [returnQuantities, setReturnQuantities] = useState<Record<string, string>>({});
   const [returnSettlement, setReturnSettlement] = useState<'SUPPLIER_CREDIT' | 'CASH_REFUND' | 'BANK_REFUND'>('SUPPLIER_CREDIT');
@@ -61,7 +71,6 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
-  // New purchase state
   const [supplierId, setSupplierId] = useState('');
   const [supplierInv, setSupplierInv] = useState('');
   const [status, setStatus] = useState<'DRAFT' | 'RECEIVED'>('RECEIVED');
@@ -76,11 +85,12 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
     unitCost: '',
     sellingPricePerBase: '',
   });
-  const [draftLines, setDraftLines] = useState<Array<typeof lineForm & { label: string; unitLabel: string; conv: number }>>([]);
+  const [draftLines, setDraftLines] = useState<Array<typeof lineForm & { label: string; unitLabel: string; conv: string }>>([]);
+  const currencySym = getDisplayCurrencySymbol();
 
-  async function load() {
+  async function load(q = search) {
     const [purRes, medRes, partyRes] = await Promise.all([
-      apiFetch<{ purchases: PurchaseRecord[] }>('/api/purchases'),
+      apiFetch<{ purchases: PurchaseRecord[] }>(`/api/purchases?search=${encodeURIComponent(q)}`),
       apiFetch<{ medicines: Medicine[] }>('/api/medicines'),
       apiFetch<{ suppliers: Supplier[] }>('/api/parties'),
     ]);
@@ -96,7 +106,7 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
   }
 
   useEffect(() => {
-    load().catch((e) => setError(e.message));
+    load('').catch((e) => setError(e.message));
   }, []);
 
   function addLineToDraft() {
@@ -107,6 +117,21 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
       setError('Fill batch number, unit cost, and selling price per base unit');
       return;
     }
+    const qErr = checkStrictDecimalInput(lineForm.quantityInput, 'qty', 'Purchase quantity');
+    if (qErr) {
+      setError(qErr);
+      return;
+    }
+    const cErr = checkStrictDecimalInput(lineForm.unitCost, 'currency', 'Cost per purchase unit', { allowZero: true });
+    if (cErr) {
+      setError(cErr);
+      return;
+    }
+    const sErr = checkStrictDecimalInput(lineForm.sellingPricePerBase, 'currency', 'Selling price per base unit');
+    if (sErr) {
+      setError(sErr);
+      return;
+    }
     setError('');
     setDraftLines((prev) => [
       ...prev,
@@ -114,7 +139,7 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
         ...lineForm,
         label: `${med.brand_name} ${med.strength}`,
         unitLabel: unit.unit_name,
-        conv: Number(unit.conversion_to_base),
+        conv: unit.conversion_to_base,
       },
     ]);
     setLineForm((prev) => ({ ...prev, batchNumber: '', quantityInput: '1', unitCost: '', sellingPricePerBase: '' }));
@@ -126,10 +151,19 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
       setError('Add at least one medicine line first');
       return;
     }
+    if (status === 'RECEIVED') {
+      const pErr = checkStrictDecimalInput(paidAmount || '0', 'currency', 'Paid amount', { allowZero: true });
+      if (pErr) {
+        setError(pErr);
+        return;
+      }
+    }
     setError('');
+    setSubmitting(true);
     try {
       const res = await apiFetch<{ purchaseNumber: string }>('/api/purchases', {
         method: 'POST',
+        headers: { 'Idempotency-Key': newIdempotencyKey() },
         body: JSON.stringify({
           supplierId,
           supplierInvoiceNo: supplierInv,
@@ -147,6 +181,8 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Purchase failed');
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -155,6 +191,7 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
     try {
       await apiFetch(`/api/purchases/${p.id}/receive`, {
         method: 'POST',
+        headers: { 'Idempotency-Key': newIdempotencyKey() },
         body: JSON.stringify({ paidAmount: '0', paymentMethod: 'CASH' }),
       });
       setNotice(`Purchase ${p.purchase_number} received into active batch inventory.`);
@@ -162,10 +199,6 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Receive failed');
     }
-  }
-
-  function handleReversePurchase(p: PurchaseRecord) {
-    setReverseTarget(p);
   }
 
   async function confirmReversePurchase(reason: string) {
@@ -194,6 +227,7 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
     try {
       const res = await apiFetch<{ returnNumber: string }>('/api/purchase-returns', {
         method: 'POST',
+        headers: { 'Idempotency-Key': newIdempotencyKey() },
         body: JSON.stringify({
           purchaseId: returnTarget.id,
           settlementType: returnSettlement,
@@ -218,22 +252,37 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold text-slate-900">Purchase Management & Supplier Returns</h1>
+          <h1 className="text-xl font-bold text-slate-900">Purchase Management &amp; Supplier Returns</h1>
           <p className="text-xs text-slate-500">
             Receive supplier stock into batch-wise inventory using medicine-specific manual purchase units.
           </p>
         </div>
-        {user.permissions['purchases.create'] && (
-          <button
-            type="button"
-            disabled={!writable}
-            onClick={() => setShowNew(true)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
-          >
-            <Plus className="w-4 h-4" />
-            New Purchase
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          <div className="relative">
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" />
+            <input
+              type="text"
+              placeholder="Search PO #, invoice #, supplier..."
+              value={search}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                load(e.target.value);
+              }}
+              className="pl-8 pr-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white w-56"
+            />
+          </div>
+          {user.permissions['purchases.create'] && (
+            <button
+              type="button"
+              disabled={!writable}
+              onClick={() => setShowNew(true)}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
+            >
+              <Plus className="w-4 h-4" />
+              New Purchase
+            </button>
+          )}
+        </div>
       </div>
 
       {error && <div className="p-3 bg-red-50 border border-red-200 text-red-800 rounded-md text-xs">{error}</div>}
@@ -303,7 +352,7 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
                     <button
                       type="button"
                       disabled={!writable}
-                      onClick={() => handleReversePurchase(p)}
+                      onClick={() => setReverseTarget(p)}
                       className="text-red-700 hover:underline font-medium"
                     >
                       Reverse
@@ -315,7 +364,7 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
             {purchases.length === 0 && (
               <tr>
                 <td colSpan={8} className="px-4 py-8 text-center text-slate-500">
-                  No purchases recorded yet. Click New Purchase to receive inventory.
+                  No purchases matched or recorded yet.
                 </td>
               </tr>
             )}
@@ -323,7 +372,6 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
         </table>
       </div>
 
-      {/* New Purchase Modal */}
       {showNew && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
           <form
@@ -407,27 +455,24 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
                   className="px-2 py-1.5 border border-slate-300 rounded font-mono-num"
                 />
                 <input
-                  type="number"
-                  step="0.01"
-                  min="0.01"
+                  type="text"
+                  inputMode="decimal"
                   placeholder="Qty"
                   value={lineForm.quantityInput}
                   onChange={(e) => setLineForm({ ...lineForm, quantityInput: e.target.value })}
                   className="px-2 py-1.5 border border-slate-300 rounded font-mono-num"
                 />
                 <input
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  placeholder="Cost / Purchase Unit (৳)"
+                  type="text"
+                  inputMode="decimal"
+                  placeholder={`Cost / Purchase Unit (${currencySym})`}
                   value={lineForm.unitCost}
                   onChange={(e) => setLineForm({ ...lineForm, unitCost: e.target.value })}
                   className="px-2 py-1.5 border border-slate-300 rounded font-mono-num"
                 />
                 <input
-                  type="number"
-                  step="0.01"
-                  min="0.01"
+                  type="text"
+                  inputMode="decimal"
                   placeholder={`Sell Price / ${selectedMedForForm?.base_unit_name || 'Base'}`}
                   value={lineForm.sellingPricePerBase}
                   onChange={(e) => setLineForm({ ...lineForm, sellingPricePerBase: e.target.value })}
@@ -449,7 +494,7 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
                   <tr>
                     <th className="text-left px-3 py-2">Medicine</th>
                     <th className="text-left px-3 py-2">Batch / Exp</th>
-                    <th className="text-right px-3 py-2">Qty & Unit</th>
+                    <th className="text-right px-3 py-2">Qty &amp; Unit</th>
                     <th className="text-right px-3 py-2">Line Cost</th>
                   </tr>
                 </thead>
@@ -459,10 +504,10 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
                       <td className="px-3 py-2 font-medium">{dl.label}</td>
                       <td className="px-3 py-2 font-mono-num">{dl.batchNumber} · {dl.expiryDate}</td>
                       <td className="px-3 py-2 text-right font-mono-num">
-                        {dl.quantityInput} {dl.unitLabel} ({Number(dl.quantityInput) * dl.conv} base)
+                        {dl.quantityInput} {dl.unitLabel} ({formatQty(new Decimal(dl.quantityInput).mul(new Decimal(dl.conv)).toFixed(6))} base)
                       </td>
                       <td className="px-3 py-2 text-right font-mono-num">
-                        {formatBDT(Number(dl.quantityInput) * Number(dl.unitCost))}
+                        {formatBDT(new Decimal(dl.quantityInput).mul(new Decimal(dl.unitCost)).toFixed(2))}
                       </td>
                     </tr>
                   ))}
@@ -473,11 +518,10 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
             {status === 'RECEIVED' && (
               <div className="grid grid-cols-2 gap-3 text-xs">
                 <div>
-                  <label className="block text-slate-600 mb-1">Paid Amount Now (৳)</label>
+                  <label className="block text-slate-600 mb-1">Paid Amount Now ({currencySym})</label>
                   <input
-                    type="number"
-                    step="0.01"
-                    min="0"
+                    type="text"
+                    inputMode="decimal"
                     value={paidAmount}
                     onChange={(e) => setPaidAmount(e.target.value)}
                     className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num"
@@ -502,15 +546,18 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
               <button type="button" onClick={() => setShowNew(false)} className="px-4 py-2 text-xs bg-slate-100 rounded-md">
                 Cancel
               </button>
-              <button type="submit" className="px-5 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md">
-                {status === 'RECEIVED' ? 'Receive Purchase Atomically' : 'Save Purchase Draft'}
+              <button
+                type="submit"
+                disabled={submitting}
+                className="px-5 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
+              >
+                {submitting ? 'Saving...' : status === 'RECEIVED' ? 'Receive Purchase Atomically' : 'Save Purchase Draft'}
               </button>
             </div>
           </form>
         </div>
       )}
 
-      {/* Purchase Return Modal */}
       {returnTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
           <form onSubmit={handleReturnSubmit} className="bg-white border border-slate-200 rounded-lg w-full max-w-2xl p-6 space-y-4">
@@ -527,10 +574,8 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
                     </div>
                   </div>
                   <input
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    max={Number(l.batch_current_qty || 0)}
+                    type="text"
+                    inputMode="decimal"
                     placeholder={`Return (${l.base_unit_name})`}
                     value={returnQuantities[l.id] || ''}
                     onChange={(e) => setReturnQuantities({ ...returnQuantities, [l.id]: e.target.value })}

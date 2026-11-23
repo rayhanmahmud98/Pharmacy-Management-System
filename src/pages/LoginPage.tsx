@@ -35,16 +35,21 @@ export const LoginPage: React.FC<Props> = ({ settings, onLoggedIn }) => {
       <div className="w-full max-w-md bg-white border border-slate-200 rounded-lg p-8">
         <div className="mb-6">
           <div className="flex items-center gap-2.5 text-teal-700 mb-2">
-            <ShieldCheck className="w-6 h-6" />
+            {settings?.logo_data_url ? (
+              <img
+                src={settings.logo_data_url}
+                alt={settings.pharmacy_name}
+                className="w-8 h-8 object-contain rounded"
+              />
+            ) : (
+              <ShieldCheck className="w-6 h-6" />
+            )}
             <span className="text-xl font-bold tracking-tight text-slate-900">
-              {settings?.pharmacy_name || 'Dhaka Care Pharmacy'}
+              {settings?.pharmacy_name || 'MediNest'}
             </span>
           </div>
-          {settings?.pharmacy_name_bn && (
-            <p className="text-sm text-slate-600">{settings.pharmacy_name_bn}</p>
-          )}
           <p className="text-xs text-slate-500 mt-1">
-            Offline-First Pharmacy Management System · Localhost Workstation
+            MediNest Pharmacy Management System · Local &amp; LAN Workstation
           </p>
         </div>
 
@@ -100,7 +105,7 @@ export const LoginPage: React.FC<Props> = ({ settings, onLoggedIn }) => {
         </form>
 
         <div className="mt-6 pt-5 border-t border-slate-200">
-          <p className="text-xs font-medium text-slate-500 mb-2">Workstation Accounts (Role Testing)</p>
+          <p className="text-xs font-medium text-slate-500 mb-2">Quick Workstation Role Switch</p>
           <div className="grid grid-cols-3 gap-2">
             {[
               { label: 'Admin', u: 'admin', p: 'Admin@123' },

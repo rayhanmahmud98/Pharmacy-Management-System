@@ -8,22 +8,29 @@ export interface AuthUser {
   roleName: string;
   isSuperAdmin: boolean;
   isActive: boolean;
+  mustChangePassword?: boolean;
+  lastLoginAt?: string | null;
   permissions: Record<string, boolean>;
 }
 
 export interface PharmacySettings {
   id: number;
   pharmacy_name: string;
-  pharmacy_name_bn: string;
   drug_license_no: string;
   address: string;
   phone: string;
   email: string;
+  website: string;
+  currency: string;
+  currency_symbol: string;
+  timezone: string;
+  default_low_stock_threshold: string;
+  session_timeout_minutes: number;
   logo_data_url: string;
   receipt_footer: string;
   expiry_warning_days: number;
   backup_retention_count: number;
-  printer_type: 'THERMAL_80MM' | 'A4';
+  printer_type: 'A5' | 'THERMAL_80MM' | 'A4';
   setup_completed: number;
 }
 
@@ -68,17 +75,21 @@ export interface Batch {
   initial_qty_base: string;
   current_qty_base: string;
   base_unit_name: string;
-  status: 'ACTIVE' | 'QUARANTINED' | 'EXPIRED' | 'WRITTEN_OFF' | 'INACTIVE';
+  status: 'ACTIVE' | 'QUARANTINED' | 'EXPIRED' | 'WRITTEN_OFF' | 'INACTIVE' | 'DEPLETED' | 'DAMAGED';
   brand_name?: string;
   generic_name?: string;
   strength?: string;
+  medicine_code?: string;
+  barcode?: string;
+  storage_info?: string;
 }
 
 export interface Medicine {
   id: string;
+  medicine_code: string;
+  barcode: string;
   brand_name: string;
   generic_name: string;
-  bangla_name: string;
   alternative_names: string;
   strength: string;
   dosage_form: string;
@@ -86,6 +97,7 @@ export interface Medicine {
   category_name: string | null;
   manufacturer_id: string | null;
   manufacturer_name: string | null;
+  storage_info: string;
   description: string;
   base_unit_name: string;
   min_stock_level: string;
@@ -101,9 +113,10 @@ export interface Medicine {
 export interface SaleLineDetail {
   id: string;
   medicine_id: string;
+  medicine_code?: string;
+  barcode?: string;
   brand_name: string;
   generic_name: string;
-  bangla_name: string;
   strength: string;
   base_unit_name: string;
   unit_name_snapshot: string;

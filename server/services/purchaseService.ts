@@ -1,8 +1,19 @@
 import Decimal from 'decimal.js';
-import { generateDocNumber, getDb, nowIso, todayDate, uuid, withTransaction } from '../db.ts';
+import { generateDocNumber, nowIso, todayDate, uuid, withTransaction } from '../db.ts';
 import { recordAudit } from '../audit.ts';
 import type { AuthUser } from '../auth.ts';
-import { computeInvoiceTotals, computeLineTotals, d, money, qty } from '../../src/shared/decimalMath.ts';
+import {
+  computeInvoiceTotals,
+  computeLineTotals,
+  d,
+  money,
+  qty,
+  roundCost6,
+  roundMoney,
+  roundQty,
+  validateCurrencyInput,
+  validateQuantityInput,
+} from '../../src/shared/decimalMath.ts';
 import { getActiveCashSessionId } from './financeService.ts';
 
 export interface PurchaseLineInput {
@@ -34,6 +45,10 @@ export function createPurchase(
   if (!input.lines || input.lines.length === 0) throw new Error('At least one purchase line is required');
   const today = todayDate();
   const pDate = input.purchaseDate || today;
+
+  if (input.status === 'RECEIVED' && input.paidAmount !== undefined) {
+    validateCurrencyInput(input.paidAmount, 'Paid amount', { allowZero: true });
+  }
 
   return withTransaction((tx) => {
     const supplier = tx.prepare('SELECT * FROM suppliers WHERE id = ? AND is_active = 1').get(input.supplierId) as
@@ -73,8 +88,9 @@ export function createPurchase(
         unitPriceOrCost: line.unitCost,
         discountAmount: line.lineDiscount || '0',
       });
-      const sellPrice = money(line.sellingPricePerBase);
-      if (sellPrice.lte(0)) throw new Error(`Selling price per base unit must be positive for ${med.brand_name}`);
+      const sellPrice = validateCurrencyInput(line.sellingPricePerBase, `Selling price for ${med.brand_name}`, {
+        allowZero: false,
+      });
 
       return {
         ...line,
@@ -82,7 +98,7 @@ export function createPurchase(
         unit,
         calc,
         sellPrice,
-        costPerBase: d(calc.netTotal).div(calc.quantityBase).toDecimalPlaces(4, Decimal.ROUND_HALF_UP),
+        costPerBase: roundCost6(d(calc.netTotal).div(calc.quantityBase)),
       };
     });
 
@@ -143,11 +159,11 @@ export function createPurchase(
 
         if (existingBatch) {
           batchId = existingBatch.id;
-          const newCur = qty(existingBatch.current_qty_base).add(l.calc.quantityBase).toFixed(4);
-          const newInit = qty(existingBatch.initial_qty_base).add(l.calc.quantityBase).toFixed(4);
+          const newCur = roundQty(qty(existingBatch.current_qty_base).add(l.calc.quantityBase)).toFixed(6);
+          const newInit = roundQty(qty(existingBatch.initial_qty_base).add(l.calc.quantityBase)).toFixed(6);
           tx.prepare(
             `UPDATE batches SET current_qty_base = ?, initial_qty_base = ?, purchase_cost_per_base = ?, selling_price_per_base = ?, updated_at = ? WHERE id = ?`
-          ).run(newCur, newInit, l.costPerBase.toFixed(4), l.sellPrice.toFixed(2), ts, batchId);
+          ).run(newCur, newInit, l.costPerBase.toFixed(6), l.sellPrice.toFixed(2), ts, batchId);
         } else {
           batchId = uuid();
           tx.prepare(
@@ -164,10 +180,10 @@ export function createPurchase(
             supplier.id,
             purchaseId,
             pDate,
-            l.costPerBase.toFixed(4),
+            l.costPerBase.toFixed(6),
             l.sellPrice.toFixed(2),
-            l.calc.quantityBase.toFixed(4),
-            l.calc.quantityBase.toFixed(4),
+            l.calc.quantityBase.toFixed(6),
+            l.calc.quantityBase.toFixed(6),
             l.med.base_unit_name,
             ts,
             ts
@@ -184,10 +200,10 @@ export function createPurchase(
           uuid(),
           l.med.id,
           batchId,
-          l.calc.quantityBase.toFixed(4),
+          l.calc.quantityBase.toFixed(6),
           purchaseId,
           plId,
-          l.costPerBase.toFixed(4),
+          l.costPerBase.toFixed(6),
           `Purchase ${purchaseNumber}`,
           user.id,
           ts
@@ -203,10 +219,10 @@ export function createPurchase(
         l.expiryDate,
         l.unit.id,
         l.unit.unit_name,
-        d(l.unit.conversion_to_base).toFixed(4),
-        qty(l.quantityInput).toFixed(4),
-        l.calc.quantityBase.toFixed(4),
-        money(l.unitCost).toFixed(2),
+        d(l.unit.conversion_to_base).toFixed(6),
+        validateQuantityInput(l.quantityInput, 'Quantity').toFixed(6),
+        l.calc.quantityBase.toFixed(6),
+        validateCurrencyInput(l.unitCost, 'Unit cost').toFixed(2),
         l.sellPrice.toFixed(2),
         l.calc.discount.toFixed(2),
         l.calc.netTotal.toFixed(2)
@@ -214,9 +230,8 @@ export function createPurchase(
     }
 
     if (input.status === 'RECEIVED') {
-      // Increase supplier payable by dueAmount
       if (totals.dueAmount.gt(0)) {
-        const nextBal = money(d(supplier.current_balance).add(totals.dueAmount)).toFixed(2);
+        const nextBal = roundMoney(d(supplier.current_balance).add(totals.dueAmount)).toFixed(2);
         tx.prepare('UPDATE suppliers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
           nextBal,
           ts,
@@ -291,6 +306,8 @@ export function receiveDraftPurchase(
   paidAmountStr = '0',
   paymentMethod: 'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD' | 'OTHER' = 'CASH'
 ) {
+  const paid = validateCurrencyInput(paidAmountStr || '0', 'Paid amount', { allowZero: true });
+
   return withTransaction((tx) => {
     const pur = tx.prepare('SELECT * FROM purchases WHERE id = ?').get(purchaseId) as
       | { id: string; purchase_number: string; supplier_id: string; status: string; net_total: string; purchase_date: string }
@@ -315,16 +332,15 @@ export function receiveDraftPurchase(
     const today = todayDate();
     const ts = nowIso();
     const netTotal = money(pur.net_total);
-    const paid = money(paidAmountStr || '0');
-    if (paid.lt(0) || paid.gt(netTotal)) throw new Error('Invalid paid amount');
-    const due = money(netTotal.sub(paid));
+    if (paid.gt(netTotal)) throw new Error('Paid amount cannot exceed purchase net total');
+    const due = roundMoney(netTotal.sub(paid));
 
     for (const l of lines) {
       if (l.expiry_date <= today) throw new Error(`Batch ${l.batch_number} is already expired (${l.expiry_date})`);
       const med = tx.prepare('SELECT base_unit_name FROM medicines WHERE id = ?').get(l.medicine_id) as {
         base_unit_name: string;
       };
-      const costPerBase = d(l.line_total).div(d(l.qty_base)).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+      const costPerBase = roundCost6(d(l.line_total).div(d(l.qty_base)));
       const existingBatch = tx
         .prepare('SELECT * FROM batches WHERE medicine_id = ? AND batch_number = ? AND expiry_date = ?')
         .get(l.medicine_id, l.batch_number, l.expiry_date) as
@@ -337,9 +353,9 @@ export function receiveDraftPurchase(
         tx.prepare(
           'UPDATE batches SET current_qty_base = ?, initial_qty_base = ?, purchase_cost_per_base = ?, selling_price_per_base = ?, updated_at = ? WHERE id = ?'
         ).run(
-          qty(existingBatch.current_qty_base).add(qty(l.qty_base)).toFixed(4),
-          qty(existingBatch.initial_qty_base).add(qty(l.qty_base)).toFixed(4),
-          costPerBase.toFixed(4),
+          roundQty(qty(existingBatch.current_qty_base).add(qty(l.qty_base))).toFixed(6),
+          roundQty(qty(existingBatch.initial_qty_base).add(qty(l.qty_base))).toFixed(6),
+          costPerBase.toFixed(6),
           l.selling_price_per_base,
           ts,
           batchId
@@ -360,10 +376,10 @@ export function receiveDraftPurchase(
           pur.supplier_id,
           purchaseId,
           pur.purchase_date,
-          costPerBase.toFixed(4),
+          costPerBase.toFixed(6),
           l.selling_price_per_base,
-          l.qty_base,
-          l.qty_base,
+          qty(l.qty_base).toFixed(6),
+          qty(l.qty_base).toFixed(6),
           med.base_unit_name,
           ts,
           ts
@@ -376,7 +392,7 @@ export function receiveDraftPurchase(
           id, medicine_id, batch_id, qty_change_base, movement_type, reference_type, reference_id, reference_line_id,
           cost_per_base_snapshot, reason, created_by, created_at
         ) VALUES (?, ?, ?, ?, 'PURCHASE_RECEIVED', 'PURCHASE', ?, ?, ?, ?, ?, ?)`
-      ).run(uuid(), l.medicine_id, batchId, l.qty_base, purchaseId, l.id, costPerBase.toFixed(4), `Received ${pur.purchase_number}`, user.id, ts);
+      ).run(uuid(), l.medicine_id, batchId, qty(l.qty_base).toFixed(6), purchaseId, l.id, costPerBase.toFixed(6), `Received ${pur.purchase_number}`, user.id, ts);
     }
 
     tx.prepare(
@@ -385,7 +401,7 @@ export function receiveDraftPurchase(
 
     if (due.gt(0)) {
       tx.prepare('UPDATE suppliers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-        money(d(supplier.current_balance).add(due)).toFixed(2),
+        roundMoney(d(supplier.current_balance).add(due)).toFixed(2),
         ts,
         supplier.id
       );
@@ -460,6 +476,10 @@ export function createPurchaseReturn(
   if (!input.reason?.trim()) throw new Error('Return reason is required');
   if (!input.lines?.length) throw new Error('At least one return line is required');
 
+  for (const item of input.lines) {
+    validateQuantityInput(item.qtyBase ?? '0', 'Return quantity', { allowZero: true });
+  }
+
   return withTransaction((tx) => {
     const pur = tx.prepare('SELECT * FROM purchases WHERE id = ?').get(input.purchaseId) as
       | { id: string; purchase_number: string; supplier_id: string; status: string }
@@ -487,12 +507,27 @@ export function createPurchaseReturn(
     }> = [];
 
     for (const item of input.lines) {
-      const qRet = qty(item.qtyBase);
+      const qRet = validateQuantityInput(item.qtyBase, 'Return quantity', { allowZero: true });
       if (qRet.lte(0)) continue;
       const pl = tx.prepare('SELECT * FROM purchase_lines WHERE id = ? AND purchase_id = ?').get(item.purchaseLineId, pur.id) as
         | { id: string; batch_id: string; medicine_id: string; qty_base: string; line_total: string }
         | undefined;
       if (!pl || !pl.batch_id) throw new Error('Purchase line or batch not found');
+
+      // Validate against purchased quantity minus prior returns on this purchase line
+      const prevReturnRows = tx
+        .prepare('SELECT qty_base FROM purchase_return_lines WHERE purchase_line_id = ?')
+        .all(pl.id) as Array<{ qty_base: string }>;
+      let alreadyReturned = new Decimal(0);
+      for (const pr of prevReturnRows) {
+        alreadyReturned = alreadyReturned.add(qty(pr.qty_base));
+      }
+      const maxLineReturnable = roundQty(qty(pl.qty_base).sub(alreadyReturned));
+      if (qRet.gt(maxLineReturnable)) {
+        throw new Error(
+          `Return quantity ${qRet.toFixed(6)} exceeds remaining returnable purchased quantity (${maxLineReturnable.toFixed(6)})`
+        );
+      }
 
       const batch = tx.prepare('SELECT * FROM batches WHERE id = ?').get(pl.batch_id) as {
         id: string;
@@ -501,11 +536,11 @@ export function createPurchaseReturn(
         purchase_cost_per_base: string;
       };
       if (qty(batch.current_qty_base).lt(qRet)) {
-        throw new Error(`Cannot return ${qRet.toFixed(2)} from batch ${batch.batch_number}; only ${batch.current_qty_base} left in stock`);
+        throw new Error(`Cannot return ${qRet.toFixed(6)} from batch ${batch.batch_number}; only ${batch.current_qty_base} left in stock`);
       }
 
-      const costPerBase = d(pl.line_total).div(d(pl.qty_base)).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
-      const lineTotal = money(qRet.mul(costPerBase));
+      const costPerBase = roundCost6(d(pl.line_total).div(d(pl.qty_base)));
+      const lineTotal = roundMoney(qRet.mul(costPerBase));
       totalReturn = totalReturn.add(lineTotal);
       lineRecords.push({
         plId: pl.id,
@@ -518,7 +553,7 @@ export function createPurchaseReturn(
     }
 
     if (lineRecords.length === 0) throw new Error('No valid positive return quantities provided');
-    totalReturn = money(totalReturn);
+    totalReturn = roundMoney(totalReturn);
 
     const refundAmount = input.settlementType === 'SUPPLIER_CREDIT' ? new Decimal(0) : totalReturn;
     const creditAmount = input.settlementType === 'SUPPLIER_CREDIT' ? totalReturn : new Decimal(0);
@@ -548,11 +583,11 @@ export function createPurchaseReturn(
       tx.prepare(
         `INSERT INTO purchase_return_lines (id, purchase_return_id, purchase_line_id, batch_id, medicine_id, qty_base, cost_per_base_snapshot, line_total)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(prlId, retId, lr.plId, lr.batchId, lr.medId, lr.qtyBase.toFixed(4), lr.costPerBase.toFixed(4), lr.lineTotal.toFixed(2));
+      ).run(prlId, retId, lr.plId, lr.batchId, lr.medId, lr.qtyBase.toFixed(6), lr.costPerBase.toFixed(6), lr.lineTotal.toFixed(2));
 
       const batch = tx.prepare('SELECT current_qty_base FROM batches WHERE id = ?').get(lr.batchId) as { current_qty_base: string };
       tx.prepare('UPDATE batches SET current_qty_base = ?, updated_at = ? WHERE id = ?').run(
-        qty(batch.current_qty_base).sub(lr.qtyBase).toFixed(4),
+        roundQty(qty(batch.current_qty_base).sub(lr.qtyBase)).toFixed(6),
         ts,
         lr.batchId
       );
@@ -561,12 +596,12 @@ export function createPurchaseReturn(
           id, medicine_id, batch_id, qty_change_base, movement_type, reference_type, reference_id, reference_line_id,
           cost_per_base_snapshot, reason, created_by, created_at
         ) VALUES (?, ?, ?, ?, 'PURCHASE_RETURN', 'PURCHASE_RETURN', ?, ?, ?, ?, ?, ?)`
-      ).run(uuid(), lr.medId, lr.batchId, lr.qtyBase.neg().toFixed(4), retId, prlId, lr.costPerBase.toFixed(4), input.reason.trim(), user.id, ts);
+      ).run(uuid(), lr.medId, lr.batchId, lr.qtyBase.neg().toFixed(6), retId, prlId, lr.costPerBase.toFixed(6), input.reason.trim(), user.id, ts);
     }
 
     if (creditAmount.gt(0)) {
       tx.prepare('UPDATE suppliers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-        money(d(supplier.current_balance).sub(creditAmount)).toFixed(2),
+        roundMoney(d(supplier.current_balance).sub(creditAmount)).toFixed(2),
         ts,
         supplier.id
       );
@@ -604,6 +639,13 @@ export function reversePurchase(user: AuthUser, purchaseId: string, reason: stri
     if (!pur) throw new Error('Purchase not found');
     if (pur.status !== 'RECEIVED') throw new Error('Only RECEIVED purchases can be reversed');
 
+    const existingReturns = tx
+      .prepare('SELECT COUNT(*) as cnt FROM purchase_returns WHERE purchase_id = ?')
+      .get(purchaseId) as { cnt: number };
+    if (existingReturns.cnt > 0) {
+      throw new Error('Cannot reverse a purchase that already has partial/full purchase returns');
+    }
+
     const lines = tx.prepare('SELECT * FROM purchase_lines WHERE purchase_id = ?').all(purchaseId) as Array<{
       id: string;
       batch_id: string;
@@ -621,9 +663,9 @@ export function reversePurchase(user: AuthUser, purchaseId: string, reason: stri
       if (qty(batch.current_qty_base).lt(qty(l.qty_base))) {
         throw new Error(`Cannot reverse purchase: stock from batch ${batch.batch_number} has already been sold or adjusted`);
       }
-      const costPerBase = d(l.line_total).div(d(l.qty_base)).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+      const costPerBase = roundCost6(d(l.line_total).div(d(l.qty_base)));
       tx.prepare('UPDATE batches SET current_qty_base = ?, updated_at = ? WHERE id = ?').run(
-        qty(batch.current_qty_base).sub(qty(l.qty_base)).toFixed(4),
+        roundQty(qty(batch.current_qty_base).sub(qty(l.qty_base))).toFixed(6),
         ts,
         l.batch_id
       );
@@ -632,20 +674,18 @@ export function reversePurchase(user: AuthUser, purchaseId: string, reason: stri
           id, medicine_id, batch_id, qty_change_base, movement_type, reference_type, reference_id, reference_line_id,
           cost_per_base_snapshot, reason, created_by, created_at
         ) VALUES (?, ?, ?, ?, 'PURCHASE_REVERSAL', 'PURCHASE_REVERSAL', ?, ?, ?, ?, ?, ?)`
-      ).run(uuid(), l.medicine_id, l.batch_id, qty(l.qty_base).neg().toFixed(4), purchaseId, l.id, costPerBase.toFixed(4), reason.trim(), user.id, ts);
+      ).run(uuid(), l.medicine_id, l.batch_id, qty(l.qty_base).neg().toFixed(6), purchaseId, l.id, costPerBase.toFixed(6), reason.trim(), user.id, ts);
     }
 
-    // Reverse supplier balance due
     if (money(pur.due_amount).gt(0)) {
       const sup = tx.prepare('SELECT current_balance FROM suppliers WHERE id = ?').get(pur.supplier_id) as { current_balance: string };
       tx.prepare('UPDATE suppliers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-        money(d(sup.current_balance).sub(d(pur.due_amount))).toFixed(2),
+        roundMoney(d(sup.current_balance).sub(d(pur.due_amount))).toFixed(2),
         ts,
         pur.supplier_id
       );
     }
 
-    // Reverse cash payments if any
     const allocs = tx
       .prepare(
         `SELECT p.id, p.method, p.amount FROM payment_allocations pa

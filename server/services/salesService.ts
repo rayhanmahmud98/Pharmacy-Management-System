@@ -1,5 +1,5 @@
 import Decimal from 'decimal.js';
-import { generateDocNumber, getDb, nowIso, todayDate, uuid, withTransaction } from '../db.ts';
+import { generateDocNumber, nowIso, todayDate, uuid, withTransaction } from '../db.ts';
 import { recordAudit } from '../audit.ts';
 import type { AuthUser } from '../auth.ts';
 import {
@@ -10,6 +10,10 @@ import {
   d,
   money,
   qty,
+  roundMoney,
+  roundQty,
+  validateCurrencyInput,
+  validateQuantityInput,
   type BatchCandidate,
 } from '../../src/shared/decimalMath.ts';
 import { getActiveCashSessionId } from './financeService.ts';
@@ -47,6 +51,11 @@ export function completeSale(
   const today = todayDate();
   const sDate = input.saleDate || today;
 
+  const invDisc = validateCurrencyInput(input.invoiceDiscount ?? '0', 'Invoice discount', { allowZero: true });
+  for (const p of input.payments || []) {
+    validateCurrencyInput(p.amount ?? '0', `${p.method} payment amount`, { allowZero: true });
+  }
+
   return withTransaction((tx) => {
     let customer: { id: string; name: string; current_balance: string; credit_limit: string } | undefined;
     if (input.customerId) {
@@ -59,6 +68,9 @@ export function completeSale(
     const saleId = uuid();
     const invoiceNumber = generateDocNumber(tx, 'INV', 'sales', 'invoice_number');
     const ts = nowIso();
+
+    // Preload in-transaction batch balances so multiple lines for the same medicine deduct sequentially
+    const batchBalanceMap = new Map<string, Decimal>();
 
     const preparedLines = input.lines.map((line) => {
       const med = tx.prepare('SELECT id, brand_name, base_unit_name, is_active FROM medicines WHERE id = ?').get(line.medicineId) as
@@ -105,18 +117,26 @@ export function completeSale(
         purchase_cost_per_base: string;
       }>;
 
-      const candidates: BatchCandidate[] = dbBatches.map((b) => ({
-        id: b.id,
-        batchNumber: b.batch_number,
-        expiryDate: b.expiry_date,
-        receivedDate: b.received_date,
-        status: b.status,
-        currentQtyBase: b.current_qty_base,
-        purchaseCostPerBase: b.purchase_cost_per_base,
-      }));
+      const candidates: BatchCandidate[] = dbBatches.map((b) => {
+        if (!batchBalanceMap.has(b.id)) {
+          batchBalanceMap.set(b.id, qty(b.current_qty_base));
+        }
+        return {
+          id: b.id,
+          batchNumber: b.batch_number,
+          expiryDate: b.expiry_date,
+          receivedDate: b.received_date,
+          status: b.status,
+          currentQtyBase: batchBalanceMap.get(b.id)!,
+          purchaseCostPerBase: b.purchase_cost_per_base,
+        };
+      });
 
       const allocations = allocateBatchesFEFO(candidates, calc.quantityBase, today, line.manualBatchId);
-      const lineCogs = money(allocations.reduce((acc, a) => acc.add(a.cogsTotal), new Decimal(0)));
+      for (const a of allocations) {
+        batchBalanceMap.set(a.batchId, roundQty(batchBalanceMap.get(a.batchId)!.sub(a.qtyBase)));
+      }
+      const lineCogs = roundMoney(allocations.reduce((acc, a) => acc.add(a.cogsTotal), new Decimal(0)));
 
       return {
         line,
@@ -128,19 +148,17 @@ export function completeSale(
       };
     });
 
-    // Check discount permission if any discount > 0
     const anyLineDisc = preparedLines.some((l) => l.calc.discount.gt(0));
-    const invDisc = money(input.invoiceDiscount || '0');
     if ((anyLineDisc || invDisc.gt(0)) && !user.permissions['pos.discount']) {
       throw new Error('Permission denied: applying discounts requires pos.discount permission');
     }
 
     let totalPaid = new Decimal(0);
-    const validPayments = (input.payments || []).filter((p) => money(p.amount).gt(0));
+    const validPayments = (input.payments || []).filter((p) => validateCurrencyInput(p.amount, 'Payment amount').gt(0));
     for (const p of validPayments) {
-      totalPaid = totalPaid.add(money(p.amount));
+      totalPaid = totalPaid.add(validateCurrencyInput(p.amount, 'Payment amount'));
     }
-    totalPaid = money(totalPaid);
+    totalPaid = roundMoney(totalPaid);
 
     const totals = computeInvoiceTotals({
       lines: preparedLines.map((l) => ({
@@ -158,16 +176,16 @@ export function completeSale(
       }
       const limit = money(customer.credit_limit);
       if (limit.gt(0)) {
-        const projected = money(d(customer.current_balance).add(totals.dueAmount));
+        const projected = roundMoney(d(customer.current_balance).add(totals.dueAmount));
         if (projected.gt(limit)) {
           throw new Error(
-            `Customer credit limit exceeded: limit ৳${limit.toFixed(2)}, projected balance ৳${projected.toFixed(2)}`
+            `Customer credit limit exceeded: limit ${limit.toFixed(2)}, projected balance ${projected.toFixed(2)}`
           );
         }
       }
     }
 
-    const totalCogs = money(preparedLines.reduce((acc, l) => acc.add(l.lineCogs), new Decimal(0)));
+    const totalCogs = roundMoney(preparedLines.reduce((acc, l) => acc.add(l.lineCogs), new Decimal(0)));
 
     tx.prepare(
       `INSERT INTO sales (
@@ -217,10 +235,10 @@ export function completeSale(
         item.med.id,
         item.unit.id,
         item.unit.unit_name,
-        d(item.unit.conversion_to_base).toFixed(4),
-        qty(item.line.quantityInput).toFixed(4),
-        item.calc.quantityBase.toFixed(4),
-        money(item.line.unitPrice).toFixed(2),
+        d(item.unit.conversion_to_base).toFixed(6),
+        validateQuantityInput(item.line.quantityInput, 'Quantity').toFixed(6),
+        item.calc.quantityBase.toFixed(6),
+        validateCurrencyInput(item.line.unitPrice, 'Unit price').toFixed(2),
         item.calc.grossTotal.toFixed(2),
         item.calc.discount.toFixed(2),
         item.calc.netTotal.toFixed(2),
@@ -232,8 +250,8 @@ export function completeSale(
           uuid(),
           lineId,
           alloc.batchId,
-          alloc.qtyBase.toFixed(4),
-          alloc.costPerBaseSnapshot.toFixed(4),
+          alloc.qtyBase.toFixed(6),
+          alloc.costPerBaseSnapshot.toFixed(6),
           alloc.cogsTotal.toFixed(2),
           item.line.manualBatchId ? 1 : 0,
           item.line.manualOverrideReason?.trim() || ''
@@ -242,12 +260,12 @@ export function completeSale(
         const batchRow = tx.prepare('SELECT current_qty_base FROM batches WHERE id = ?').get(alloc.batchId) as {
           current_qty_base: string;
         };
-        const nextQty = qty(batchRow.current_qty_base).sub(alloc.qtyBase);
+        const nextQty = roundQty(qty(batchRow.current_qty_base).sub(alloc.qtyBase));
         if (nextQty.lt(0)) {
           throw new Error(`Concurrency check failed: negative stock prevented for batch ${alloc.batchNumber}`);
         }
         tx.prepare('UPDATE batches SET current_qty_base = ?, updated_at = ? WHERE id = ?').run(
-          nextQty.toFixed(4),
+          nextQty.toFixed(6),
           ts,
           alloc.batchId
         );
@@ -256,10 +274,10 @@ export function completeSale(
           uuid(),
           item.med.id,
           alloc.batchId,
-          alloc.qtyBase.neg().toFixed(4),
+          alloc.qtyBase.neg().toFixed(6),
           saleId,
           lineId,
-          alloc.costPerBaseSnapshot.toFixed(4),
+          alloc.costPerBaseSnapshot.toFixed(6),
           item.line.manualBatchId ? `Manual override: ${item.line.manualOverrideReason}` : `FEFO Sale ${invoiceNumber}`,
           user.id,
           ts
@@ -267,10 +285,9 @@ export function completeSale(
       }
     }
 
-    // Payments & Cash Ledger isolation (ONLY CASH increases physical drawer)
     let cashPaidTotal = new Decimal(0);
     for (const p of validPayments) {
-      const amt = money(p.amount);
+      const amt = validateCurrencyInput(p.amount, 'Payment amount', { allowZero: false });
       const payId = uuid();
       const payNo = generateDocNumber(tx, 'PAY', 'payments', 'payment_number');
       tx.prepare(
@@ -310,7 +327,7 @@ export function completeSale(
       ).run(
         uuid(),
         cashSessionId,
-        money(cashPaidTotal).toFixed(2),
+        roundMoney(cashPaidTotal).toFixed(2),
         saleId,
         `Cash received on ${invoiceNumber}`,
         user.id,
@@ -320,7 +337,7 @@ export function completeSale(
 
     if (customer && totals.dueAmount.gt(0)) {
       tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-        money(d(customer.current_balance).add(totals.dueAmount)).toFixed(2),
+        roundMoney(d(customer.current_balance).add(totals.dueAmount)).toFixed(2),
         ts,
         customer.id
       );
@@ -338,7 +355,7 @@ export function completeSale(
         netTotal: totals.netTotal.toFixed(2),
         paid: totals.paidAmount.toFixed(2),
         due: totals.dueAmount.toFixed(2),
-        cashOnly: money(cashPaidTotal).toFixed(2),
+        cashOnly: roundMoney(cashPaidTotal).toFixed(2),
         cogs: totalCogs.toFixed(2),
       },
     });
@@ -370,6 +387,10 @@ export function createSalesReturn(
   if (!input.reason?.trim()) throw new Error('Return reason is required');
   if (!input.lines || input.lines.length === 0) throw new Error('At least one return line is required');
 
+  for (const rl of input.lines) {
+    validateQuantityInput(rl.qtyBase ?? '0', 'Return quantity', { allowZero: true });
+  }
+
   return withTransaction((tx) => {
     const sale = tx.prepare('SELECT * FROM sales WHERE id = ?').get(input.saleId) as
       | { id: string; invoice_number: string; customer_id: string | null; status: string; net_total: string; due_amount: string }
@@ -396,7 +417,7 @@ export function createSalesReturn(
     }> = [];
 
     for (const reqLine of input.lines) {
-      const qRet = qty(reqLine.qtyBase);
+      const qRet = validateQuantityInput(reqLine.qtyBase, 'Return quantity', { allowZero: true });
       if (qRet.lte(0)) continue;
 
       const sl = tx.prepare('SELECT * FROM sale_lines WHERE id = ? AND sale_id = ?').get(reqLine.saleLineId, sale.id) as
@@ -404,38 +425,31 @@ export function createSalesReturn(
         | undefined;
       if (!sl) throw new Error('Sale line not found on this invoice');
 
-      const alreadyReturnedRow = tx
-        .prepare(
-          `SELECT COALESCE(SUM(CAST(qty_base AS REAL)), 0) as returned_qty
-           FROM sales_return_lines srl
-           JOIN sales_returns sr ON sr.id = srl.sales_return_id
-           WHERE srl.sale_line_id = ?`
-        )
-        .get(sl.id) as { returned_qty: number };
+      const prevLines = tx
+        .prepare('SELECT batch_id, qty_base FROM sales_return_lines WHERE sale_line_id = ?')
+        .all(sl.id) as Array<{ batch_id: string; qty_base: string }>;
 
-      const alreadyReturned = qty(alreadyReturnedRow.returned_qty || 0);
-      const maxReturnable = qty(d(sl.qty_base).sub(alreadyReturned));
+      let alreadyReturned = new Decimal(0);
+      const prevPerBatch = new Map<string, Decimal>();
+      for (const pr of prevLines) {
+        const qPrev = qty(pr.qty_base);
+        alreadyReturned = alreadyReturned.add(qPrev);
+        prevPerBatch.set(pr.batch_id, (prevPerBatch.get(pr.batch_id) || new Decimal(0)).add(qPrev));
+      }
+
+      const maxReturnable = roundQty(d(sl.qty_base).sub(alreadyReturned));
       if (qRet.gt(maxReturnable)) {
-        throw new Error(`Return quantity ${qRet.toFixed(2)} exceeds remaining returnable quantity ${maxReturnable.toFixed(2)}`);
+        throw new Error(`Return quantity ${qRet.toFixed(6)} exceeds remaining returnable quantity ${maxReturnable.toFixed(6)}`);
       }
 
       const origAllocs = tx
         .prepare('SELECT batch_id, qty_base, cost_per_base_snapshot FROM sale_batch_allocations WHERE sale_line_id = ?')
         .all(sl.id) as Array<{ batch_id: string; qty_base: string; cost_per_base_snapshot: string }>;
 
-      // Subtract previously returned quantities per batch if partial returns happened before
-      const prevPerBatch = new Map<string, Decimal>();
-      const prevRows = tx
-        .prepare('SELECT batch_id, qty_base FROM sales_return_lines WHERE sale_line_id = ?')
-        .all(sl.id) as Array<{ batch_id: string; qty_base: string }>;
-      for (const pr of prevRows) {
-        prevPerBatch.set(pr.batch_id, (prevPerBatch.get(pr.batch_id) || new Decimal(0)).add(qty(pr.qty_base)));
-      }
-
       const remainingOrigAllocs = origAllocs
         .map((oa) => {
           const usedPrev = prevPerBatch.get(oa.batch_id) || new Decimal(0);
-          const avail = qty(oa.qty_base).sub(usedPrev);
+          const avail = roundQty(qty(oa.qty_base).sub(usedPrev));
           return {
             batchId: oa.batch_id,
             qtyBase: avail.gt(0) ? avail : new Decimal(0),
@@ -448,7 +462,7 @@ export function createSalesReturn(
       const effectivePricePerBase = d(sl.line_total).div(d(sl.qty_base));
 
       const splitWithRefund = cogsSplits.map((sp) => {
-        const refundPart = money(sp.qtyBase.mul(effectivePricePerBase));
+        const refundPart = roundMoney(sp.qtyBase.mul(effectivePricePerBase));
         totalRefundValue = totalRefundValue.add(refundPart);
         totalCogsReversed = totalCogsReversed.add(sp.cogsReversed);
         return { ...sp, refundPart };
@@ -463,8 +477,8 @@ export function createSalesReturn(
     }
 
     if (preparedReturnLines.length === 0) throw new Error('No positive return quantities submitted');
-    totalRefundValue = money(totalRefundValue);
-    totalCogsReversed = money(totalCogsReversed);
+    totalRefundValue = roundMoney(totalRefundValue);
+    totalCogsReversed = roundMoney(totalCogsReversed);
 
     const refundAmount = input.settlementType === 'CUSTOMER_CREDIT' ? new Decimal(0) : totalRefundValue;
     const creditAmount = input.settlementType === 'CUSTOMER_CREDIT' ? totalRefundValue : new Decimal(0);
@@ -504,9 +518,9 @@ export function createSalesReturn(
           rl.saleLineId,
           rl.medicineId,
           sp.batchId,
-          sp.qtyBase.toFixed(4),
+          sp.qtyBase.toFixed(6),
           rl.disposition,
-          sp.costPerBaseSnapshot.toFixed(4),
+          sp.costPerBaseSnapshot.toFixed(6),
           sp.cogsReversed.toFixed(2),
           sp.refundPart.toFixed(2)
         );
@@ -525,13 +539,12 @@ export function createSalesReturn(
           base_unit_name: string;
         };
 
-        // CRITICAL RULE 13: Never automatically restock into sellable stock unless disposition === 'RESTOCK_SELLABLE'
         if (rl.disposition === 'RESTOCK_SELLABLE') {
           if (origBatch.expiry_date <= today) {
             throw new Error(`Batch ${origBatch.batch_number} is expired (${origBatch.expiry_date}) and cannot be restocked as sellable`);
           }
           tx.prepare('UPDATE batches SET current_qty_base = ?, updated_at = ? WHERE id = ?').run(
-            qty(origBatch.current_qty_base).add(sp.qtyBase).toFixed(4),
+            roundQty(qty(origBatch.current_qty_base).add(sp.qtyBase)).toFixed(6),
             ts,
             origBatch.id
           );
@@ -544,16 +557,15 @@ export function createSalesReturn(
             uuid(),
             rl.medicineId,
             origBatch.id,
-            sp.qtyBase.toFixed(4),
+            sp.qtyBase.toFixed(6),
             returnId,
             srlId,
-            sp.costPerBaseSnapshot.toFixed(4),
+            sp.costPerBaseSnapshot.toFixed(6),
             `Restocked after inspection (${input.reason.trim()})`,
             user.id,
             ts
           );
         } else if (rl.disposition === 'QUARANTINE') {
-          // Put into a separate QUARANTINED batch record so sellable stock is untouched
           const qBatchNum = `${origBatch.batch_number}-QRN`;
           const existingQ = tx
             .prepare("SELECT id, current_qty_base FROM batches WHERE medicine_id = ? AND batch_number = ? AND status = 'QUARANTINED'")
@@ -562,7 +574,7 @@ export function createSalesReturn(
           if (existingQ) {
             targetBatchId = existingQ.id;
             tx.prepare('UPDATE batches SET current_qty_base = ?, updated_at = ? WHERE id = ?').run(
-              qty(existingQ.current_qty_base).add(sp.qtyBase).toFixed(4),
+              roundQty(qty(existingQ.current_qty_base).add(sp.qtyBase)).toFixed(6),
               ts,
               targetBatchId
             );
@@ -582,10 +594,10 @@ export function createSalesReturn(
               origBatch.supplier_id,
               origBatch.purchase_id,
               today,
-              sp.costPerBaseSnapshot.toFixed(4),
+              sp.costPerBaseSnapshot.toFixed(6),
               origBatch.selling_price_per_base,
-              sp.qtyBase.toFixed(4),
-              sp.qtyBase.toFixed(4),
+              sp.qtyBase.toFixed(6),
+              sp.qtyBase.toFixed(6),
               origBatch.base_unit_name,
               `Quarantined from ${returnNumber}`,
               ts,
@@ -601,28 +613,27 @@ export function createSalesReturn(
             uuid(),
             rl.medicineId,
             targetBatchId,
-            sp.qtyBase.toFixed(4),
+            sp.qtyBase.toFixed(6),
             returnId,
             srlId,
-            sp.costPerBaseSnapshot.toFixed(4),
+            sp.costPerBaseSnapshot.toFixed(6),
             `Quarantined on return (${input.reason.trim()})`,
             user.id,
             ts
           );
         } else {
-          // DAMAGED / WRITE_OFF / NOT_RESTOCKABLE: record audit/ledger movement in/out net 0 on sellable stock so damaged return is never sellable
           tx.prepare(
             `INSERT INTO stock_movements (
               id, medicine_id, batch_id, qty_change_base, movement_type, reference_type, reference_id, reference_line_id,
               cost_per_base_snapshot, reason, created_by, created_at
-            ) VALUES (?, ?, ?, '0.0000', 'DAMAGE_WRITEOFF', 'SALES_RETURN', ?, ?, ?, ?, ?, ?)`
+            ) VALUES (?, ?, ?, '0.000000', 'DAMAGE_WRITEOFF', 'SALES_RETURN', ?, ?, ?, ?, ?, ?)`
           ).run(
             uuid(),
             rl.medicineId,
             origBatch.id,
             returnId,
             srlId,
-            sp.costPerBaseSnapshot.toFixed(4),
+            sp.costPerBaseSnapshot.toFixed(6),
             `Non-restockable return (${rl.disposition}): ${input.reason.trim()}`,
             user.id,
             ts
@@ -652,7 +663,7 @@ export function createSalesReturn(
         current_balance: string;
       };
       tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-        money(d(cust.current_balance).sub(creditAmount)).toFixed(2),
+        roundMoney(d(cust.current_balance).sub(creditAmount)).toFixed(2),
         ts,
         sale.customer_id
       );
@@ -713,7 +724,7 @@ export function reverseSale(user: AuthUser, saleId: string, reason: string) {
       for (const a of allocs) {
         const batch = tx.prepare('SELECT current_qty_base FROM batches WHERE id = ?').get(a.batch_id) as { current_qty_base: string };
         tx.prepare('UPDATE batches SET current_qty_base = ?, updated_at = ? WHERE id = ?').run(
-          qty(batch.current_qty_base).add(qty(a.qty_base)).toFixed(4),
+          roundQty(qty(batch.current_qty_base).add(qty(a.qty_base))).toFixed(6),
           ts,
           a.batch_id
         );
@@ -722,14 +733,14 @@ export function reverseSale(user: AuthUser, saleId: string, reason: string) {
             id, medicine_id, batch_id, qty_change_base, movement_type, reference_type, reference_id, reference_line_id,
             cost_per_base_snapshot, reason, created_by, created_at
           ) VALUES (?, ?, ?, ?, 'SALE_REVERSAL', 'SALE_REVERSAL', ?, ?, ?, ?, ?, ?)`
-        ).run(uuid(), l.medicine_id, a.batch_id, qty(a.qty_base).toFixed(4), saleId, l.id, a.cost_per_base_snapshot, reason.trim(), user.id, ts);
+        ).run(uuid(), l.medicine_id, a.batch_id, qty(a.qty_base).toFixed(6), saleId, l.id, a.cost_per_base_snapshot, reason.trim(), user.id, ts);
       }
     }
 
     if (sale.customer_id && money(sale.due_amount).gt(0)) {
       const cust = tx.prepare('SELECT current_balance FROM customers WHERE id = ?').get(sale.customer_id) as { current_balance: string };
       tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-        money(d(cust.current_balance).sub(d(sale.due_amount))).toFixed(2),
+        roundMoney(d(cust.current_balance).sub(d(sale.due_amount))).toFixed(2),
         ts,
         sale.customer_id
       );

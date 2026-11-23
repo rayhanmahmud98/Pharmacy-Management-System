@@ -1,6 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { Printer, RotateCcw } from 'lucide-react';
-import { apiFetch, formatBDT, formatQty } from '../lib/api';
+import { Printer, RotateCcw, Search } from 'lucide-react';
+import {
+  apiFetch,
+  checkStrictDecimalInput,
+  formatBDT,
+  formatQty,
+  newIdempotencyKey,
+} from '../lib/api';
 import type { AuthUser, PharmacySettings, SaleRecord } from '../types';
 import { ReceiptPrintModal } from '../components/ReceiptPrintModal';
 import { ReasonPromptModal } from '../components/ActionModals';
@@ -36,6 +42,7 @@ interface Props {
 export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) => {
   const [sales, setSales] = useState<SaleRecord[]>([]);
   const [returns, setReturns] = useState<SalesReturnRecord[]>([]);
+  const [search, setSearch] = useState('');
   const [tab, setTab] = useState<'sales' | 'returns'>('sales');
   const [printSale, setPrintSale] = useState<SaleRecord | null>(null);
   const [returnTarget, setReturnTarget] = useState<SaleRecord | null>(null);
@@ -48,21 +55,23 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) 
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
-  async function load() {
-    const res = await apiFetch<{ sales: SaleRecord[]; returns: SalesReturnRecord[] }>('/api/sales');
+  async function load(q = search) {
+    const res = await apiFetch<{ sales: SaleRecord[]; returns: SalesReturnRecord[] }>(
+      `/api/sales?search=${encodeURIComponent(q)}`
+    );
     setSales(res.sales);
     setReturns(res.returns);
   }
 
   useEffect(() => {
-    load().catch((e) => setError(e.message));
+    load('').catch((e) => setError(e.message));
   }, []);
 
   function openReturnModal(s: SaleRecord) {
     setReturnTarget(s);
     const init: typeof lineReturns = {};
     for (const l of s.lines) {
-      init[l.id] = { qtyBase: '', disposition: 'QUARANTINE' }; // Safe default: never auto-restock without explicit inspection choice!
+      init[l.id] = { qtyBase: '', disposition: 'QUARANTINE' };
     }
     setLineReturns(init);
     setSettlementType('CASH_REFUND');
@@ -73,18 +82,27 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) 
     e.preventDefault();
     if (!returnTarget) return;
     setError('');
-    const lines = Object.entries(lineReturns)
-      .filter(([, v]) => Number(v.qtyBase) > 0)
-      .map(([saleLineId, v]) => ({
-        saleLineId,
-        qtyBase: v.qtyBase,
-        disposition: v.disposition,
-      }));
+
+    const lines: Array<{ saleLineId: string; qtyBase: string; disposition: string }> = [];
+    for (const [saleLineId, v] of Object.entries(lineReturns)) {
+      if (v.qtyBase && v.qtyBase.trim() !== '') {
+        const qErr = checkStrictDecimalInput(v.qtyBase, 'qty', 'Return quantity', { allowZero: true });
+        if (qErr) {
+          setError(qErr);
+          return;
+        }
+        if (Number(v.qtyBase) > 0) {
+          lines.push({ saleLineId, qtyBase: v.qtyBase, disposition: v.disposition });
+        }
+      }
+    }
+
     try {
       const res = await apiFetch<{ returnNumber: string; totalRefundValue: string; totalCogsReversed: string }>(
         '/api/sales-returns',
         {
           method: 'POST',
+          headers: { 'Idempotency-Key': newIdempotencyKey() },
           body: JSON.stringify({
             saleId: returnTarget.id,
             settlementType,
@@ -101,10 +119,6 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) 
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Return failed');
     }
-  }
-
-  function handleReverseSale(s: SaleRecord) {
-    setReverseSaleTarget(s);
   }
 
   async function confirmReverseSale(reason: string) {
@@ -127,30 +141,45 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) 
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold text-slate-900">Sales History, Reprints & Inspection Returns</h1>
+          <h1 className="text-xl font-bold text-slate-900">Sales History, Reprints &amp; Inspection Returns</h1>
           <p className="text-xs text-slate-500">
             Completed invoices cannot be deleted. Corrections use authorized reversals or inspection-verified returns.
           </p>
         </div>
-        <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
-          <button
-            type="button"
-            onClick={() => setTab('sales')}
-            className={`px-3 py-1.5 text-xs font-medium rounded-md ${
-              tab === 'sales' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
-            }`}
-          >
-            Sales Invoices ({sales.length})
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab('returns')}
-            className={`px-3 py-1.5 text-xs font-medium rounded-md ${
-              tab === 'returns' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
-            }`}
-          >
-            Sales Returns ({returns.length})
-          </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative">
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" />
+            <input
+              type="text"
+              placeholder="Search invoice #, customer..."
+              value={search}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                load(e.target.value);
+              }}
+              className="pl-8 pr-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white w-52"
+            />
+          </div>
+          <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
+            <button
+              type="button"
+              onClick={() => setTab('sales')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-md ${
+                tab === 'sales' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
+              }`}
+            >
+              Sales Invoices ({sales.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab('returns')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-md ${
+                tab === 'returns' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
+              }`}
+            >
+              Sales Returns ({returns.length})
+            </button>
+          </div>
         </div>
       </div>
 
@@ -211,7 +240,7 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) 
                       <button
                         type="button"
                         disabled={!writable}
-                        onClick={() => handleReverseSale(s)}
+                        onClick={() => setReverseSaleTarget(s)}
                         className="text-red-700 hover:underline font-medium disabled:opacity-40"
                       >
                         Reverse
@@ -232,7 +261,7 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) 
               <tr>
                 <th className="text-left px-4 py-2.5 font-medium">Return #</th>
                 <th className="text-left px-4 py-2.5 font-medium">Original Invoice</th>
-                <th className="text-left px-4 py-2.5 font-medium">Items & Disposition</th>
+                <th className="text-left px-4 py-2.5 font-medium">Items &amp; Disposition</th>
                 <th className="text-right px-4 py-2.5 font-medium">Refund Value</th>
                 <th className="text-right px-4 py-2.5 font-medium">COGS Reversed</th>
                 <th className="text-left px-4 py-2.5 font-medium">Reason</th>
@@ -276,7 +305,7 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) 
           <form onSubmit={handleSubmitReturn} className="bg-white border border-slate-200 rounded-lg w-full max-w-3xl p-6 space-y-4">
             <div>
               <h3 className="text-base font-bold text-slate-900">
-                Sales Return & Mandatory Inspection · {returnTarget.invoice_number}
+                Sales Return &amp; Mandatory Inspection · {returnTarget.invoice_number}
               </h3>
               <p className="text-xs text-slate-500">
                 Returned medicines require explicit inspection disposition before affecting sellable inventory. Original batch COGS is preserved.
@@ -297,10 +326,8 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) 
                     </div>
                     <div className="sm:col-span-3">
                       <input
-                        type="number"
-                        step="0.01"
-                        min="0"
-                        max={maxRet}
+                        type="text"
+                        inputMode="decimal"
                         disabled={maxRet <= 0}
                         placeholder={`Qty (${l.base_unit_name})`}
                         value={state.qtyBase}

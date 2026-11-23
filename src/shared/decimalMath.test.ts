@@ -9,21 +9,60 @@ import {
   computeReturnCogsReversal,
   convertToBaseUnits,
   resolvePermission,
+  roundCost6,
+  validateConversionInput,
+  validateCostInput,
+  validateCurrencyInput,
+  validateQuantityInput,
   type BatchCandidate,
 } from './decimalMath';
 
-test('manual unit conversions support non-10 strip and box sizes with zero hardcoding', () => {
-  // Medicine A: 1 Strip = 12 Tablets, 1 Box = 60 Tablets
-  assert.equal(convertToBaseUnits('2', '12').toFixed(4), '24.0000');
-  assert.equal(convertToBaseUnits('1.5', '60').toFixed(4), '90.0000');
-  // Medicine B: 1 Strip = 6 Capsules, 1 Box = 48 Capsules
-  assert.equal(convertToBaseUnits('3', '6').toFixed(4), '18.0000');
-  assert.equal(convertToBaseUnits('2', '48').toFixed(4), '96.0000');
+test('strict currency validation enforces max 18 integer digits and max 2 decimal places without silent rounding', () => {
+  assert.equal(validateCurrencyInput('100', 'Price').toFixed(2), '100.00');
+  assert.equal(validateCurrencyInput('100.5', 'Price').toFixed(2), '100.50');
+  assert.equal(validateCurrencyInput('100.50', 'Price').toFixed(2), '100.50');
+  assert.equal(validateCurrencyInput('999999999999999999.99', 'Max Price').toFixed(2), '999999999999999999.99');
+
+  assert.throws(() => validateCurrencyInput('100.555', 'Price'), /more than 2 decimal places/);
+  assert.throws(() => validateCurrencyInput('1000000000000000000.00', 'Price'), /exceeds maximum 18 integer digits/);
+  assert.throws(() => validateCurrencyInput('-1.00', 'Price'), /cannot be negative/);
+  assert.throws(() => validateCurrencyInput('0', 'Price', { allowZero: false }), /greater than zero/);
+  assert.throws(() => validateCurrencyInput('1e5', 'Price'), /invalid numeric format/);
+  assert.throws(() => validateCurrencyInput('1,000.00', 'Price'), /invalid numeric format/);
+  assert.throws(() => validateCurrencyInput('', 'Price'), /required/);
+  assert.throws(() => validateCurrencyInput(Number.NaN, 'Price'), /finite number/);
+  assert.throws(() => validateCurrencyInput(Number.POSITIVE_INFINITY, 'Price'), /finite number/);
+});
+
+test('strict 6-decimal validation applies to quantities, conversion ratios, and per-base cost snapshots', () => {
+  assert.equal(validateQuantityInput('1.123456', 'Qty').toFixed(6), '1.123456');
+  assert.equal(validateQuantityInput('10.000001', 'Qty').toFixed(6), '10.000001');
+  assert.equal(validateQuantityInput('999999999999999999.123456', 'Qty').toFixed(6), '999999999999999999.123456');
+  assert.equal(validateConversionInput('0.5', 'Conversion').toFixed(6), '0.500000');
+  assert.equal(validateCostInput('1.458333', 'Cost').toFixed(6), '1.458333');
+
+  assert.throws(() => validateQuantityInput('1.1234567', 'Qty'), /more than 6 decimal places/);
+  assert.throws(() => validateQuantityInput('10.0000001', 'Qty'), /more than 6 decimal places/);
+  assert.throws(() => validateCostInput('1.1234567', 'Cost'), /more than 6 decimal places/);
+  assert.throws(() => validateConversionInput('1.1234567', 'Conv'), /more than 6 decimal places/);
+  assert.throws(() => validateQuantityInput('1000000000000000000.1', 'Qty'), /exceeds maximum 18 integer digits/);
+});
+
+test('manual unit conversions support non-10 and fractional 6-decimal sizes with zero hardcoding', () => {
+  assert.equal(convertToBaseUnits('2', '12').toFixed(6), '24.000000');
+  assert.equal(convertToBaseUnits('1.5', '60').toFixed(6), '90.000000');
+  assert.equal(convertToBaseUnits('3', '6').toFixed(6), '18.000000');
+  assert.equal(convertToBaseUnits('1.250000', '1.500000').toFixed(6), '1.875000');
+
+  // Cost per base unit computed accurately to 6 decimals (e.g. 175.00 / 120 = 1.458333)
+  const unitCost = validateCurrencyInput('175.00', 'Box Cost');
+  const conv = validateConversionInput('120', 'Box Conversion');
+  assert.equal(roundCost6(unitCost.div(conv)).toFixed(6), '1.458333');
 });
 
 test('invalid conversion ratios and quantities are rejected', () => {
   assert.throws(() => convertToBaseUnits('1', '0'), /greater than zero/);
-  assert.throws(() => convertToBaseUnits('1', '-10'), /greater than zero/);
+  assert.throws(() => convertToBaseUnits('1', '-10'), /cannot be negative/);
   assert.throws(() => convertToBaseUnits('0', '10'), /greater than zero/);
 });
 
@@ -53,6 +92,15 @@ test('FEFO allocation excludes expired/quarantined batches and splits across ear
       receivedDate: '2025-02-01',
       status: 'QUARANTINED',
       currentQtyBase: '50',
+      purchaseCostPerBase: '2.10',
+    },
+    {
+      id: 'b-damaged',
+      batchNumber: 'DMG01',
+      expiryDate: '2027-01-05',
+      receivedDate: '2025-02-02',
+      status: 'DAMAGED',
+      currentQtyBase: '20',
       purchaseCostPerBase: '2.10',
     },
     {

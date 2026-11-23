@@ -1,12 +1,12 @@
-import React, { useEffect, useState } from 'react';
-import { CheckCircle2, ShieldAlert } from 'lucide-react';
-import { apiFetch, formatBDT, formatQty } from '../lib/api';
+import React, { useEffect, useRef, useState } from 'react';
+import { CheckCircle2, Search, ShieldAlert } from 'lucide-react';
+import { apiFetch, checkStrictDecimalInput, formatBDT, formatQty, newIdempotencyKey } from '../lib/api';
 import type { AuthUser, Batch } from '../types';
 
 interface InventoryPayload {
   today: string;
   expiryWarningDays: number;
-  batches: Array<Batch & { bangla_name: string }>;
+  batches: Batch[];
   movements: Array<{
     id: string;
     brand_name: string;
@@ -53,49 +53,68 @@ interface Props {
 
 export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
   const [data, setData] = useState<InventoryPayload | null>(null);
+  const [search, setSearch] = useState('');
   const [tab, setTab] = useState<'batches' | 'movements' | 'adjustments'>('batches');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ACTIVE' | 'NEAR_EXPIRY' | 'EXPIRED' | 'QUARANTINED'>('ALL');
   const [adjBatch, setAdjBatch] = useState<Batch | null>(null);
   const [adjType, setAdjType] = useState<'STOCK_INCREASE' | 'STOCK_DECREASE' | 'DAMAGE' | 'MISSING_STOCK' | 'EXPIRY' | 'RECONCILIATION'>('STOCK_DECREASE');
   const [adjActual, setAdjActual] = useState('');
   const [adjReason, setAdjReason] = useState('');
+  const [submittingAdj, setSubmittingAdj] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const adjIdempKeyRef = useRef(newIdempotencyKey());
 
-  async function load() {
-    const res = await apiFetch<InventoryPayload>('/api/inventory');
+  async function load(q = search) {
+    const query = q.trim() ? `?search=${encodeURIComponent(q.trim())}` : '';
+    const res = await apiFetch<InventoryPayload>(`/api/inventory${query}`);
     setData(res);
   }
 
   useEffect(() => {
-    load().catch((e) => setError(e.message));
+    load('').catch((e) => setError(e.message));
   }, []);
 
   async function handleAdjustSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!adjBatch) return;
+    if (!adjBatch || submittingAdj) return;
     setError('');
+    const qtyErr = checkStrictDecimalInput(adjActual, 'qty', 'Actual physical quantity', { allowZero: true });
+    if (qtyErr) {
+      setError(qtyErr);
+      return;
+    }
+    setSubmittingAdj(true);
     try {
       const res = await apiFetch<{ adjustmentNumber: string }>('/api/inventory/adjust', {
         method: 'POST',
+        headers: { 'Idempotency-Key': adjIdempKeyRef.current },
         body: JSON.stringify({
           batchId: adjBatch.id,
           adjustmentType: adjType,
-          actualQtyBase: adjActual,
+          actualQtyBase: adjActual.trim(),
           reason: adjReason,
         }),
       });
+      adjIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Adjustment ${res.adjustmentNumber} recorded in StockMovement ledger.`);
       setAdjBatch(null);
       setAdjReason('');
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Adjustment failed');
+    } finally {
+      setSubmittingAdj(false);
     }
   }
 
-  async function handleStatusAction(batchId: string, status: 'QUARANTINED' | 'WRITTEN_OFF' | 'ACTIVE') {
-    const reason = status === 'WRITTEN_OFF' ? 'Expiry / Damage write-off' : `Status changed to ${status}`;
+  async function handleStatusAction(batchId: string, status: 'QUARANTINED' | 'WRITTEN_OFF' | 'DAMAGED' | 'ACTIVE') {
+    const reason =
+      status === 'WRITTEN_OFF'
+        ? 'Expiry / Damage write-off'
+        : status === 'DAMAGED'
+        ? 'Marked damaged in batch inspection'
+        : `Status changed to ${status}`;
     setError('');
     try {
       await apiFetch(`/api/inventory/batches/${batchId}/status`, {
@@ -121,7 +140,7 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
     if (statusFilter === 'ACTIVE') return b.status === 'ACTIVE' && !isExp && Number(b.current_qty_base) > 0;
     if (statusFilter === 'NEAR_EXPIRY') return isNear && Number(b.current_qty_base) > 0;
     if (statusFilter === 'EXPIRED') return isExp && Number(b.current_qty_base) > 0;
-    if (statusFilter === 'QUARANTINED') return b.status === 'QUARANTINED';
+    if (statusFilter === 'QUARANTINED') return b.status === 'QUARANTINED' || b.status === 'DAMAGED';
     return true;
   });
 
@@ -176,25 +195,49 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
         </div>
 
         {tab === 'batches' && (
-          <div className="flex items-center gap-1 p-1 bg-slate-100 border border-slate-200 rounded-lg">
-            {[
-              { id: 'ALL', label: 'All Batches' },
-              { id: 'ACTIVE', label: 'Active' },
-              { id: 'NEAR_EXPIRY', label: 'Near Expiry' },
-              { id: 'EXPIRED', label: 'Expired' },
-              { id: 'QUARANTINED', label: 'Quarantined' },
-            ].map((f) => (
-              <button
-                key={f.id}
-                type="button"
-                onClick={() => setStatusFilter(f.id as typeof statusFilter)}
-                className={`px-2.5 py-1 text-xs font-medium rounded ${
-                  statusFilter === f.id ? 'bg-teal-700 text-white' : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                {f.label}
+          <div className="flex flex-wrap items-center gap-2">
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                load(search).catch((err) => setError(err.message));
+              }}
+              className="flex items-center gap-1.5"
+            >
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" />
+                <input
+                  type="text"
+                  aria-label="Search inventory batches"
+                  placeholder="Code, barcode, medicine, batch..."
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  className="pl-8 pr-3 py-1.5 text-xs bg-white border border-slate-300 rounded-md w-56"
+                />
+              </div>
+              <button type="submit" className="px-3 py-1.5 text-xs bg-slate-800 text-white rounded-md">
+                Search
               </button>
-            ))}
+            </form>
+            <div className="flex items-center gap-1 p-1 bg-slate-100 border border-slate-200 rounded-lg">
+              {[
+                { id: 'ALL', label: 'All Batches' },
+                { id: 'ACTIVE', label: 'Active' },
+                { id: 'NEAR_EXPIRY', label: 'Near Expiry' },
+                { id: 'EXPIRED', label: 'Expired' },
+                { id: 'QUARANTINED', label: 'Quarantined/Dmg' },
+              ].map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => setStatusFilter(f.id as typeof statusFilter)}
+                  className={`px-2.5 py-1 text-xs font-medium rounded ${
+                    statusFilter === f.id ? 'bg-teal-700 text-white' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
           </div>
         )}
       </div>
@@ -220,8 +263,16 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
                 return (
                   <tr key={b.id} className={isExpired ? 'bg-red-50/40' : ''}>
                     <td className="px-4 py-2.5">
-                      <div className="font-semibold text-slate-900">{b.brand_name} {b.strength}</div>
-                      <div className="text-slate-500">{b.supplier_name || 'Opening Stock'}</div>
+                      <div className="font-semibold text-slate-900">
+                        {b.brand_name} {b.strength}
+                        {b.medicine_code && (
+                          <span className="ml-1.5 text-[10px] font-mono-num text-slate-500">{b.medicine_code}</span>
+                        )}
+                      </div>
+                      <div className="text-slate-500">
+                        {b.supplier_name || 'Opening Stock'}
+                        {b.storage_info ? ` · ${b.storage_info}` : ''}
+                      </div>
                     </td>
                     <td className="px-4 py-2.5 font-mono-num">
                       <div className="font-medium text-slate-900">{b.batch_number}</div>
@@ -239,7 +290,7 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
                         className={`font-semibold ${
                           b.status === 'WRITTEN_OFF'
                             ? 'text-slate-500'
-                            : isExpired
+                            : isExpired || b.status === 'DAMAGED'
                             ? 'text-red-700'
                             : b.status === 'QUARANTINED'
                             ? 'text-amber-700'
@@ -257,6 +308,7 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
                           type="button"
                           disabled={!writable}
                           onClick={() => {
+                            adjIdempKeyRef.current = newIdempotencyKey();
                             setAdjBatch(b);
                             setAdjActual(formatQty(b.current_qty_base));
                           }}
@@ -266,18 +318,28 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
                         </button>
                       )}
                       {user.permissions['inventory.expiry'] && b.status === 'ACTIVE' && (
-                        <button
-                          type="button"
-                          disabled={!writable}
-                          onClick={() => handleStatusAction(b.id, 'QUARANTINED')}
-                          className="text-amber-700 hover:underline font-medium disabled:opacity-40"
-                        >
-                          Quarantine
-                        </button>
+                        <>
+                          <button
+                            type="button"
+                            disabled={!writable}
+                            onClick={() => handleStatusAction(b.id, 'QUARANTINED')}
+                            className="text-amber-700 hover:underline font-medium disabled:opacity-40"
+                          >
+                            Quarantine
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!writable}
+                            onClick={() => handleStatusAction(b.id, 'DAMAGED')}
+                            className="text-orange-700 hover:underline font-medium disabled:opacity-40"
+                          >
+                            Damaged
+                          </button>
+                        </>
                       )}
                       {user.permissions['inventory.expiry'] &&
                         Number(b.current_qty_base) > 0 &&
-                        (isExpired || b.status === 'QUARANTINED') && (
+                        (isExpired || b.status === 'QUARANTINED' || b.status === 'DAMAGED') && (
                           <button
                             type="button"
                             disabled={!writable}
@@ -291,6 +353,13 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
                   </tr>
                 );
               })}
+              {filteredBatches.length === 0 && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-6 text-center text-slate-500">
+                    No matching inventory batches found.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -401,11 +470,10 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
                 </select>
               </div>
               <div>
-                <label className="block text-slate-600 mb-1">Actual Physical Quantity ({adjBatch.base_unit_name})</label>
+                <label className="block text-slate-600 mb-1">Actual Physical Quantity ({adjBatch.base_unit_name}, up to 6 dec)</label>
                 <input
-                  type="number"
-                  step="0.01"
-                  min="0"
+                  type="text"
+                  inputMode="decimal"
                   required
                   value={adjActual}
                   onChange={(e) => setAdjActual(e.target.value)}
@@ -434,9 +502,10 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
               </button>
               <button
                 type="submit"
-                className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
+                disabled={submittingAdj}
+                className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
               >
-                Post Adjustment
+                {submittingAdj ? 'Posting...' : 'Post Adjustment'}
               </button>
             </div>
           </form>

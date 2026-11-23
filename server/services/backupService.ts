@@ -6,7 +6,13 @@ import * as XLSX from 'xlsx';
 import { BACKUP_DIR, DB_PATH, closeDb, getDb, nowIso, todayDate, uuid, withTransaction } from '../db.ts';
 import { recordAudit } from '../audit.ts';
 import type { AuthUser } from '../auth.ts';
-import { d, money, qty, ratio } from '../../src/shared/decimalMath.ts';
+import {
+  qty,
+  validateConversionInput,
+  validateCostInput,
+  validateCurrencyInput,
+  validateQuantityInput,
+} from '../../src/shared/decimalMath.ts';
 
 export async function createVerifiedBackup(
   user: AuthUser | null,
@@ -14,16 +20,14 @@ export async function createVerifiedBackup(
 ) {
   const db = getDb();
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filename = `shifarx-backup-${backupType.toLowerCase()}-${stamp}.sqlite`;
+  const filename = `medinest-backup-${backupType.toLowerCase()}-${stamp}.sqlite`;
   const targetPath = path.join(BACKUP_DIR, filename);
   const ts = nowIso();
   const id = uuid();
 
   try {
-    // Native SQLite Online Backup API (safe even in WAL mode with active connections)
     await backup(db, targetPath);
 
-    // Verify backup integrity before marking successful
     const verifyDb = new DatabaseSync(targetPath, { readOnly: true });
     let integrityResult = 'failed';
     try {
@@ -58,7 +62,6 @@ export async function createVerifiedBackup(
       });
     });
 
-    // Enforce retention policy (keep newest N verified backups)
     const settings = db.prepare('SELECT backup_retention_count FROM pharmacy_settings WHERE id = 1').get() as
       | { backup_retention_count: number }
       | undefined;
@@ -97,7 +100,6 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
   if (!rec || rec.status !== 'VERIFIED') throw new Error('Selected backup record is missing or unverified');
   if (!fs.existsSync(rec.file_path)) throw new Error('Backup file does not exist on disk');
 
-  // Verify integrity of target backup again before touching live DB
   const checkDb = new DatabaseSync(rec.file_path, { readOnly: true });
   try {
     const res = checkDb.prepare('PRAGMA integrity_check;').get() as { integrity_check: string };
@@ -108,7 +110,6 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
     checkDb.close();
   }
 
-  // Mandatory pre-restore safety backup
   await createVerifiedBackup(user, 'PRE_RESTORE');
 
   closeDb();
@@ -117,7 +118,6 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
     if (fs.existsSync(DB_PATH + suffix)) fs.unlinkSync(DB_PATH + suffix);
   }
 
-  // Reopen & verify restored DB
   const restored = getDb();
   const postCheck = restored.prepare('PRAGMA integrity_check;').get() as { integrity_check: string };
   if (postCheck?.integrity_check?.toLowerCase() !== 'ok') {
@@ -144,13 +144,15 @@ export function buildMedicineImportTemplateBuffer(): Buffer {
   const wb = XLSX.utils.book_new();
   const sampleRows = [
     {
+      medicine_code: 'MED-0101',
+      barcode: '8901234560998',
       brand_name: 'Fexo 120',
       generic_name: 'Fexofenadine HCl',
-      bangla_name: 'ফেক্সো ১২০',
       strength: '120 mg',
       dosage_form: 'Tablet',
       category: 'Respiratory & Anti-Allergic',
       manufacturer: 'Square Pharmaceuticals PLC',
+      storage_info: 'Store below 25°C in a dry place',
       base_unit: 'Tablet',
       secondary_unit: 'Strip',
       secondary_conversion: 10,
@@ -173,13 +175,15 @@ export function buildMedicineImportTemplateBuffer(): Buffer {
 export interface ParsedImportRow {
   rowIndex: number;
   raw: Record<string, unknown>;
+  medicineCode: string;
+  barcode: string;
   brandName: string;
   genericName: string;
-  banglaName: string;
   strength: string;
   dosageForm: string;
   category: string;
   manufacturer: string;
+  storageInfo: string;
   baseUnit: string;
   secondaryUnit: string;
   secondaryConversion: string;
@@ -203,17 +207,22 @@ export function parseAndValidateExcelImport(buffer: Buffer): ParsedImportRow[] {
   const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[sheetName], { defval: '' });
   const db = getDb();
   const today = todayDate();
+  const seenBarcodes = new Set<string>();
 
   return rows.map((raw, idx) => {
     const errors: string[] = [];
+    const medicineCode = String(raw.medicine_code || '').trim();
+    const barcode = String(raw.barcode || '').trim();
     const brandName = String(raw.brand_name || '').trim();
     const genericName = String(raw.generic_name || '').trim();
     const strength = String(raw.strength || '').trim();
+    const storageInfo = String(raw.storage_info || '').trim();
     const baseUnit = String(raw.base_unit || '').trim();
     const secondaryUnit = String(raw.secondary_unit || '').trim();
     const secondaryConvRaw = String(raw.secondary_conversion ?? '').trim();
     const boxUnit = String(raw.box_unit || '').trim();
     const boxConvRaw = String(raw.box_conversion ?? '').trim();
+    const minStockRaw = String(raw.min_stock_level ?? '0').trim() || '0';
     const openingBatch = String(raw.opening_batch_number || '').trim();
     const openingExp = String(raw.opening_expiry_date || '').trim();
     const openingQtyRaw = String(raw.opening_qty_base ?? '').trim();
@@ -224,26 +233,48 @@ export function parseAndValidateExcelImport(buffer: Buffer): ParsedImportRow[] {
     if (!genericName) errors.push('generic_name is required');
     if (!baseUnit) errors.push('base_unit is required');
 
+    if (barcode) {
+      const lowerBc = barcode.toLowerCase();
+      if (seenBarcodes.has(lowerBc)) {
+        errors.push(`Duplicate barcode '${barcode}' within import file`);
+      } else {
+        seenBarcodes.add(lowerBc);
+      }
+      const existingBc = db
+        .prepare("SELECT id FROM medicines WHERE LOWER(barcode) = LOWER(?) AND barcode != ''")
+        .get(barcode) as { id: string } | undefined;
+      if (existingBc) {
+        errors.push(`Barcode '${barcode}' already exists in database`);
+      }
+    }
+
+    let minStockLevel = '0.000000';
+    try {
+      minStockLevel = validateQuantityInput(minStockRaw, 'min_stock_level', { allowZero: true }).toFixed(6);
+    } catch (e) {
+      errors.push((e as Error).message);
+    }
+
     let secondaryConversion = '';
     if (secondaryUnit) {
       try {
-        secondaryConversion = ratio(secondaryConvRaw).toFixed(4);
-      } catch {
-        errors.push(`Invalid secondary_conversion '${secondaryConvRaw}'`);
+        secondaryConversion = validateConversionInput(secondaryConvRaw, 'secondary_conversion').toFixed(6);
+      } catch (e) {
+        errors.push((e as Error).message);
       }
     }
 
     let boxConversion = '';
     if (boxUnit) {
       try {
-        boxConversion = ratio(boxConvRaw).toFixed(4);
-      } catch {
-        errors.push(`Invalid box_conversion '${boxConvRaw}'`);
+        boxConversion = validateConversionInput(boxConvRaw, 'box_conversion').toFixed(6);
+      } catch (e) {
+        errors.push((e as Error).message);
       }
     }
 
-    let openingQtyBase = '0.0000';
-    let costPerBase = '0.0000';
+    let openingQtyBase = '0.000000';
+    let costPerBase = '0.000000';
     let sellingPricePerBase = '0.00';
 
     if (openingBatch || openingQtyRaw) {
@@ -252,25 +283,22 @@ export function parseAndValidateExcelImport(buffer: Buffer): ParsedImportRow[] {
         errors.push(`opening_expiry_date '${openingExp}' must be future YYYY-MM-DD`);
       }
       try {
-        const q = qty(openingQtyRaw);
-        if (q.lte(0)) errors.push('opening_qty_base must be > 0');
-        openingQtyBase = q.toFixed(4);
-      } catch {
-        errors.push(`Invalid opening_qty_base '${openingQtyRaw}'`);
+        const q = validateQuantityInput(openingQtyRaw, 'opening_qty_base');
+        openingQtyBase = q.toFixed(6);
+      } catch (e) {
+        errors.push((e as Error).message);
       }
       try {
-        const c = d(costRaw);
-        if (c.lt(0)) errors.push('cost_per_base cannot be negative');
-        costPerBase = c.toFixed(4);
-      } catch {
-        errors.push(`Invalid cost_per_base '${costRaw}'`);
+        const c = validateCostInput(costRaw || '0', 'cost_per_base', { allowZero: true });
+        costPerBase = c.toFixed(6);
+      } catch (e) {
+        errors.push((e as Error).message);
       }
       try {
-        const p = money(priceRaw);
-        if (p.lte(0)) errors.push('selling_price_per_base must be > 0');
+        const p = validateCurrencyInput(priceRaw, 'selling_price_per_base');
         sellingPricePerBase = p.toFixed(2);
-      } catch {
-        errors.push(`Invalid selling_price_per_base '${priceRaw}'`);
+      } catch (e) {
+        errors.push((e as Error).message);
       }
     }
 
@@ -281,19 +309,21 @@ export function parseAndValidateExcelImport(buffer: Buffer): ParsedImportRow[] {
     return {
       rowIndex: idx + 2,
       raw,
+      medicineCode,
+      barcode,
       brandName,
       genericName,
-      banglaName: String(raw.bangla_name || '').trim(),
       strength,
       dosageForm: String(raw.dosage_form || '').trim(),
       category: String(raw.category || '').trim(),
       manufacturer: String(raw.manufacturer || '').trim(),
+      storageInfo,
       baseUnit,
       secondaryUnit,
       secondaryConversion,
       boxUnit,
       boxConversion,
-      minStockLevel: String(raw.min_stock_level || '0').trim(),
+      minStockLevel,
       rxRequired: ['YES', 'TRUE', '1'].includes(String(raw.rx_required || '').trim().toUpperCase()),
       openingBatchNumber: openingBatch,
       openingExpiryDate: openingExp,
@@ -316,6 +346,8 @@ export function executeExcelImport(
     let createdMeds = 0;
     let addedBatches = 0;
     let skipped = 0;
+
+    let medCodeCounter = (tx.prepare('SELECT COUNT(*) as cnt FROM medicines').get() as { cnt: number }).cnt;
 
     for (const r of rows) {
       if (r.errors && r.errors.length > 0) {
@@ -354,24 +386,30 @@ export function executeExcelImport(
           }
         }
 
+        medCodeCounter++;
+        const medCode = r.medicineCode?.trim() || `MED-${String(medCodeCounter).padStart(4, '0')}`;
+        const minStock = validateQuantityInput(r.minStockLevel || '0', 'min_stock_level', { allowZero: true });
+
         medId = uuid();
         tx.prepare(
           `INSERT INTO medicines (
-            id, brand_name, generic_name, bangla_name, strength, dosage_form,
-            category_id, manufacturer_id, base_unit_name, min_stock_level, rx_required,
+            id, medicine_code, barcode, brand_name, generic_name, bangla_name, strength, dosage_form,
+            category_id, manufacturer_id, storage_info, base_unit_name, min_stock_level, rx_required,
             is_active, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+          ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
         ).run(
           medId,
+          medCode,
+          (r.barcode || '').trim(),
           r.brandName,
           r.genericName,
-          r.banglaName,
           r.strength,
           r.dosageForm,
           catId,
           mfgId,
+          (r.storageInfo || '').trim(),
           r.baseUnit,
-          qty(r.minStockLevel || '0').toFixed(4),
+          minStock.toFixed(6),
           r.rxRequired ? 1 : 0,
           ts,
           ts
@@ -379,25 +417,30 @@ export function executeExcelImport(
 
         tx.prepare(
           `INSERT INTO medicine_units (id, medicine_id, unit_name, conversion_to_base, is_base, allow_purchase, allow_sale, is_active, created_at, updated_at)
-           VALUES (?, ?, ?, '1.0000', 1, 1, 1, 1, ?, ?)`
+           VALUES (?, ?, ?, '1.000000', 1, 1, 1, 1, ?, ?)`
         ).run(uuid(), medId, r.baseUnit, ts, ts);
 
         if (r.secondaryUnit && r.secondaryConversion) {
+          const secConv = validateConversionInput(r.secondaryConversion, 'secondary_conversion');
           tx.prepare(
             `INSERT INTO medicine_units (id, medicine_id, unit_name, conversion_to_base, is_base, allow_purchase, allow_sale, is_active, created_at, updated_at)
              VALUES (?, ?, ?, ?, 0, 1, 1, 1, ?, ?)`
-          ).run(uuid(), medId, r.secondaryUnit, r.secondaryConversion, ts, ts);
+          ).run(uuid(), medId, r.secondaryUnit, secConv.toFixed(6), ts, ts);
         }
         if (r.boxUnit && r.boxConversion && r.boxUnit.toLowerCase() !== r.secondaryUnit.toLowerCase()) {
+          const boxConv = validateConversionInput(r.boxConversion, 'box_conversion');
           tx.prepare(
             `INSERT INTO medicine_units (id, medicine_id, unit_name, conversion_to_base, is_base, allow_purchase, allow_sale, is_active, created_at, updated_at)
              VALUES (?, ?, ?, ?, 0, 1, 1, 1, ?, ?)`
-          ).run(uuid(), medId, r.boxUnit, r.boxConversion, ts, ts);
+          ).run(uuid(), medId, r.boxUnit, boxConv.toFixed(6), ts, ts);
         }
         createdMeds++;
       }
 
       if (r.openingBatchNumber && qty(r.openingQtyBase).gt(0)) {
+        const openQty = validateQuantityInput(r.openingQtyBase, 'opening_qty_base');
+        const openCost = validateCostInput(r.costPerBase || '0', 'cost_per_base', { allowZero: true });
+        const openPrice = validateCurrencyInput(r.sellingPricePerBase, 'selling_price_per_base');
         const batchId = uuid();
         tx.prepare(
           `INSERT INTO batches (
@@ -411,10 +454,10 @@ export function executeExcelImport(
           r.openingBatchNumber,
           r.openingExpiryDate,
           today,
-          r.costPerBase,
-          r.sellingPricePerBase,
-          r.openingQtyBase,
-          r.openingQtyBase,
+          openCost.toFixed(6),
+          openPrice.toFixed(2),
+          openQty.toFixed(6),
+          openQty.toFixed(6),
           r.baseUnit,
           ts,
           ts
@@ -424,7 +467,7 @@ export function executeExcelImport(
             id, medicine_id, batch_id, qty_change_base, movement_type, reference_type, reference_id,
             cost_per_base_snapshot, reason, created_by, created_at
           ) VALUES (?, ?, ?, ?, 'OPENING_STOCK', 'EXCEL_IMPORT', ?, ?, 'Excel opening stock import', ?, ?)`
-        ).run(uuid(), medId, batchId, r.openingQtyBase, batchId, r.costPerBase, user.id, ts);
+        ).run(uuid(), medId, batchId, openQty.toFixed(6), batchId, openCost.toFixed(6), user.id, ts);
         addedBatches++;
       }
     }

@@ -3,7 +3,14 @@ import type { DatabaseSync } from 'node:sqlite';
 import { generateDocNumber, getDb, nowIso, todayDate, uuid, withTransaction } from '../db.ts';
 import { recordAudit } from '../audit.ts';
 import type { AuthUser } from '../auth.ts';
-import { computeCashVariance, computeExpectedCash, d, money } from '../../src/shared/decimalMath.ts';
+import {
+  computeCashVariance,
+  computeExpectedCash,
+  d,
+  money,
+  roundMoney,
+  validateCurrencyInput,
+} from '../../src/shared/decimalMath.ts';
 
 export function getActiveCashSessionId(tx?: DatabaseSync): string | null {
   const db = tx || getDb();
@@ -63,27 +70,26 @@ export function getCashSessionSummary(sessionId: string) {
 
   const expectedCash = computeExpectedCash(
     String(session.opening_cash),
-    cashReceived,
-    cashPaid,
-    cashAdjustments
+    roundMoney(cashReceived),
+    roundMoney(cashPaid),
+    roundMoney(cashAdjustments)
   );
 
   return {
     session,
     movements,
     totals: {
-      openingCash: money(String(session.opening_cash)).toFixed(2),
-      cashReceived: money(cashReceived).toFixed(2),
-      cashPaid: money(cashPaid).toFixed(2),
-      cashAdjustments: money(cashAdjustments).toFixed(2),
+      openingCash: roundMoney(d(String(session.opening_cash))).toFixed(2),
+      cashReceived: roundMoney(cashReceived).toFixed(2),
+      cashPaid: roundMoney(cashPaid).toFixed(2),
+      cashAdjustments: roundMoney(cashAdjustments).toFixed(2),
       expectedCash: expectedCash.toFixed(2),
     },
   };
 }
 
 export function openCashSession(user: AuthUser, openingCashStr: string, notes = '') {
-  const openingCash = money(openingCashStr);
-  if (openingCash.lt(0)) throw new Error('Opening cash cannot be negative');
+  const openingCash = validateCurrencyInput(openingCashStr, 'Opening cash', { allowZero: true });
 
   return withTransaction((tx) => {
     const existing = tx.prepare("SELECT session_number FROM cash_sessions WHERE status = 'OPEN'").get() as
@@ -132,8 +138,7 @@ export function closeCashSession(
     forceClose?: boolean;
   }
 ) {
-  const actualCash = money(input.actualCash);
-  if (actualCash.lt(0)) throw new Error('Actual counted cash cannot be negative');
+  const actualCash = validateCurrencyInput(input.actualCash, 'Actual counted cash', { allowZero: true });
 
   return withTransaction((tx) => {
     const session = tx.prepare('SELECT * FROM cash_sessions WHERE id = ?').get(sessionId) as
@@ -165,11 +170,16 @@ export function closeCashSession(
       }
     }
 
-    const expectedCash = computeExpectedCash(session.opening_cash, cashReceived, cashPaid, cashAdjustments);
+    const expectedCash = computeExpectedCash(
+      session.opening_cash,
+      roundMoney(cashReceived),
+      roundMoney(cashPaid),
+      roundMoney(cashAdjustments)
+    );
     const variance = computeCashVariance(actualCash, expectedCash);
 
     if (!variance.eq(0) && !input.varianceReason?.trim()) {
-      throw new Error(`Cash variance of ৳${variance.toFixed(2)} detected. A mandatory variance reason is required.`);
+      throw new Error(`Cash variance of ${variance.toFixed(2)} detected. A mandatory variance reason is required.`);
     }
     if (input.forceClose && !input.varianceReason?.trim() && !input.notes?.trim()) {
       throw new Error('Force-closing a session requires a mandatory reason');
@@ -245,8 +255,7 @@ export function recordPartyPayment(
     targetDocId?: string | null;
   }
 ) {
-  const amt = money(input.amount);
-  if (amt.lte(0)) throw new Error('Payment amount must be strictly positive');
+  const amt = validateCurrencyInput(input.amount, 'Payment amount', { allowZero: false });
 
   return withTransaction((tx) => {
     const ts = nowIso();
@@ -265,13 +274,16 @@ export function recordPartyPayment(
          VALUES (?, ?, 'CUSTOMER', ?, 'IN', ?, ?, ?, ?, 'POSTED', ?, ?)`
       ).run(payId, payNo, cust.id, input.method, amt.toFixed(2), (input.referenceNo || '').trim(), (input.notes || '').trim(), user.id, ts);
 
-      // Allocate across open due sales (FIFO or targeted invoice)
       let remainingToAlloc = amt;
-      const openSales = input.targetDocId
-        ? (tx.prepare("SELECT id, paid_amount, due_amount FROM sales WHERE id = ? AND customer_id = ? AND status = 'COMPLETED'").all(input.targetDocId, cust.id) as Array<{ id: string; paid_amount: string; due_amount: string }>)
-        : (tx.prepare("SELECT id, paid_amount, due_amount FROM sales WHERE customer_id = ? AND status = 'COMPLETED' AND CAST(due_amount AS REAL) > 0 ORDER BY sale_date ASC, created_at ASC").all(cust.id) as Array<{ id: string; paid_amount: string; due_amount: string }>);
+      const candidateSales = input.targetDocId
+        ? (tx
+            .prepare("SELECT id, paid_amount, due_amount FROM sales WHERE id = ? AND customer_id = ? AND status = 'COMPLETED'")
+            .all(input.targetDocId, cust.id) as Array<{ id: string; paid_amount: string; due_amount: string }>)
+        : (tx
+            .prepare("SELECT id, paid_amount, due_amount FROM sales WHERE customer_id = ? AND status = 'COMPLETED' ORDER BY sale_date ASC, created_at ASC")
+            .all(cust.id) as Array<{ id: string; paid_amount: string; due_amount: string }>);
 
-      for (const s of openSales) {
+      for (const s of candidateSales) {
         if (remainingToAlloc.lte(0)) break;
         const due = money(s.due_amount);
         if (due.lte(0)) continue;
@@ -280,14 +292,14 @@ export function recordPartyPayment(
           `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES (?, ?, 'SALE', ?, ?)`
         ).run(uuid(), payId, s.id, apply.toFixed(2));
         tx.prepare('UPDATE sales SET paid_amount = ?, due_amount = ? WHERE id = ?').run(
-          money(d(s.paid_amount).add(apply)).toFixed(2),
-          money(due.sub(apply)).toFixed(2),
+          roundMoney(d(s.paid_amount).add(apply)).toFixed(2),
+          roundMoney(due.sub(apply)).toFixed(2),
           s.id
         );
-        remainingToAlloc = money(remainingToAlloc.sub(apply));
+        remainingToAlloc = roundMoney(remainingToAlloc.sub(apply));
       }
 
-      const nextBal = money(d(cust.current_balance).sub(amt));
+      const nextBal = roundMoney(d(cust.current_balance).sub(amt));
       tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
         nextBal.toFixed(2),
         ts,
@@ -325,11 +337,15 @@ export function recordPartyPayment(
       ).run(payId, payNo, sup.id, input.method, amt.toFixed(2), (input.referenceNo || '').trim(), (input.notes || '').trim(), user.id, ts);
 
       let remainingToAlloc = amt;
-      const openPurchases = input.targetDocId
-        ? (tx.prepare("SELECT id, paid_amount, due_amount FROM purchases WHERE id = ? AND supplier_id = ? AND status = 'RECEIVED'").all(input.targetDocId, sup.id) as Array<{ id: string; paid_amount: string; due_amount: string }>)
-        : (tx.prepare("SELECT id, paid_amount, due_amount FROM purchases WHERE supplier_id = ? AND status = 'RECEIVED' AND CAST(due_amount AS REAL) > 0 ORDER BY purchase_date ASC, created_at ASC").all(sup.id) as Array<{ id: string; paid_amount: string; due_amount: string }>);
+      const candidatePurchases = input.targetDocId
+        ? (tx
+            .prepare("SELECT id, paid_amount, due_amount FROM purchases WHERE id = ? AND supplier_id = ? AND status = 'RECEIVED'")
+            .all(input.targetDocId, sup.id) as Array<{ id: string; paid_amount: string; due_amount: string }>)
+        : (tx
+            .prepare("SELECT id, paid_amount, due_amount FROM purchases WHERE supplier_id = ? AND status = 'RECEIVED' ORDER BY purchase_date ASC, created_at ASC")
+            .all(sup.id) as Array<{ id: string; paid_amount: string; due_amount: string }>);
 
-      for (const p of openPurchases) {
+      for (const p of candidatePurchases) {
         if (remainingToAlloc.lte(0)) break;
         const due = money(p.due_amount);
         if (due.lte(0)) continue;
@@ -338,15 +354,15 @@ export function recordPartyPayment(
           `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES (?, ?, 'PURCHASE', ?, ?)`
         ).run(uuid(), payId, p.id, apply.toFixed(2));
         tx.prepare('UPDATE purchases SET paid_amount = ?, due_amount = ?, updated_at = ? WHERE id = ?').run(
-          money(d(p.paid_amount).add(apply)).toFixed(2),
-          money(due.sub(apply)).toFixed(2),
+          roundMoney(d(p.paid_amount).add(apply)).toFixed(2),
+          roundMoney(due.sub(apply)).toFixed(2),
           ts,
           p.id
         );
-        remainingToAlloc = money(remainingToAlloc.sub(apply));
+        remainingToAlloc = roundMoney(remainingToAlloc.sub(apply));
       }
 
-      const nextBal = money(d(sup.current_balance).sub(amt));
+      const nextBal = roundMoney(d(sup.current_balance).sub(amt));
       tx.prepare('UPDATE suppliers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
         nextBal.toFixed(2),
         ts,
@@ -404,8 +420,8 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
           | undefined;
         if (s) {
           tx.prepare('UPDATE sales SET paid_amount = ?, due_amount = ? WHERE id = ?').run(
-            money(d(s.paid_amount).sub(alAmt)).toFixed(2),
-            money(d(s.due_amount).add(alAmt)).toFixed(2),
+            roundMoney(d(s.paid_amount).sub(alAmt)).toFixed(2),
+            roundMoney(d(s.due_amount).add(alAmt)).toFixed(2),
             a.target_id
           );
         }
@@ -415,8 +431,8 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
           | undefined;
         if (p) {
           tx.prepare('UPDATE purchases SET paid_amount = ?, due_amount = ?, updated_at = ? WHERE id = ?').run(
-            money(d(p.paid_amount).sub(alAmt)).toFixed(2),
-            money(d(p.due_amount).add(alAmt)).toFixed(2),
+            roundMoney(d(p.paid_amount).sub(alAmt)).toFixed(2),
+            roundMoney(d(p.due_amount).add(alAmt)).toFixed(2),
             ts,
             a.target_id
           );
@@ -430,7 +446,7 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
         | undefined;
       if (cust) {
         tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-          money(d(cust.current_balance).add(amt)).toFixed(2),
+          roundMoney(d(cust.current_balance).add(amt)).toFixed(2),
           ts,
           pay.party_id
         );
@@ -441,7 +457,7 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
         | undefined;
       if (sup) {
         tx.prepare('UPDATE suppliers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-          money(d(sup.current_balance).add(amt)).toFixed(2),
+          roundMoney(d(sup.current_balance).add(amt)).toFixed(2),
           ts,
           pay.party_id
         );
@@ -488,8 +504,7 @@ export function createExpense(
   }
 ) {
   if (!input.name?.trim()) throw new Error('Expense name is required');
-  const amt = money(input.amount);
-  if (amt.lte(0)) throw new Error('Expense amount must be positive');
+  const amt = validateCurrencyInput(input.amount, 'Expense amount', { allowZero: false });
 
   return withTransaction((tx) => {
     const id = uuid();

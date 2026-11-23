@@ -14,6 +14,8 @@ interface ReportPayload {
     cogsReversedOnReturns: string;
     netCogs: string;
     grossProfit: string;
+    totalExpenses: string;
+    netProfit: string;
   };
   salesByMedicine: Array<{
     id: string;
@@ -164,12 +166,24 @@ export const ReportsPage: React.FC = () => {
                   : formatBDT(report.profitSummary.cogsReversedOnReturns)}
               </span>
             </div>
-            <div className="flex justify-between pt-2 border-t border-slate-300 text-sm font-bold text-emerald-700">
+            <div className="flex justify-between pt-2 border-t border-slate-300 font-bold text-slate-900">
               <span className="font-sans">Gross Profit</span>
               <span>
                 {report.profitSummary.grossProfit === 'RESTRICTED'
                   ? 'RESTRICTED'
                   : formatBDT(report.profitSummary.grossProfit)}
+              </span>
+            </div>
+            <div className="flex justify-between text-red-700">
+              <span className="font-sans">- Operating Expenses (Posted)</span>
+              <span>-{formatBDT(report.profitSummary.totalExpenses)}</span>
+            </div>
+            <div className="flex justify-between pt-2 border-t border-slate-300 text-sm font-bold text-emerald-700">
+              <span className="font-sans">Net Profit</span>
+              <span>
+                {report.profitSummary.netProfit === 'RESTRICTED'
+                  ? 'RESTRICTED'
+                  : formatBDT(report.profitSummary.netProfit)}
               </span>
             </div>
           </div>

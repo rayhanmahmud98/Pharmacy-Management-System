@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Download, Plus, Search, Settings2, Upload } from 'lucide-react';
-import { apiFetch, formatQty } from '../lib/api';
+import { Download, Pencil, Plus, Search, Settings2, Upload } from 'lucide-react';
+import { apiFetch, checkStrictDecimalInput, formatQty } from '../lib/api';
 import type { AuthUser, Medicine, MedicineUnit } from '../types';
 
 interface Category {
@@ -14,6 +14,8 @@ interface Manufacturer {
 
 interface ImportRowPreview {
   rowIndex: number;
+  medicineCode: string;
+  barcode: string;
   brandName: string;
   genericName: string;
   strength: string;
@@ -42,20 +44,22 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
   const [manufacturers, setManufacturers] = useState<Manufacturer[]>([]);
   const [selectedMed, setSelectedMed] = useState<Medicine | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [editingMed, setEditingMed] = useState<Medicine | null>(null);
   const [showImportModal, setShowImportModal] = useState(false);
   const [importRows, setImportRows] = useState<ImportRowPreview[]>([]);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
-  // Create medicine form
   const [newMed, setNewMed] = useState({
+    medicineCode: '',
+    barcode: '',
     brandName: '',
     genericName: '',
-    banglaName: '',
     strength: '',
     dosageForm: 'Tablet',
     categoryId: '',
     manufacturerId: '',
+    storageInfo: '',
     baseUnitName: 'Tablet',
     minStockLevel: '50',
     rxRequired: false,
@@ -63,7 +67,21 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
     extraUnitConv: '10',
   });
 
-  // New unit form on selected medicine
+  const [editForm, setEditForm] = useState({
+    medicineCode: '',
+    barcode: '',
+    brandName: '',
+    genericName: '',
+    strength: '',
+    dosageForm: '',
+    categoryId: '',
+    manufacturerId: '',
+    storageInfo: '',
+    minStockLevel: '0',
+    rxRequired: false,
+    isActive: true,
+  });
+
   const [newUnit, setNewUnit] = useState({
     unitName: '',
     conversionToBase: '',
@@ -93,6 +111,18 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
   async function handleCreateMedicine(e: React.FormEvent) {
     e.preventDefault();
     setError('');
+    const minErr = checkStrictDecimalInput(newMed.minStockLevel || '0', 'qty', 'Minimum stock level', { allowZero: true });
+    if (minErr) {
+      setError(minErr);
+      return;
+    }
+    if (newMed.extraUnitName.trim()) {
+      const convErr = checkStrictDecimalInput(newMed.extraUnitConv, 'conversion', 'Conversion ratio');
+      if (convErr) {
+        setError(convErr);
+        return;
+      }
+    }
     try {
       const units = newMed.extraUnitName.trim()
         ? [
@@ -116,13 +146,15 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
       setShowCreateModal(false);
       setNotice(`Medicine '${newMed.brandName}' created with manual unit conversions.`);
       setNewMed({
+        medicineCode: '',
+        barcode: '',
         brandName: '',
         genericName: '',
-        banglaName: '',
         strength: '',
         dosageForm: 'Tablet',
         categoryId: '',
         manufacturerId: '',
+        storageInfo: '',
         baseUnitName: 'Tablet',
         minStockLevel: '50',
         rxRequired: false,
@@ -135,10 +167,41 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
     }
   }
 
+  async function handleSaveEditMedicine(e: React.FormEvent) {
+    e.preventDefault();
+    if (!editingMed) return;
+    setError('');
+    const minErr = checkStrictDecimalInput(editForm.minStockLevel || '0', 'qty', 'Minimum stock level', { allowZero: true });
+    if (minErr) {
+      setError(minErr);
+      return;
+    }
+    try {
+      await apiFetch(`/api/medicines/${editingMed.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          ...editForm,
+          categoryId: editForm.categoryId || null,
+          manufacturerId: editForm.manufacturerId || null,
+        }),
+      });
+      setNotice(`Updated medicine '${editForm.brandName}'.`);
+      setEditingMed(null);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update medicine');
+    }
+  }
+
   async function handleAddUnit(e: React.FormEvent) {
     e.preventDefault();
     if (!selectedMed) return;
     setError('');
+    const convErr = checkStrictDecimalInput(newUnit.conversionToBase, 'conversion', 'Conversion ratio');
+    if (convErr) {
+      setError(convErr);
+      return;
+    }
     try {
       await apiFetch(`/api/medicines/${selectedMed.id}/units`, {
         method: 'POST',
@@ -161,13 +224,21 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
   async function handleUpdateUnit(u: MedicineUnit, patch: Partial<MedicineUnit>) {
     if (!selectedMed) return;
     setError('');
+    const convStr = String(patch.conversion_to_base ?? u.conversion_to_base);
+    if (!u.is_base) {
+      const convErr = checkStrictDecimalInput(convStr, 'conversion', `Conversion ratio for ${u.unit_name}`);
+      if (convErr) {
+        setError(convErr);
+        return;
+      }
+    }
     try {
       await apiFetch(`/api/medicines/${selectedMed.id}/units`, {
         method: 'POST',
         body: JSON.stringify({
           unitId: u.id,
           unitName: patch.unit_name ?? u.unit_name,
-          conversionToBase: patch.conversion_to_base ?? u.conversion_to_base,
+          conversionToBase: convStr,
           allowPurchase: Boolean(patch.allow_purchase ?? u.allow_purchase),
           allowSale: Boolean(patch.allow_sale ?? u.allow_sale),
           isActive: Boolean(patch.is_active ?? u.is_active),
@@ -185,7 +256,12 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
     if (!file) return;
     setError('');
     const buf = await file.arrayBuffer();
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    const base64 = btoa(binary);
     try {
       const res = await apiFetch<{ rows: ImportRowPreview[] }>('/api/medicines/import/preview', {
         method: 'POST',
@@ -222,9 +298,9 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold text-slate-900">Medicines & Manual Unit Conversions</h1>
+          <h1 className="text-xl font-bold text-slate-900">Medicines, Codes &amp; Manual Unit Conversions</h1>
           <p className="text-xs text-slate-500">
-            Configure medicine-specific units and direct base-unit ratios manually. No packaging assumptions.
+            Configure medicine codes, barcodes, storage shelves, and explicit base-unit conversion ratios. No packaging assumptions.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -263,7 +339,7 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
               <input
                 type="text"
-                placeholder="Search brand, generic, Bangla, manufacturer..."
+                placeholder="Search code, barcode, brand, generic, storage, manufacturer..."
                 value={search}
                 onChange={(e) => {
                   setSearch(e.target.value);
@@ -277,27 +353,30 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
             <table className="w-full text-xs">
               <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
                 <tr>
-                  <th className="text-left px-4 py-2.5 font-medium">Medicine</th>
-                  <th className="text-left px-4 py-2.5 font-medium">Base Unit & Configs</th>
+                  <th className="text-left px-4 py-2.5 font-medium">Medicine &amp; Code</th>
+                  <th className="text-left px-4 py-2.5 font-medium">Base Unit &amp; Configs</th>
                   <th className="text-right px-4 py-2.5 font-medium">Sellable Stock</th>
-                  <th className="text-right px-4 py-2.5 font-medium">Action</th>
+                  <th className="text-right px-4 py-2.5 font-medium">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {medicines.map((m) => (
                   <tr
                     key={m.id}
-                    className={selectedMed?.id === m.id ? 'bg-teal-50/50' : 'hover:bg-slate-50'}
+                    className={`${selectedMed?.id === m.id ? 'bg-teal-50/50' : 'hover:bg-slate-50'} ${!m.is_active ? 'opacity-60' : ''}`}
                   >
                     <td className="px-4 py-2.5">
                       <div className="font-semibold text-slate-900">
                         {m.brand_name} {m.strength}
+                        {!m.is_active && <span className="ml-2 text-[10px] text-red-700 font-semibold">(Inactive)</span>}
                       </div>
-                      <div className="text-slate-500">
-                        {m.generic_name} {m.bangla_name ? `· ${m.bangla_name}` : ''}
+                      <div className="text-slate-600">{m.generic_name}</div>
+                      <div className="text-[11px] text-slate-500 font-mono-num">
+                        {m.medicine_code || '—'} {m.barcode ? `· BC: ${m.barcode}` : ''}
                       </div>
                       <div className="text-[11px] text-slate-400">
                         {m.manufacturer_name || '—'} · {m.category_name || '—'}
+                        {m.storage_info ? ` · ${m.storage_info}` : ''}
                       </div>
                     </td>
                     <td className="px-4 py-2.5 text-slate-700 font-mono-num">
@@ -312,7 +391,34 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                     <td className="px-4 py-2.5 text-right font-mono-num font-semibold text-slate-900 whitespace-nowrap">
                       {formatQty(m.sellable_stock_base)} {m.base_unit_name}
                     </td>
-                    <td className="px-4 py-2.5 text-right">
+                    <td className="px-4 py-2.5 text-right whitespace-nowrap space-x-1.5">
+                      {user.permissions['medicines.manage'] && (
+                        <button
+                          type="button"
+                          disabled={!writable}
+                          onClick={() => {
+                            setEditingMed(m);
+                            setEditForm({
+                              medicineCode: m.medicine_code || '',
+                              barcode: m.barcode || '',
+                              brandName: m.brand_name,
+                              genericName: m.generic_name,
+                              strength: m.strength,
+                              dosageForm: m.dosage_form,
+                              categoryId: m.category_id || '',
+                              manufacturerId: m.manufacturer_id || '',
+                              storageInfo: m.storage_info || '',
+                              minStockLevel: formatQty(m.min_stock_level),
+                              rxRequired: Boolean(m.rx_required),
+                              isActive: Boolean(m.is_active),
+                            });
+                          }}
+                          className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 border border-slate-200 rounded disabled:opacity-40"
+                        >
+                          <Pencil className="w-3 h-3" />
+                          Edit
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => setSelectedMed(m)}
@@ -342,7 +448,8 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                   {selectedMed.brand_name} {selectedMed.strength}
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Base Stock Unit: <strong>{selectedMed.base_unit_name}</strong> · Edits apply prospectively; historical invoices & purchases keep their original conversion snapshot.
+                  Code: <span className="font-mono-num">{selectedMed.medicine_code || '—'}</span> · Base Stock Unit:{' '}
+                  <strong>{selectedMed.base_unit_name}</strong> · Up to 6 decimal places supported. Historical invoices retain original snapshots.
                 </p>
               </div>
 
@@ -368,17 +475,17 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                             '1'
                           ) : (
                             <input
-                              type="number"
-                              step="0.0001"
-                              min="0.0001"
+                              type="text"
+                              inputMode="decimal"
                               disabled={!user.permissions['medicines.units'] || !writable}
                               defaultValue={formatQty(u.conversion_to_base)}
                               onBlur={(e) => {
-                                if (e.target.value && Number(e.target.value) !== Number(u.conversion_to_base)) {
-                                  handleUpdateUnit(u, { conversion_to_base: e.target.value });
+                                const val = e.target.value.trim();
+                                if (val && val !== formatQty(u.conversion_to_base)) {
+                                  handleUpdateUnit(u, { conversion_to_base: val });
                                 }
                               }}
-                              className="w-20 px-1.5 py-1 text-right border border-slate-300 rounded font-mono-num"
+                              className="w-24 px-1.5 py-1 text-right border border-slate-300 rounded font-mono-num"
                             />
                           )}
                         </td>
@@ -425,10 +532,9 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                       className="px-2.5 py-1.5 text-xs border border-slate-300 rounded"
                     />
                     <input
-                      type="number"
-                      step="0.0001"
-                      min="0.0001"
-                      placeholder={`Qty in ${selectedMed.base_unit_name}`}
+                      type="text"
+                      inputMode="decimal"
+                      placeholder={`Qty in ${selectedMed.base_unit_name} (up to 6 dec)`}
                       value={newUnit.conversionToBase}
                       onChange={(e) => setNewUnit({ ...newUnit, conversionToBase: e.target.value })}
                       required
@@ -474,10 +580,30 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
           <form
             onSubmit={handleCreateMedicine}
-            className="bg-white border border-slate-200 rounded-lg w-full max-w-lg p-6 space-y-3"
+            className="bg-white border border-slate-200 rounded-lg w-full max-w-xl p-6 space-y-3"
           >
-            <h3 className="text-base font-bold text-slate-900">Add New Medicine & Base Unit</h3>
+            <h3 className="text-base font-bold text-slate-900">Add New Medicine &amp; Base Unit</h3>
             <div className="grid grid-cols-2 gap-3 text-xs">
+              <div>
+                <label className="block text-slate-600 mb-1">Medicine Code (auto if blank)</label>
+                <input
+                  type="text"
+                  placeholder="e.g. MED-0101"
+                  value={newMed.medicineCode}
+                  onChange={(e) => setNewMed({ ...newMed, medicineCode: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono-num"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-600 mb-1">Barcode / EAN-13</label>
+                <input
+                  type="text"
+                  placeholder="Scan or type barcode"
+                  value={newMed.barcode}
+                  onChange={(e) => setNewMed({ ...newMed, barcode: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono-num"
+                />
+              </div>
               <div>
                 <label className="block text-slate-600 mb-1">Brand Name *</label>
                 <input
@@ -499,20 +625,21 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                 />
               </div>
               <div>
-                <label className="block text-slate-600 mb-1">Bangla Name</label>
-                <input
-                  type="text"
-                  value={newMed.banglaName}
-                  onChange={(e) => setNewMed({ ...newMed, banglaName: e.target.value })}
-                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
-                />
-              </div>
-              <div>
                 <label className="block text-slate-600 mb-1">Strength (e.g. 500 mg)</label>
                 <input
                   type="text"
                   value={newMed.strength}
                   onChange={(e) => setNewMed({ ...newMed, strength: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-600 mb-1">Storage / Shelf Location</label>
+                <input
+                  type="text"
+                  placeholder="e.g. Shelf A1 · Room Temp"
+                  value={newMed.storageInfo}
+                  onChange={(e) => setNewMed({ ...newMed, storageInfo: e.target.value })}
                   className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
                 />
               </div>
@@ -555,8 +682,8 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
               <div>
                 <label className="block text-slate-600 mb-1">Min Stock Level (Base)</label>
                 <input
-                  type="number"
-                  min="0"
+                  type="text"
+                  inputMode="decimal"
                   value={newMed.minStockLevel}
                   onChange={(e) => setNewMed({ ...newMed, minStockLevel: e.target.value })}
                   className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono-num"
@@ -575,9 +702,8 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
               <div>
                 <label className="block text-slate-600 mb-1">Conversion to Base</label>
                 <input
-                  type="number"
-                  step="0.0001"
-                  min="0.0001"
+                  type="text"
+                  inputMode="decimal"
                   value={newMed.extraUnitConv}
                   onChange={(e) => setNewMed({ ...newMed, extraUnitConv: e.target.value })}
                   className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono-num"
@@ -611,15 +737,156 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
         </div>
       )}
 
+      {/* Edit Medicine Modal */}
+      {editingMed && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <form
+            onSubmit={handleSaveEditMedicine}
+            className="bg-white border border-slate-200 rounded-lg w-full max-w-xl p-6 space-y-3"
+          >
+            <h3 className="text-base font-bold text-slate-900">
+              Edit Medicine · {editingMed.brand_name}
+            </h3>
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div>
+                <label className="block text-slate-600 mb-1">Medicine Code</label>
+                <input
+                  type="text"
+                  value={editForm.medicineCode}
+                  onChange={(e) => setEditForm({ ...editForm, medicineCode: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono-num"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-600 mb-1">Barcode</label>
+                <input
+                  type="text"
+                  value={editForm.barcode}
+                  onChange={(e) => setEditForm({ ...editForm, barcode: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono-num"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-600 mb-1">Brand Name *</label>
+                <input
+                  type="text"
+                  required
+                  value={editForm.brandName}
+                  onChange={(e) => setEditForm({ ...editForm, brandName: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-600 mb-1">Generic Name *</label>
+                <input
+                  type="text"
+                  required
+                  value={editForm.genericName}
+                  onChange={(e) => setEditForm({ ...editForm, genericName: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-600 mb-1">Strength</label>
+                <input
+                  type="text"
+                  value={editForm.strength}
+                  onChange={(e) => setEditForm({ ...editForm, strength: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-600 mb-1">Storage / Shelf Location</label>
+                <input
+                  type="text"
+                  value={editForm.storageInfo}
+                  onChange={(e) => setEditForm({ ...editForm, storageInfo: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-600 mb-1">Category</label>
+                <select
+                  value={editForm.categoryId}
+                  onChange={(e) => setEditForm({ ...editForm, categoryId: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                >
+                  <option value="">Select category</option>
+                  {categories.map((c) => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-slate-600 mb-1">Manufacturer</label>
+                <select
+                  value={editForm.manufacturerId}
+                  onChange={(e) => setEditForm({ ...editForm, manufacturerId: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                >
+                  <option value="">Select manufacturer</option>
+                  {manufacturers.map((m) => (
+                    <option key={m.id} value={m.id}>{m.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-slate-600 mb-1">Min Stock Level ({editingMed.base_unit_name})</label>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={editForm.minStockLevel}
+                  onChange={(e) => setEditForm({ ...editForm, minStockLevel: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded font-mono-num"
+                />
+              </div>
+              <div className="flex items-center gap-4 pt-5">
+                <label className="inline-flex items-center gap-1.5 text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={editForm.rxRequired}
+                    onChange={(e) => setEditForm({ ...editForm, rxRequired: e.target.checked })}
+                  />
+                  Rx Required
+                </label>
+                <label className="inline-flex items-center gap-1.5 text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={editForm.isActive}
+                    onChange={(e) => setEditForm({ ...editForm, isActive: e.target.checked })}
+                  />
+                  Active
+                </label>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setEditingMed(null)}
+                className="px-4 py-2 text-xs font-medium text-slate-700 bg-slate-100 rounded-md"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
+              >
+                Save Medicine
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {/* Excel Import Modal */}
       {showImportModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
           <div className="bg-white border border-slate-200 rounded-lg w-full max-w-4xl max-h-[88vh] flex flex-col p-6 space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <h3 className="text-base font-bold text-slate-900">Excel Medicine & Opening Stock Import</h3>
+                <h3 className="text-base font-bold text-slate-900">Excel Medicine &amp; Opening Stock Import</h3>
                 <p className="text-xs text-slate-500">
-                  Validate rows, resolve duplicates explicitly, and import atomically.
+                  Validate rows with strict numeric checks, resolve duplicates explicitly, and import atomically.
                 </p>
               </div>
               <a
@@ -644,7 +911,7 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                   <thead className="bg-slate-50 border-b border-slate-200">
                     <tr>
                       <th className="px-3 py-2 text-left">Row</th>
-                      <th className="px-3 py-2 text-left">Medicine</th>
+                      <th className="px-3 py-2 text-left">Medicine &amp; Code</th>
                       <th className="px-3 py-2 text-left">Units</th>
                       <th className="px-3 py-2 text-left">Opening Batch</th>
                       <th className="px-3 py-2 text-left">Duplicate / Validation</th>
@@ -657,12 +924,17 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                         <td className="px-3 py-2">
                           <div className="font-medium">{r.brandName} {r.strength}</div>
                           <div className="text-slate-500">{r.genericName}</div>
+                          {(r.medicineCode || r.barcode) && (
+                            <div className="text-[11px] font-mono-num text-slate-400">
+                              {r.medicineCode} {r.barcode ? `· ${r.barcode}` : ''}
+                            </div>
+                          )}
                         </td>
                         <td className="px-3 py-2 font-mono-num">
-                          Base: {r.baseUnit} {r.secondaryUnit ? `· 1 ${r.secondaryUnit}=${r.secondaryConversion}` : ''}
+                          Base: {r.baseUnit} {r.secondaryUnit ? `· 1 ${r.secondaryUnit}=${formatQty(r.secondaryConversion)}` : ''}
                         </td>
                         <td className="px-3 py-2 font-mono-num">
-                          {r.openingBatchNumber ? `${r.openingBatchNumber} (${r.openingQtyBase}, Exp ${r.openingExpiryDate})` : '—'}
+                          {r.openingBatchNumber ? `${r.openingBatchNumber} (${formatQty(r.openingQtyBase)}, Exp ${r.openingExpiryDate})` : '—'}
                         </td>
                         <td className="px-3 py-2">
                           {r.errors.length > 0 ? (
@@ -713,7 +985,7 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                 onClick={handleExecuteImport}
                 className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
               >
-                Confirm & Execute Atomic Import
+                Confirm &amp; Execute Atomic Import
               </button>
             </div>
           </div>

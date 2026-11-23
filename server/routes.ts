@@ -1,18 +1,26 @@
+import crypto from 'node:crypto';
+import os from 'node:os';
+import Decimal from 'decimal.js';
 import express from 'express';
 import { getDb, nowIso, todayDate, uuid, withTransaction } from './db.ts';
 import {
   SESSION_COOKIE_NAME,
+  checkLoginRateLimit,
+  clearLoginAttempts,
   createSession,
   deleteSession,
+  extractClientIp,
   getUserEffectivePermissions,
   hashPassword,
   loadAuthUserById,
+  recordFailedLoginAttempt,
   requireAuth,
+  requireCsrfProtection,
   requirePermission,
   requireWritableLicense,
   verifyPassword,
 } from './auth.ts';
-import { recordAudit, verifyAuditChain } from './audit.ts';
+import { exportAuditLogsExcelBuffer, queryAuditLogs, recordAudit, verifyAuditChain } from './audit.ts';
 import { getCurrentLicenseStatus, installLicenseFile, type SignedLicenseFile } from './licensing.ts';
 import {
   adjustStock,
@@ -53,12 +61,25 @@ import {
   getComprehensiveReport,
   getDashboardStats,
 } from './services/reportService.ts';
-import { d, money } from '../src/shared/decimalMath.ts';
+import { d, qty, validateCurrencyInput, validateQuantityInput } from '../src/shared/decimalMath.ts';
+
+function getLanAddresses(port: number): string[] {
+  const ifaces = os.networkInterfaces();
+  const urls: string[] = [`http://localhost:${port}`];
+  for (const entries of Object.values(ifaces)) {
+    for (const iface of entries || []) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        urls.push(`http://${iface.address}:${port}`);
+      }
+    }
+  }
+  return urls;
+}
 
 export function buildApiRouter() {
   const router = express.Router();
+  router.use(requireCsrfProtection);
 
-  // Helper error wrapper
   const handle =
     (fn: (req: express.Request, res: express.Response) => Promise<void> | void) =>
     async (req: express.Request, res: express.Response) => {
@@ -69,6 +90,64 @@ export function buildApiRouter() {
         res.status(400).json({ error: msg });
       }
     };
+
+  const withIdempotency = async (
+    req: express.Request,
+    res: express.Response,
+    endpoint: string,
+    defaultStatus: number,
+    fn: () => Promise<unknown> | unknown
+  ) => {
+    const headerKey = req.get('x-idempotency-key') || req.get('idempotency-key');
+    const bodyKey =
+      req.body && typeof req.body === 'object' && typeof (req.body as Record<string, unknown>).idempotencyKey === 'string'
+        ? String((req.body as Record<string, unknown>).idempotencyKey)
+        : '';
+    const key = (headerKey || bodyKey || '').trim();
+
+    if (!key) {
+      const payload = await fn();
+      res.status(defaultStatus).json(payload);
+      return;
+    }
+
+    const db = getDb();
+    const userId = req.authUser?.id || 'anonymous';
+    const bodyClone = req.body && typeof req.body === 'object' ? { ...(req.body as Record<string, unknown>) } : {};
+    delete bodyClone.idempotencyKey;
+    const requestHash = crypto.createHash('sha256').update(JSON.stringify(bodyClone)).digest('hex');
+
+    const existing = db
+      .prepare(
+        'SELECT request_hash, response_status, response_json FROM idempotency_keys WHERE idempotency_key = ? AND endpoint = ? AND user_id = ?'
+      )
+      .get(key, endpoint, userId) as
+      | { request_hash: string; response_status: number; response_json: string }
+      | undefined;
+
+    if (existing) {
+      if (existing.request_hash !== requestHash) {
+        res.status(409).json({
+          error: 'Idempotency key was already used with a different request payload. Start a new submission.',
+        });
+        return;
+      }
+      res.status(existing.response_status).json(JSON.parse(existing.response_json));
+      return;
+    }
+
+    const result = await fn();
+    const serialized = JSON.stringify(result);
+    try {
+      db.prepare(
+        `INSERT INTO idempotency_keys (idempotency_key, endpoint, user_id, request_hash, response_status, response_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(key, endpoint, userId, requestHash, defaultStatus, serialized, nowIso());
+    } catch {
+      // Ignore rare race insert on identical key; response still valid
+    }
+    res.status(defaultStatus).json(result);
+  };
 
   // --- AUTH & BOOTSTRAP ---
   router.get('/auth/me', (req, res) => {
@@ -91,37 +170,97 @@ export function buildApiRouter() {
         res.status(400).json({ error: 'Username and password are required' });
         return;
       }
+      const ipAddress = extractClientIp(req);
+      const rate = checkLoginRateLimit(username, ipAddress);
+      if (rate.blocked) {
+        withTransaction((tx) => {
+          recordAudit(tx, {
+            userId: null,
+            username: username.trim(),
+            ipAddress,
+            action: 'FAILED_LOGIN',
+            module: 'accounts',
+            targetType: 'USER',
+            targetId: username.trim(),
+            status: 'FAILURE',
+            reason: `Rate-limited for ${rate.retryAfterMinutes} minute(s)`,
+          });
+        });
+        res.status(429).json({
+          error: `Too many failed login attempts. Try again in ${rate.retryAfterMinutes} minute(s).`,
+        });
+        return;
+      }
+
       const db = getDb();
       const row = db
         .prepare('SELECT id, username, password_hash, is_active FROM users WHERE LOWER(username) = LOWER(?)')
         .get(username.trim()) as { id: string; username: string; password_hash: string; is_active: number } | undefined;
 
       if (!row || !verifyPassword(password, row.password_hash)) {
-        res.status(401).json({ error: 'Invalid username or password' });
+        const failInfo = recordFailedLoginAttempt(username, ipAddress);
+        withTransaction((tx) => {
+          recordAudit(tx, {
+            userId: row?.id || null,
+            username: username.trim(),
+            ipAddress,
+            action: 'FAILED_LOGIN',
+            module: 'accounts',
+            targetType: 'USER',
+            targetId: row?.id || username.trim(),
+            status: 'FAILURE',
+            reason: failInfo.locked ? 'Invalid credentials — account temporarily rate-locked' : 'Invalid credentials',
+          });
+        });
+        res.status(401).json({
+          error: failInfo.locked
+            ? 'Invalid username or password. Account login locked for 15 minutes.'
+            : 'Invalid username or password',
+        });
         return;
       }
       if (!row.is_active) {
+        withTransaction((tx) => {
+          recordAudit(tx, {
+            userId: row.id,
+            username: row.username,
+            ipAddress,
+            action: 'FAILED_LOGIN',
+            module: 'accounts',
+            targetType: 'USER',
+            targetId: row.id,
+            status: 'FAILURE',
+            reason: 'Deactivated account login attempt',
+          });
+        });
         res.status(403).json({ error: 'User account is deactivated. Contact your Pharmacy Admin.' });
         return;
       }
 
-      const { token } = createSession(row.id);
-      const user = loadAuthUserById(row.id);
+      clearLoginAttempts(username, ipAddress);
+      const { token, ttlMs } = createSession(row.id);
+      const sessionHash = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
+      const ts = nowIso();
       withTransaction((tx) => {
+        tx.prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(ts, ts, row.id);
         recordAudit(tx, {
           userId: row.id,
           username: row.username,
+          sessionId: sessionHash,
+          ipAddress,
           action: 'USER_LOGIN',
           module: 'accounts',
           targetType: 'USER',
           targetId: row.id,
+          status: 'SUCCESS',
         });
       });
 
+      const user = loadAuthUserById(row.id);
       res.cookie(SESSION_COOKIE_NAME, token, {
         httpOnly: true,
         sameSite: 'lax',
-        maxAge: 1000 * 60 * 60 * 16,
+        maxAge: ttlMs,
       });
       res.json({ user });
     })
@@ -130,6 +269,10 @@ export function buildApiRouter() {
   router.post(
     '/auth/logout',
     handle((req, res) => {
+      const ipAddress = extractClientIp(req);
+      const sessionHash = req.sessionToken
+        ? crypto.createHash('sha256').update(req.sessionToken).digest('hex').slice(0, 16)
+        : '';
       if (req.sessionToken) {
         deleteSession(req.sessionToken);
       }
@@ -138,15 +281,68 @@ export function buildApiRouter() {
           recordAudit(tx, {
             userId: req.authUser!.id,
             username: req.authUser!.username,
+            sessionId: sessionHash,
+            ipAddress,
             action: 'USER_LOGOUT',
             module: 'accounts',
             targetType: 'USER',
             targetId: req.authUser!.id,
+            status: 'SUCCESS',
           });
         });
       }
       res.clearCookie(SESSION_COOKIE_NAME);
+      res.clearCookie('shifarx_session');
       res.json({ ok: true });
+    })
+  );
+
+  router.post(
+    '/auth/change-password',
+    requireAuth,
+    handle((req, res) => {
+      const { currentPassword, newPassword } = req.body as {
+        currentPassword?: string;
+        newPassword?: string;
+      };
+      if (!newPassword || newPassword.length < 6) {
+        throw new Error('New password must be at least 6 characters');
+      }
+      const db = getDb();
+      const row = db
+        .prepare('SELECT password_hash, must_change_password FROM users WHERE id = ?')
+        .get(req.authUser!.id) as { password_hash: string; must_change_password: number } | undefined;
+      if (!row) throw new Error('User not found');
+
+      if (!row.must_change_password) {
+        if (!currentPassword || !verifyPassword(currentPassword, row.password_hash)) {
+          throw new Error('Current password is incorrect');
+        }
+      } else if (currentPassword && !verifyPassword(currentPassword, row.password_hash)) {
+        throw new Error('Current password is incorrect');
+      }
+
+      const ipAddress = extractClientIp(req);
+      withTransaction((tx) => {
+        const ts = nowIso();
+        tx.prepare('UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?').run(
+          hashPassword(newPassword),
+          ts,
+          req.authUser!.id
+        );
+        recordAudit(tx, {
+          userId: req.authUser!.id,
+          username: req.authUser!.username,
+          ipAddress,
+          action: 'CHANGE_PASSWORD',
+          module: 'accounts',
+          targetType: 'USER',
+          targetId: req.authUser!.id,
+          status: 'SUCCESS',
+        });
+      });
+
+      res.json({ user: loadAuthUserById(req.authUser!.id) });
     })
   );
 
@@ -161,6 +357,9 @@ export function buildApiRouter() {
         newPassword?: string;
       };
       if (!fullName?.trim()) throw new Error('Full name is required');
+      if (newPassword && newPassword.length < 6) {
+        throw new Error('New password must be at least 6 characters');
+      }
       withTransaction((tx) => {
         const ts = nowIso();
         tx.prepare('UPDATE users SET full_name = ?, phone = ?, email = ?, updated_at = ? WHERE id = ?').run(
@@ -171,7 +370,7 @@ export function buildApiRouter() {
           req.authUser!.id
         );
         if (newPassword && newPassword.length >= 6) {
-          tx.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?').run(
+          tx.prepare('UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?').run(
             hashPassword(newPassword),
             ts,
             req.authUser!.id
@@ -180,6 +379,7 @@ export function buildApiRouter() {
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
           action: 'UPDATE_OWN_PROFILE',
           module: 'accounts',
           targetType: 'USER',
@@ -296,7 +496,7 @@ export function buildApiRouter() {
     handle((_req, res) => {
       const buf = buildMedicineImportTemplateBuffer();
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', 'attachment; filename="shifarx_medicine_import_template.xlsx"');
+      res.setHeader('Content-Disposition', 'attachment; filename="medinest_medicine_import_template.xlsx"');
       res.send(buf);
     })
   );
@@ -332,21 +532,29 @@ export function buildApiRouter() {
     '/inventory',
     requireAuth,
     requirePermission('inventory.view'),
-    handle((_req, res) => {
+    handle((req, res) => {
       const db = getDb();
       const today = todayDate();
+      const search = String(req.query.search || '').trim().toLowerCase();
       const settings = db.prepare('SELECT expiry_warning_days FROM pharmacy_settings WHERE id = 1').get() as {
         expiry_warning_days: number;
       };
+
+      const whereClause = search
+        ? `WHERE (LOWER(b.batch_number) LIKE ? OR LOWER(m.brand_name) LIKE ? OR LOWER(m.generic_name) LIKE ? OR LOWER(m.medicine_code) LIKE ? OR LOWER(m.barcode) LIKE ?)`
+        : '';
+      const searchParams = search ? [`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`] : [];
+
       const batches = db
         .prepare(
-          `SELECT b.*, m.brand_name, m.generic_name, m.strength, m.bangla_name, s.name as supplier_name
+          `SELECT b.*, m.brand_name, m.generic_name, m.strength, m.medicine_code, m.barcode, m.storage_info, s.name as supplier_name
            FROM batches b
            JOIN medicines m ON m.id = b.medicine_id
            LEFT JOIN suppliers s ON s.id = b.supplier_id
+           ${whereClause}
            ORDER BY b.expiry_date ASC`
         )
-        .all();
+        .all(...searchParams);
       const movements = db
         .prepare(
           `SELECT sm.*, m.brand_name, b.batch_number, u.username
@@ -383,9 +591,8 @@ export function buildApiRouter() {
     requireAuth,
     requireWritableLicense,
     requirePermission('inventory.adjust'),
-    handle((req, res) => {
-      const result = adjustStock(req.authUser!, req.body);
-      res.json(result);
+    handle(async (req, res) => {
+      await withIdempotency(req, res, 'POST:/inventory/adjust', 200, () => adjustStock(req.authUser!, req.body));
     })
   );
 
@@ -396,7 +603,7 @@ export function buildApiRouter() {
     requirePermission('inventory.expiry'),
     handle((req, res) => {
       const { status, reason } = req.body as {
-        status: 'ACTIVE' | 'QUARANTINED' | 'EXPIRED' | 'WRITTEN_OFF';
+        status: 'ACTIVE' | 'QUARANTINED' | 'EXPIRED' | 'WRITTEN_OFF' | 'DAMAGED';
         reason: string;
       };
       changeBatchStatus(req.authUser!, String(req.params.id), status, reason);
@@ -409,17 +616,27 @@ export function buildApiRouter() {
     '/purchases',
     requireAuth,
     requirePermission('purchases.view'),
-    handle((_req, res) => {
+    handle((req, res) => {
       const db = getDb();
+      const search = String(req.query.search || '').trim().toLowerCase();
+      const limit = Math.min(250, Math.max(1, Number(req.query.limit || 100)));
+      const offset = Math.max(0, Number(req.query.offset || 0));
+
+      const whereClause = search
+        ? `WHERE (LOWER(p.purchase_number) LIKE ? OR LOWER(p.supplier_invoice_no) LIKE ? OR LOWER(s.name) LIKE ?)`
+        : '';
+      const params = search ? [`%${search}%`, `%${search}%`, `%${search}%`] : [];
+
       const purchases = db
         .prepare(
           `SELECT p.*, s.name as supplier_name, u.full_name as created_by_name
            FROM purchases p
            JOIN suppliers s ON s.id = p.supplier_id
            JOIN users u ON u.id = p.created_by
-           ORDER BY p.created_at DESC LIMIT 100`
+           ${whereClause}
+           ORDER BY p.created_at DESC LIMIT ? OFFSET ?`
         )
-        .all() as Array<Record<string, unknown>>;
+        .all(...params, limit, offset) as Array<Record<string, unknown>>;
 
       const lineStmt = db.prepare(
         `SELECT pl.*, m.brand_name, m.strength, m.base_unit_name, b.current_qty_base as batch_current_qty
@@ -450,12 +667,11 @@ export function buildApiRouter() {
     requireAuth,
     requireWritableLicense,
     requirePermission('purchases.create'),
-    handle((req, res) => {
+    handle(async (req, res) => {
       if (req.body.status === 'RECEIVED' && !req.authUser!.permissions['purchases.receive']) {
         throw new Error('Permission denied: receiving stock requires purchases.receive');
       }
-      const result = createPurchase(req.authUser!, req.body);
-      res.status(201).json(result);
+      await withIdempotency(req, res, 'POST:/purchases', 201, () => createPurchase(req.authUser!, req.body));
     })
   );
 
@@ -464,13 +680,16 @@ export function buildApiRouter() {
     requireAuth,
     requireWritableLicense,
     requirePermission('purchases.receive'),
-    handle((req, res) => {
-      const { paidAmount, paymentMethod } = req.body as {
-        paidAmount?: string;
-        paymentMethod?: 'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD' | 'OTHER';
-      };
-      receiveDraftPurchase(req.authUser!, String(req.params.id), paidAmount, paymentMethod);
-      res.json({ ok: true });
+    handle(async (req, res) => {
+      const id = String(req.params.id);
+      await withIdempotency(req, res, `POST:/purchases/${id}/receive`, 200, () => {
+        const { paidAmount, paymentMethod } = req.body as {
+          paidAmount?: string;
+          paymentMethod?: 'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD' | 'OTHER';
+        };
+        receiveDraftPurchase(req.authUser!, id, paidAmount, paymentMethod);
+        return { ok: true };
+      });
     })
   );
 
@@ -501,9 +720,8 @@ export function buildApiRouter() {
     requireAuth,
     requireWritableLicense,
     requirePermission('purchases.return'),
-    handle((req, res) => {
-      const result = createPurchaseReturn(req.authUser!, req.body);
-      res.status(201).json(result);
+    handle(async (req, res) => {
+      await withIdempotency(req, res, 'POST:/purchase-returns', 201, () => createPurchaseReturn(req.authUser!, req.body));
     })
   );
 
@@ -512,25 +730,35 @@ export function buildApiRouter() {
     '/sales',
     requireAuth,
     requirePermission('sales.view'),
-    handle((_req, res) => {
+    handle((req, res) => {
       const db = getDb();
+      const search = String(req.query.search || '').trim().toLowerCase();
+      const limit = Math.min(250, Math.max(1, Number(req.query.limit || 120)));
+      const offset = Math.max(0, Number(req.query.offset || 0));
+
+      const whereClause = search
+        ? `WHERE (LOWER(s.invoice_number) LIKE ? OR LOWER(COALESCE(c.name, 'Walk-in Customer')) LIKE ? OR LOWER(COALESCE(c.phone, '')) LIKE ?)`
+        : '';
+      const params = search ? [`%${search}%`, `%${search}%`, `%${search}%`] : [];
+
       const sales = db
         .prepare(
           `SELECT s.*, COALESCE(c.name, 'Walk-in Customer') as customer_name, c.phone as customer_phone, u.full_name as cashier_name
            FROM sales s
            LEFT JOIN customers c ON c.id = s.customer_id
            JOIN users u ON u.id = s.created_by
-           ORDER BY s.created_at DESC LIMIT 120`
+           ${whereClause}
+           ORDER BY s.created_at DESC LIMIT ? OFFSET ?`
         )
-        .all() as Array<Record<string, unknown>>;
+        .all(...params, limit, offset) as Array<Record<string, unknown>>;
 
       const lineStmt = db.prepare(
-        `SELECT sl.*, m.brand_name, m.generic_name, m.bangla_name, m.strength, m.base_unit_name,
-                COALESCE((SELECT SUM(CAST(srl.qty_base AS REAL)) FROM sales_return_lines srl WHERE srl.sale_line_id = sl.id), 0) as returned_qty_base
+        `SELECT sl.*, m.brand_name, m.generic_name, m.medicine_code, m.barcode, m.strength, m.base_unit_name
          FROM sale_lines sl
          JOIN medicines m ON m.id = sl.medicine_id
          WHERE sl.sale_id = ?`
       );
+      const retQtyStmt = db.prepare('SELECT qty_base FROM sales_return_lines WHERE sale_line_id = ?');
       const allocStmt = db.prepare(
         `SELECT sba.*, b.batch_number, b.expiry_date
          FROM sale_batch_allocations sba
@@ -565,10 +793,17 @@ export function buildApiRouter() {
 
       res.json({
         sales: sales.map((s) => {
-          const lines = (lineStmt.all(String(s.id)) as Array<Record<string, unknown>>).map((l) => ({
-            ...l,
-            allocations: allocStmt.all(String(l.id)),
-          }));
+          const lines = (lineStmt.all(String(s.id)) as Array<Record<string, unknown>>).map((l) => {
+            const retRows = retQtyStmt.all(String(l.id)) as Array<{ qty_base: string }>;
+            let returnedQty = new Decimal(0);
+            for (const rr of retRows) returnedQty = returnedQty.add(qty(rr.qty_base));
+            return {
+              ...l,
+              returned_qty_base: returnedQty.toNumber(),
+              returned_qty_base_str: returnedQty.toFixed(6),
+              allocations: allocStmt.all(String(l.id)),
+            };
+          });
           return {
             ...s,
             lines,
@@ -585,9 +820,8 @@ export function buildApiRouter() {
     requireAuth,
     requireWritableLicense,
     requirePermission('pos.sell'),
-    handle((req, res) => {
-      const result = completeSale(req.authUser!, req.body);
-      res.status(201).json(result);
+    handle(async (req, res) => {
+      await withIdempotency(req, res, 'POST:/sales', 201, () => completeSale(req.authUser!, req.body));
     })
   );
 
@@ -607,9 +841,8 @@ export function buildApiRouter() {
     requireAuth,
     requireWritableLicense,
     requirePermission('sales.return'),
-    handle((req, res) => {
-      const result = createSalesReturn(req.authUser!, req.body);
-      res.status(201).json(result);
+    handle(async (req, res) => {
+      await withIdempotency(req, res, 'POST:/sales-returns', 201, () => createSalesReturn(req.authUser!, req.body));
     })
   );
 
@@ -648,6 +881,7 @@ export function buildApiRouter() {
         notes?: string;
       };
       if (!name?.trim()) throw new Error('Customer name is required');
+      const validatedLimit = validateCurrencyInput(creditLimit || '0', 'Credit limit', { allowZero: true });
       const db = getDb();
       const cnt = (db.prepare('SELECT COUNT(*) as cnt FROM customers').get() as { cnt: number }).cnt + 1;
       const code = `CUST-${String(cnt).padStart(3, '0')}`;
@@ -657,7 +891,7 @@ export function buildApiRouter() {
         tx.prepare(
           `INSERT INTO customers (id, code, name, phone, address, opening_balance, current_balance, credit_limit, notes, is_active, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, '0.00', '0.00', ?, ?, 1, ?, ?)`
-        ).run(id, code, name.trim(), (phone || '').trim(), (address || '').trim(), money(creditLimit || '0').toFixed(2), (notes || '').trim(), ts, ts);
+        ).run(id, code, name.trim(), (phone || '').trim(), (address || '').trim(), validatedLimit.toFixed(2), (notes || '').trim(), ts, ts);
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
@@ -665,7 +899,7 @@ export function buildApiRouter() {
           module: 'customers',
           targetType: 'CUSTOMER',
           targetId: id,
-          afterState: { code, name },
+          afterState: { code, name: name.trim() },
         });
       });
       res.status(201).json({ id, code });
@@ -717,7 +951,7 @@ export function buildApiRouter() {
           module: 'suppliers',
           targetType: 'SUPPLIER',
           targetId: id,
-          afterState: { code, name },
+          afterState: { code, name: name.trim() },
         });
       });
       res.status(201).json({ id, code });
@@ -732,7 +966,7 @@ export function buildApiRouter() {
     handle((req, res) => {
       const { amountDelta, reason } = req.body as { amountDelta?: string; reason?: string };
       if (!reason?.trim()) throw new Error('Mandatory reason is required for customer balance adjustment');
-      const delta = money(amountDelta || '0');
+      const delta = validateCurrencyInput(amountDelta || '0', 'Balance adjustment', { allowNegative: true });
       if (delta.eq(0)) throw new Error('Adjustment amount cannot be zero');
 
       withTransaction((tx) => {
@@ -740,7 +974,7 @@ export function buildApiRouter() {
           | { id: string; name: string; current_balance: string }
           | undefined;
         if (!cust) throw new Error('Customer not found');
-        const nextBal = money(d(cust.current_balance).add(delta));
+        const nextBal = d(cust.current_balance).add(delta).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
         tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
           nextBal.toFixed(2),
           nowIso(),
@@ -767,9 +1001,8 @@ export function buildApiRouter() {
     requireAuth,
     requireWritableLicense,
     requirePermission('payments.record'),
-    handle((req, res) => {
-      const result = recordPartyPayment(req.authUser!, req.body);
-      res.status(201).json(result);
+    handle(async (req, res) => {
+      await withIdempotency(req, res, 'POST:/payments', 201, () => recordPartyPayment(req.authUser!, req.body));
     })
   );
 
@@ -820,10 +1053,11 @@ export function buildApiRouter() {
     requireAuth,
     requireWritableLicense,
     requirePermission('cash.open'),
-    handle((req, res) => {
-      const { openingCash, notes } = req.body as { openingCash?: string; notes?: string };
-      const result = openCashSession(req.authUser!, openingCash || '0', notes || '');
-      res.status(201).json(result);
+    handle(async (req, res) => {
+      await withIdempotency(req, res, 'POST:/cash-sessions/open', 201, () => {
+        const { openingCash, notes } = req.body as { openingCash?: string; notes?: string };
+        return openCashSession(req.authUser!, openingCash || '0', notes || '');
+      });
     })
   );
 
@@ -832,9 +1066,11 @@ export function buildApiRouter() {
     requireAuth,
     requireWritableLicense,
     requirePermission('cash.close'),
-    handle((req, res) => {
-      const result = closeCashSession(req.authUser!, String(req.params.id), req.body);
-      res.json(result);
+    handle(async (req, res) => {
+      const id = String(req.params.id);
+      await withIdempotency(req, res, `POST:/cash-sessions/${id}/close`, 200, () =>
+        closeCashSession(req.authUser!, id, req.body)
+      );
     })
   );
 
@@ -843,9 +1079,8 @@ export function buildApiRouter() {
     requireAuth,
     requireWritableLicense,
     requirePermission('expenses.manage'),
-    handle((req, res) => {
-      const result = createExpense(req.authUser!, req.body);
-      res.status(201).json(result);
+    handle(async (req, res) => {
+      await withIdempotency(req, res, 'POST:/expenses', 201, () => createExpense(req.authUser!, req.body));
     })
   );
 
@@ -860,7 +1095,7 @@ export function buildApiRouter() {
     })
   );
 
-  // --- REPORTS & EXCEL EXPORT (Always readable even if license is expired!) ---
+  // --- REPORTS & EXCEL EXPORT ---
   router.get(
     '/reports',
     requireAuth,
@@ -880,6 +1115,7 @@ export function buildApiRouter() {
           cogsReversedOnReturns: 'RESTRICTED',
           netCogs: 'RESTRICTED',
           grossProfit: 'RESTRICTED',
+          netProfit: 'RESTRICTED',
         };
       }
       res.json(data);
@@ -896,12 +1132,69 @@ export function buildApiRouter() {
         toDate: req.query.toDate ? String(req.query.toDate) : undefined,
       });
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', `attachment; filename="shifarx-report-${todayDate()}.xlsx"`);
+      res.setHeader('Content-Disposition', `attachment; filename="medinest-report-${todayDate()}.xlsx"`);
       res.send(buf);
     })
   );
 
-  // --- ADMIN: USERS, ROLES, OVERRIDES, SETTINGS, AUDIT, BACKUP, LICENSING ---
+  // --- ADMIN: USERS, ROLES, OVERRIDES, SETTINGS, AUDIT, BACKUP, LICENSING, LAN ---
+  router.get(
+    '/admin/network-info',
+    requireAuth,
+    handle((_req, res) => {
+      const port = Number(process.env.PORT || 3000);
+      res.json({
+        port,
+        hostname: os.hostname(),
+        urls: getLanAddresses(port),
+      });
+    })
+  );
+
+  router.get(
+    '/admin/audit',
+    requireAuth,
+    requirePermission('admin.audit'),
+    handle((req, res) => {
+      const db = getDb();
+      const result = queryAuditLogs(db, {
+        search: req.query.search ? String(req.query.search) : undefined,
+        action: req.query.action ? String(req.query.action) : undefined,
+        module: req.query.module ? String(req.query.module) : undefined,
+        userId: req.query.userId ? String(req.query.userId) : undefined,
+        status: req.query.status ? String(req.query.status) : undefined,
+        fromDate: req.query.fromDate ? String(req.query.fromDate) : undefined,
+        toDate: req.query.toDate ? String(req.query.toDate) : undefined,
+        limit: req.query.limit ? Number(req.query.limit) : 100,
+        offset: req.query.offset ? Number(req.query.offset) : 0,
+      });
+      res.json({
+        ...result,
+        auditChain: verifyAuditChain(db),
+      });
+    })
+  );
+
+  router.get(
+    '/admin/audit/export',
+    requireAuth,
+    requirePermission('admin.audit'),
+    handle((req, res) => {
+      const db = getDb();
+      const buf = exportAuditLogsExcelBuffer(db, {
+        search: req.query.search ? String(req.query.search) : undefined,
+        action: req.query.action ? String(req.query.action) : undefined,
+        module: req.query.module ? String(req.query.module) : undefined,
+        status: req.query.status ? String(req.query.status) : undefined,
+        fromDate: req.query.fromDate ? String(req.query.fromDate) : undefined,
+        toDate: req.query.toDate ? String(req.query.toDate) : undefined,
+      });
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="medinest-audit-logs-${todayDate()}.xlsx"`);
+      res.send(buf);
+    })
+  );
+
   router.get(
     '/admin/overview',
     requireAuth,
@@ -917,7 +1210,8 @@ export function buildApiRouter() {
       const users = canUsers
         ? db
             .prepare(
-              `SELECT u.id, u.username, u.full_name, u.phone, u.email, u.role_id, r.name as role_name, u.is_super_admin, u.is_active, u.created_at
+              `SELECT u.id, u.username, u.full_name, u.phone, u.email, u.role_id, r.name as role_name,
+                      u.is_super_admin, u.is_active, u.must_change_password, u.last_login_at, u.created_at
                FROM users u JOIN roles r ON r.id = u.role_id ORDER BY u.username ASC`
             )
             .all()
@@ -932,6 +1226,7 @@ export function buildApiRouter() {
         : [];
       const settings = db.prepare('SELECT * FROM pharmacy_settings WHERE id = 1').get();
       const license = getCurrentLicenseStatus();
+      const port = Number(process.env.PORT || 3000);
 
       res.json({
         roles,
@@ -944,6 +1239,11 @@ export function buildApiRouter() {
         backups,
         settings,
         license,
+        networkInfo: {
+          port,
+          hostname: os.hostname(),
+          urls: getLanAddresses(port),
+        },
       });
     })
   );
@@ -970,20 +1270,71 @@ export function buildApiRouter() {
       const ts = nowIso();
       withTransaction((tx) => {
         tx.prepare(
-          `INSERT INTO users (id, username, full_name, phone, email, password_hash, role_id, is_super_admin, is_active, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+          `INSERT INTO users (id, username, full_name, phone, email, password_hash, role_id, is_super_admin, is_active, must_change_password, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)`
         ).run(id, username.trim(), fullName.trim(), (phone || '').trim(), (email || '').trim(), hashPassword(password), roleId, isSuperAdmin ? 1 : 0, ts, ts);
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
           action: 'CREATE_USER',
           module: 'accounts',
           targetType: 'USER',
           targetId: id,
-          afterState: { username, fullName, roleId },
+          afterState: { username: username.trim(), fullName: fullName.trim(), roleId },
         });
       });
       res.status(201).json({ id });
+    })
+  );
+
+  router.put(
+    '/admin/users/:id',
+    requireAuth,
+    requireWritableLicense,
+    requirePermission('admin.users'),
+    handle((req, res) => {
+      const targetId = String(req.params.id);
+      const { fullName, phone, email, roleId, isSuperAdmin } = req.body as {
+        fullName?: string;
+        phone?: string;
+        email?: string;
+        roleId?: string;
+        isSuperAdmin?: boolean;
+      };
+      if (!fullName?.trim() || !roleId) {
+        throw new Error('Full name and role are required');
+      }
+      withTransaction((tx) => {
+        const before = tx
+          .prepare('SELECT id, username, full_name, phone, email, role_id, is_super_admin FROM users WHERE id = ?')
+          .get(targetId) as Record<string, unknown> | undefined;
+        if (!before) throw new Error('User not found');
+
+        tx.prepare(
+          `UPDATE users SET full_name = ?, phone = ?, email = ?, role_id = ?, is_super_admin = ?, updated_at = ? WHERE id = ?`
+        ).run(
+          fullName.trim(),
+          (phone || '').trim(),
+          (email || '').trim(),
+          roleId,
+          isSuperAdmin ? 1 : 0,
+          nowIso(),
+          targetId
+        );
+        recordAudit(tx, {
+          userId: req.authUser!.id,
+          username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
+          action: 'UPDATE_USER',
+          module: 'accounts',
+          targetType: 'USER',
+          targetId,
+          beforeState: before,
+          afterState: { fullName: fullName.trim(), phone: (phone || '').trim(), email: (email || '').trim(), roleId, isSuperAdmin: Boolean(isSuperAdmin) },
+        });
+      });
+      res.json({ ok: true });
     })
   );
 
@@ -1002,9 +1353,13 @@ export function buildApiRouter() {
         if (!u) throw new Error('User not found');
         const next = u.is_active ? 0 : 1;
         tx.prepare('UPDATE users SET is_active = ?, updated_at = ? WHERE id = ?').run(next, nowIso(), targetId);
+        if (!next) {
+          tx.prepare('DELETE FROM sessions WHERE user_id = ?').run(targetId);
+        }
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
           action: next ? 'REACTIVATE_USER' : 'DEACTIVATE_USER',
           module: 'accounts',
           targetType: 'USER',
@@ -1023,21 +1378,29 @@ export function buildApiRouter() {
     requireWritableLicense,
     requirePermission('admin.users'),
     handle((req, res) => {
-      const { newPassword } = req.body as { newPassword?: string };
+      const { newPassword, forceChange } = req.body as { newPassword?: string; forceChange?: boolean };
       if (!newPassword || newPassword.length < 6) throw new Error('Password must be at least 6 characters');
+      const targetId = String(req.params.id);
       withTransaction((tx) => {
-        tx.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?').run(
+        const u = tx.prepare('SELECT id, username FROM users WHERE id = ?').get(targetId) as
+          | { id: string; username: string }
+          | undefined;
+        if (!u) throw new Error('User not found');
+        tx.prepare('UPDATE users SET password_hash = ?, must_change_password = ?, updated_at = ? WHERE id = ?').run(
           hashPassword(newPassword),
+          forceChange === false ? 0 : 1,
           nowIso(),
-          String(req.params.id)
+          targetId
         );
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
           action: 'ADMIN_RESET_PASSWORD',
           module: 'accounts',
           targetType: 'USER',
-          targetId: String(req.params.id),
+          targetId,
+          afterState: { mustChangePassword: forceChange !== false },
         });
       });
       res.json({ ok: true });
@@ -1060,6 +1423,7 @@ export function buildApiRouter() {
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
           action: 'UPDATE_ROLE_PERMISSIONS',
           module: 'permissions',
           targetType: 'ROLE',
@@ -1099,6 +1463,7 @@ export function buildApiRouter() {
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
           action: 'SET_USER_PERMISSION_OVERRIDE',
           module: 'permissions',
           targetType: 'USER',
@@ -1119,11 +1484,16 @@ export function buildApiRouter() {
     handle((req, res) => {
       const s = req.body as {
         pharmacyName: string;
-        pharmacyNameBn: string;
         drugLicenseNo: string;
         address: string;
         phone: string;
         email: string;
+        website?: string;
+        currency?: string;
+        currencySymbol?: string;
+        timezone?: string;
+        defaultLowStockThreshold?: string;
+        sessionTimeoutMinutes?: number;
         logoDataUrl?: string;
         receiptFooter: string;
         expiryWarningDays: number;
@@ -1132,38 +1502,54 @@ export function buildApiRouter() {
         setupCompleted?: boolean;
       };
       if (!s.pharmacyName?.trim()) throw new Error('Pharmacy name is required');
+      const threshold = validateQuantityInput(String(s.defaultLowStockThreshold ?? '10'), 'Default low-stock threshold', {
+        allowZero: true,
+      });
+
       withTransaction((tx) => {
         const before = tx.prepare('SELECT * FROM pharmacy_settings WHERE id = 1').get();
         tx.prepare(
           `UPDATE pharmacy_settings SET
-            pharmacy_name = ?, pharmacy_name_bn = ?, drug_license_no = ?, address = ?, phone = ?, email = ?,
-            logo_data_url = COALESCE(?, logo_data_url), receipt_footer = ?, expiry_warning_days = ?,
-            backup_retention_count = ?, printer_type = ?, setup_completed = ?, updated_at = ?
+            pharmacy_name = ?, pharmacy_name_bn = '', drug_license_no = ?, address = ?, phone = ?, email = ?,
+            website = ?, currency = ?, currency_symbol = ?, timezone = ?, default_low_stock_threshold = ?,
+            session_timeout_minutes = ?, logo_data_url = COALESCE(?, logo_data_url), receipt_footer = ?,
+            expiry_warning_days = ?, backup_retention_count = ?, printer_type = ?, setup_completed = ?, updated_at = ?
            WHERE id = 1`
         ).run(
           s.pharmacyName.trim(),
-          (s.pharmacyNameBn || '').trim(),
           (s.drugLicenseNo || '').trim(),
           (s.address || '').trim(),
           (s.phone || '').trim(),
           (s.email || '').trim(),
+          (s.website || '').trim(),
+          (s.currency || 'BDT').trim().toUpperCase(),
+          (s.currencySymbol || '৳').trim(),
+          (s.timezone || 'Asia/Dhaka').trim(),
+          threshold.toFixed(6),
+          Math.min(1440, Math.max(15, Number(s.sessionTimeoutMinutes || 960))),
           s.logoDataUrl !== undefined ? s.logoDataUrl : null,
           (s.receiptFooter || '').trim(),
           Math.max(7, Number(s.expiryWarningDays || 90)),
           Math.max(3, Number(s.backupRetentionCount || 14)),
-          s.printerType || 'THERMAL_80MM',
+          s.printerType || 'A5',
           s.setupCompleted === false ? 0 : 1,
           nowIso()
         );
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
           action: 'UPDATE_SETTINGS',
           module: 'settings',
           targetType: 'PHARMACY_SETTINGS',
           targetId: '1',
           beforeState: before,
-          afterState: { pharmacyName: s.pharmacyName, expiryWarningDays: s.expiryWarningDays },
+          afterState: {
+            pharmacyName: s.pharmacyName.trim(),
+            currency: s.currency || 'BDT',
+            printerType: s.printerType || 'A5',
+            expiryWarningDays: s.expiryWarningDays,
+          },
         });
       });
       res.json({ ok: true });
@@ -1201,6 +1587,7 @@ export function buildApiRouter() {
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
           action: 'INSTALL_LICENSE',
           module: 'licensing',
           targetType: 'LICENSE',

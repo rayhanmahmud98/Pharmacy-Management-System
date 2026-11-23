@@ -1,9 +1,8 @@
 import Decimal from 'decimal.js';
-import type { DatabaseSync } from 'node:sqlite';
 import { generateDocNumber, getDb, nowIso, todayDate, uuid, withTransaction } from '../db.ts';
 import { recordAudit } from '../audit.ts';
 import type { AuthUser } from '../auth.ts';
-import { d, qty, ratio } from '../../src/shared/decimalMath.ts';
+import { d, qty, ratio, roundQty, validateQuantityInput } from '../../src/shared/decimalMath.ts';
 
 export function listMedicines(search = '', includeInactive = false) {
   const db = getDb();
@@ -13,62 +12,84 @@ export function listMedicines(search = '', includeInactive = false) {
 
   const meds = db
     .prepare(
-      `SELECT m.*, c.name as category_name, mf.name as manufacturer_name,
-              COALESCE((
-                SELECT SUM(CAST(b.current_qty_base AS REAL))
-                FROM batches b
-                WHERE b.medicine_id = m.id AND b.status = 'ACTIVE' AND b.expiry_date > ?
-              ), 0) as sellable_stock_base,
-              COALESCE((
-                SELECT SUM(CAST(b.current_qty_base AS REAL))
-                FROM batches b
-                WHERE b.medicine_id = m.id AND b.status IN ('ACTIVE', 'QUARANTINED')
-              ), 0) as total_physical_base
+      `SELECT m.*, c.name as category_name, mf.name as manufacturer_name
        FROM medicines m
        LEFT JOIN categories c ON c.id = m.category_id
        LEFT JOIN manufacturers mf ON mf.id = m.manufacturer_id
        WHERE (
          LOWER(m.brand_name) LIKE ? OR
          LOWER(m.generic_name) LIKE ? OR
-         LOWER(m.bangla_name) LIKE ? OR
+         LOWER(m.medicine_code) LIKE ? OR
+         LOWER(m.barcode) LIKE ? OR
          LOWER(m.alternative_names) LIKE ? OR
          LOWER(m.strength) LIKE ? OR
+         LOWER(m.storage_info) LIKE ? OR
          LOWER(COALESCE(c.name, '')) LIKE ? OR
          LOWER(COALESCE(mf.name, '')) LIKE ?
        ) ${activeClause}
        ORDER BY m.brand_name ASC`
     )
-    .all(today, term, term, term, term, term, term, term) as Array<Record<string, unknown>>;
+    .all(term, term, term, term, term, term, term, term, term) as Array<Record<string, unknown>>;
 
-  const unitsStmt = db.prepare(
-    'SELECT * FROM medicine_units WHERE medicine_id = ? ORDER BY CAST(conversion_to_base AS REAL) ASC'
-  );
+  const unitsStmt = db.prepare('SELECT * FROM medicine_units WHERE medicine_id = ?');
   const batchesStmt = db.prepare(
     `SELECT b.*, s.name as supplier_name
      FROM batches b
      LEFT JOIN suppliers s ON s.id = b.supplier_id
-     WHERE b.medicine_id = ? AND CAST(b.current_qty_base AS REAL) > 0
+     WHERE b.medicine_id = ?
      ORDER BY b.expiry_date ASC`
   );
 
-  return meds.map((m) => ({
-    ...m,
-    units: unitsStmt.all(String(m.id)),
-    batches: batchesStmt.all(String(m.id)),
-  }));
+  return meds.map((m) => {
+    const medId = String(m.id);
+    const units = (unitsStmt.all(medId) as Array<Record<string, unknown>>).sort((a, b) =>
+      d(String(a.conversion_to_base)).cmp(d(String(b.conversion_to_base)))
+    );
+    const allBatches = batchesStmt.all(medId) as Array<Record<string, unknown>>;
+
+    let sellableStock = new Decimal(0);
+    let totalPhysical = new Decimal(0);
+    const positiveBatches: Array<Record<string, unknown>> = [];
+
+    for (const b of allBatches) {
+      const curQty = qty(String(b.current_qty_base));
+      if (curQty.gt(0)) {
+        positiveBatches.push(b);
+        const st = String(b.status);
+        if (st === 'ACTIVE' && String(b.expiry_date) > today) {
+          sellableStock = sellableStock.add(curQty);
+        }
+        if (st === 'ACTIVE' || st === 'QUARANTINED') {
+          totalPhysical = totalPhysical.add(curQty);
+        }
+      }
+    }
+
+    return {
+      ...m,
+      sellable_stock_base: roundQty(sellableStock).toNumber(),
+      sellable_stock_base_str: roundQty(sellableStock).toFixed(6),
+      total_physical_base: roundQty(totalPhysical).toNumber(),
+      total_physical_base_str: roundQty(totalPhysical).toFixed(6),
+      units,
+      batches: positiveBatches,
+    };
+  });
 }
 
 export function createMedicine(
   user: AuthUser,
   input: {
+    medicineCode?: string;
+    barcode?: string;
     brandName: string;
     genericName: string;
-    banglaName?: string;
     alternativeNames?: string;
     strength?: string;
     dosageForm?: string;
     categoryId?: string | null;
     manufacturerId?: string | null;
+    storageInfo?: string;
     description?: string;
     baseUnitName: string;
     minStockLevel?: string;
@@ -86,55 +107,70 @@ export function createMedicine(
     throw new Error('Brand name, generic name, and base stock unit are required');
   }
 
+  const minStock = validateQuantityInput(input.minStockLevel ?? '0', 'Minimum stock level', { allowZero: true });
+
   return withTransaction((tx) => {
     const id = uuid();
     const ts = nowIso();
-    const minStock = qty(input.minStockLevel || '0').toFixed(4);
     const baseUnit = input.baseUnitName.trim();
+
+    let medCode = (input.medicineCode || '').trim();
+    if (!medCode) {
+      const cnt = (tx.prepare('SELECT COUNT(*) as cnt FROM medicines').get() as { cnt: number }).cnt + 1;
+      medCode = `MED-${String(cnt).padStart(4, '0')}`;
+    }
+    const barcode = (input.barcode || '').trim();
+    if (barcode) {
+      const dupBarcode = tx
+        .prepare('SELECT id FROM medicines WHERE LOWER(barcode) = LOWER(?) AND barcode != \'\'')
+        .get(barcode);
+      if (dupBarcode) throw new Error(`Barcode '${barcode}' is already assigned to another medicine`);
+    }
 
     tx.prepare(
       `INSERT INTO medicines (
-        id, brand_name, generic_name, bangla_name, alternative_names, strength, dosage_form,
-        category_id, manufacturer_id, description, base_unit_name, min_stock_level, rx_required,
+        id, medicine_code, barcode, brand_name, generic_name, bangla_name, alternative_names, strength, dosage_form,
+        category_id, manufacturer_id, storage_info, description, base_unit_name, min_stock_level, rx_required,
         is_active, notes, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`
     ).run(
       id,
+      medCode,
+      barcode,
       input.brandName.trim(),
       input.genericName.trim(),
-      (input.banglaName || '').trim(),
       (input.alternativeNames || '').trim(),
       (input.strength || '').trim(),
       (input.dosageForm || '').trim(),
       input.categoryId || null,
       input.manufacturerId || null,
+      (input.storageInfo || '').trim(),
       (input.description || '').trim(),
       baseUnit,
-      minStock,
+      minStock.toFixed(6),
       input.rxRequired ? 1 : 0,
       (input.notes || '').trim(),
       ts,
       ts
     );
 
-    // Always create base unit (ratio 1)
     tx.prepare(
       `INSERT INTO medicine_units (
         id, medicine_id, unit_name, conversion_to_base, is_base, allow_purchase, allow_sale, is_active, created_at, updated_at
-      ) VALUES (?, ?, ?, '1.0000', 1, 1, 1, 1, ?, ?)`
+      ) VALUES (?, ?, ?, '1.000000', 1, 1, 1, 1, ?, ?)`
     ).run(uuid(), id, baseUnit, ts, ts);
 
     const seen = new Set([baseUnit.toLowerCase()]);
     for (const u of input.units || []) {
       const name = u.unitName?.trim();
       if (!name || seen.has(name.toLowerCase())) continue;
-      const conv = ratio(u.conversionToBase); // rejects <= 0
+      const conv = ratio(u.conversionToBase, `Conversion ratio for ${name}`);
       seen.add(name.toLowerCase());
       tx.prepare(
         `INSERT INTO medicine_units (
           id, medicine_id, unit_name, conversion_to_base, is_base, allow_purchase, allow_sale, is_active, created_at, updated_at
         ) VALUES (?, ?, ?, ?, 0, ?, ?, 1, ?, ?)`
-      ).run(uuid(), id, name, conv.toFixed(4), u.allowPurchase === false ? 0 : 1, u.allowSale === false ? 0 : 1, ts, ts);
+      ).run(uuid(), id, name, conv.toFixed(6), u.allowPurchase === false ? 0 : 1, u.allowSale === false ? 0 : 1, ts, ts);
     }
 
     recordAudit(tx, {
@@ -144,7 +180,7 @@ export function createMedicine(
       module: 'medicines',
       targetType: 'MEDICINE',
       targetId: id,
-      afterState: { brandName: input.brandName, baseUnit },
+      afterState: { medicineCode: medCode, barcode, brandName: input.brandName.trim(), baseUnit },
     });
 
     return id;
@@ -155,14 +191,16 @@ export function updateMedicine(
   user: AuthUser,
   medicineId: string,
   input: {
+    medicineCode?: string;
+    barcode?: string;
     brandName: string;
     genericName: string;
-    banglaName?: string;
     alternativeNames?: string;
     strength?: string;
     dosageForm?: string;
     categoryId?: string | null;
     manufacturerId?: string | null;
+    storageInfo?: string;
     description?: string;
     minStockLevel?: string;
     rxRequired?: boolean;
@@ -170,30 +208,45 @@ export function updateMedicine(
     notes?: string;
   }
 ) {
+  if (!input.brandName?.trim() || !input.genericName?.trim()) {
+    throw new Error('Brand name and generic name are required');
+  }
+  const minStock = validateQuantityInput(input.minStockLevel ?? '0', 'Minimum stock level', { allowZero: true });
+
   return withTransaction((tx) => {
-    const before = tx.prepare('SELECT * FROM medicines WHERE id = ?').get(medicineId);
+    const before = tx.prepare('SELECT * FROM medicines WHERE id = ?').get(medicineId) as
+      | Record<string, unknown>
+      | undefined;
     if (!before) throw new Error('Medicine not found');
     const ts = nowIso();
-    const minStock = qty(input.minStockLevel || '0').toFixed(4);
+    const barcode = (input.barcode ?? String(before.barcode || '')).trim();
+    if (barcode) {
+      const dupBarcode = tx
+        .prepare("SELECT id FROM medicines WHERE LOWER(barcode) = LOWER(?) AND barcode != '' AND id != ?")
+        .get(barcode, medicineId);
+      if (dupBarcode) throw new Error(`Barcode '${barcode}' is already assigned to another medicine`);
+    }
 
     tx.prepare(
       `UPDATE medicines SET
-        brand_name = ?, generic_name = ?, bangla_name = ?, alternative_names = ?,
+        medicine_code = ?, barcode = ?, brand_name = ?, generic_name = ?, alternative_names = ?,
         strength = ?, dosage_form = ?, category_id = ?, manufacturer_id = ?,
-        description = ?, min_stock_level = ?, rx_required = ?, is_active = ?,
+        storage_info = ?, description = ?, min_stock_level = ?, rx_required = ?, is_active = ?,
         notes = ?, updated_at = ?
        WHERE id = ?`
     ).run(
+      (input.medicineCode ?? String(before.medicine_code || '')).trim(),
+      barcode,
       input.brandName.trim(),
       input.genericName.trim(),
-      (input.banglaName || '').trim(),
       (input.alternativeNames || '').trim(),
       (input.strength || '').trim(),
       (input.dosageForm || '').trim(),
       input.categoryId || null,
       input.manufacturerId || null,
+      (input.storageInfo || '').trim(),
       (input.description || '').trim(),
-      minStock,
+      minStock.toFixed(6),
       input.rxRequired ? 1 : 0,
       input.isActive === false ? 0 : 1,
       (input.notes || '').trim(),
@@ -228,7 +281,7 @@ export function upsertMedicineUnit(
 ) {
   const unitName = input.unitName?.trim();
   if (!unitName) throw new Error('Unit name is required');
-  const conv = ratio(input.conversionToBase); // rejects <= 0 or NaN
+  const conv = ratio(input.conversionToBase, 'Conversion ratio');
 
   return withTransaction((tx) => {
     const med = tx.prepare('SELECT * FROM medicines WHERE id = ?').get(medicineId) as
@@ -254,12 +307,11 @@ export function upsertMedicineUnit(
         .get(medicineId, unitName, input.unitId);
       if (dup) throw new Error(`Unit '${unitName}' already exists for this medicine`);
 
-      // Updating conversion ONLY affects future transactions; historical sales/purchases retain conversion_ratio_snapshot!
       tx.prepare(
         `UPDATE medicine_units
          SET unit_name = ?, conversion_to_base = ?, allow_purchase = ?, allow_sale = ?, is_active = ?, updated_at = ?
          WHERE id = ?`
-      ).run(unitName, conv.toFixed(4), input.allowPurchase ? 1 : 0, input.allowSale ? 1 : 0, input.isActive ? 1 : 0, ts, input.unitId);
+      ).run(unitName, conv.toFixed(6), input.allowPurchase ? 1 : 0, input.allowSale ? 1 : 0, input.isActive ? 1 : 0, ts, input.unitId);
 
       recordAudit(tx, {
         userId: user.id,
@@ -269,7 +321,7 @@ export function upsertMedicineUnit(
         targetType: 'MEDICINE_UNIT',
         targetId: input.unitId,
         beforeState: existing,
-        afterState: { unitName, conversionToBase: conv.toFixed(4), allowPurchase: input.allowPurchase, allowSale: input.allowSale, isActive: input.isActive },
+        afterState: { unitName, conversionToBase: conv.toFixed(6), allowPurchase: input.allowPurchase, allowSale: input.allowSale, isActive: input.isActive },
         reason: 'Manual unit conversion update (historical snapshots preserved)',
       });
       return input.unitId;
@@ -285,7 +337,7 @@ export function upsertMedicineUnit(
       `INSERT INTO medicine_units (
         id, medicine_id, unit_name, conversion_to_base, is_base, allow_purchase, allow_sale, is_active, created_at, updated_at
       ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
-    ).run(newId, medicineId, unitName, conv.toFixed(4), input.allowPurchase ? 1 : 0, input.allowSale ? 1 : 0, input.isActive ? 1 : 1, ts, ts);
+    ).run(newId, medicineId, unitName, conv.toFixed(6), input.allowPurchase ? 1 : 0, input.allowSale ? 1 : 0, input.isActive ? 1 : 1, ts, ts);
 
     recordAudit(tx, {
       userId: user.id,
@@ -294,7 +346,7 @@ export function upsertMedicineUnit(
       module: 'medicines',
       targetType: 'MEDICINE_UNIT',
       targetId: newId,
-      afterState: { medicineId, unitName, conversionToBase: conv.toFixed(4) },
+      afterState: { medicineId, unitName, conversionToBase: conv.toFixed(6) },
     });
     return newId;
   });
@@ -317,8 +369,7 @@ export function adjustStock(
   }
 ) {
   if (!input.reason?.trim()) throw new Error('Mandatory reason is required for stock adjustments');
-  const actual = qty(input.actualQtyBase);
-  if (actual.lt(0)) throw new Error('Actual stock quantity cannot be negative');
+  const actual = validateQuantityInput(input.actualQtyBase, 'Actual quantity', { allowZero: true });
 
   return withTransaction((tx) => {
     const batch = tx.prepare('SELECT * FROM batches WHERE id = ?').get(input.batchId) as
@@ -334,7 +385,7 @@ export function adjustStock(
     if (!batch) throw new Error('Batch not found');
 
     const expected = qty(batch.current_qty_base);
-    const variance = qty(actual.sub(expected));
+    const variance = roundQty(actual.sub(expected));
     if (variance.eq(0)) throw new Error('Actual quantity equals expected quantity; no adjustment needed');
 
     const ts = nowIso();
@@ -352,9 +403,9 @@ export function adjustStock(
       batch.id,
       batch.medicine_id,
       input.adjustmentType,
-      expected.toFixed(4),
-      actual.toFixed(4),
-      variance.toFixed(4),
+      expected.toFixed(6),
+      actual.toFixed(6),
+      variance.toFixed(6),
       input.reason.trim(),
       user.id,
       ts
@@ -373,7 +424,7 @@ export function adjustStock(
       uuid(),
       batch.medicine_id,
       batch.id,
-      variance.toFixed(4),
+      variance.toFixed(6),
       movementType,
       adjId,
       batch.purchase_cost_per_base,
@@ -390,7 +441,7 @@ export function adjustStock(
         : batch.status;
 
     tx.prepare('UPDATE batches SET current_qty_base = ?, status = ?, updated_at = ? WHERE id = ?').run(
-      actual.toFixed(4),
+      actual.toFixed(6),
       newStatus,
       ts,
       batch.id
@@ -404,19 +455,19 @@ export function adjustStock(
       targetType: 'BATCH',
       targetId: batch.id,
       transactionRef: adjNumber,
-      beforeState: { current_qty_base: expected.toFixed(4), status: batch.status },
-      afterState: { current_qty_base: actual.toFixed(4), status: newStatus, variance: variance.toFixed(4) },
+      beforeState: { current_qty_base: expected.toFixed(6), status: batch.status },
+      afterState: { current_qty_base: actual.toFixed(6), status: newStatus, variance: variance.toFixed(6) },
       reason: input.reason.trim(),
     });
 
-    return { adjustmentNumber: adjNumber, variance: variance.toFixed(4) };
+    return { adjustmentNumber: adjNumber, variance: variance.toFixed(6) };
   });
 }
 
 export function changeBatchStatus(
   user: AuthUser,
   batchId: string,
-  newStatus: 'ACTIVE' | 'QUARANTINED' | 'EXPIRED' | 'WRITTEN_OFF',
+  newStatus: 'ACTIVE' | 'QUARANTINED' | 'EXPIRED' | 'WRITTEN_OFF' | 'DAMAGED',
   reason: string
 ) {
   if (!reason?.trim()) throw new Error('Reason is required to change batch status');
@@ -431,9 +482,9 @@ export function changeBatchStatus(
     }
 
     const ts = nowIso();
-    if (newStatus === 'WRITTEN_OFF' && qty(batch.current_qty_base).gt(0)) {
+    if ((newStatus === 'WRITTEN_OFF' || newStatus === 'DAMAGED') && qty(batch.current_qty_base).gt(0)) {
       const rem = qty(batch.current_qty_base);
-      const neg = rem.neg().toFixed(4);
+      const neg = rem.neg().toFixed(6);
       const mvType = batch.expiry_date <= today ? 'EXPIRY_WRITEOFF' : 'DAMAGE_WRITEOFF';
       tx.prepare(
         `INSERT INTO stock_movements (
@@ -442,8 +493,8 @@ export function changeBatchStatus(
         ) VALUES (?, ?, ?, ?, ?, 'BATCH_WRITEOFF', ?, ?, ?, ?, ?)`
       ).run(uuid(), batch.medicine_id, batch.id, neg, mvType, batch.id, batch.purchase_cost_per_base, reason.trim(), user.id, ts);
       tx.prepare('UPDATE batches SET current_qty_base = ?, status = ?, updated_at = ? WHERE id = ?').run(
-        '0.0000',
-        'WRITTEN_OFF',
+        '0.000000',
+        newStatus,
         ts,
         batch.id
       );
@@ -467,10 +518,9 @@ export function changeBatchStatus(
 
 export function reconcileInventoryLedger() {
   const db = getDb();
-  const rows = db
+  const batches = db
     .prepare(
-      `SELECT b.id, b.batch_number, m.brand_name, b.current_qty_base as cached_qty,
-              COALESCE((SELECT SUM(CAST(sm.qty_change_base AS REAL)) FROM stock_movements sm WHERE sm.batch_id = b.id), 0) as ledger_sum
+      `SELECT b.id, b.batch_number, m.brand_name, b.current_qty_base as cached_qty
        FROM batches b
        JOIN medicines m ON m.id = b.medicine_id`
     )
@@ -479,26 +529,35 @@ export function reconcileInventoryLedger() {
     batch_number: string;
     brand_name: string;
     cached_qty: string;
-    ledger_sum: number;
   }>;
 
+  const movements = db
+    .prepare('SELECT batch_id, qty_change_base FROM stock_movements')
+    .all() as Array<{ batch_id: string; qty_change_base: string }>;
+
+  const ledgerMap = new Map<string, Decimal>();
+  for (const mv of movements) {
+    const prev = ledgerMap.get(mv.batch_id) || new Decimal(0);
+    ledgerMap.set(mv.batch_id, prev.add(d(mv.qty_change_base)));
+  }
+
   const discrepancies = [];
-  for (const r of rows) {
-    const cached = d(r.cached_qty).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
-    const ledger = d(r.ledger_sum).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+  for (const r of batches) {
+    const cached = roundQty(d(r.cached_qty));
+    const ledger = roundQty(ledgerMap.get(r.id) || new Decimal(0));
     if (!cached.eq(ledger)) {
       discrepancies.push({
         batchId: r.id,
         batchNumber: r.batch_number,
         medicineName: r.brand_name,
-        cachedQty: cached.toFixed(4),
-        ledgerSum: ledger.toFixed(4),
-        diff: cached.sub(ledger).toFixed(4),
+        cachedQty: cached.toFixed(6),
+        ledgerSum: ledger.toFixed(6),
+        diff: roundQty(cached.sub(ledger)).toFixed(6),
       });
     }
   }
   return {
-    checkedBatches: rows.length,
+    checkedBatches: batches.length,
     discrepancyCount: discrepancies.length,
     healthy: discrepancies.length === 0,
     discrepancies,

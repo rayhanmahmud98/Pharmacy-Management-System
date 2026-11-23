@@ -1,6 +1,8 @@
 {
-  "name": "ShifaRx — Pharmacy Management Software",
+  "name": "Pharmacy Management Software",
   "description": "Offline-first commercial pharmacy management system with batch FEFO inventory, medicine-specific manual unit conversions, POS, returns, cash sessions, audit trail, backups, and offline licensing.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

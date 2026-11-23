@@ -1,6 +1,12 @@
-import React, { useEffect, useState } from 'react';
-import { Plus, Wallet } from 'lucide-react';
-import { apiFetch, formatBDT } from '../lib/api';
+import React, { useEffect, useRef, useState } from 'react';
+import { Plus, SlidersHorizontal, Wallet } from 'lucide-react';
+import {
+  apiFetch,
+  checkStrictDecimalInput,
+  formatBDT,
+  getDisplayCurrencySymbol,
+  newIdempotencyKey,
+} from '../lib/api';
 import { ReasonPromptModal } from '../components/ActionModals';
 import type { AuthUser } from '../types';
 
@@ -52,14 +58,20 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
   const [payMethod, setPayMethod] = useState<'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD'>('CASH');
   const [payAmount, setPayAmount] = useState('');
   const [payRef, setPayRef] = useState('');
+  const [submittingPay, setSubmittingPay] = useState(false);
   const [showAddModal, setShowAddModal] = useState<'CUSTOMER' | 'SUPPLIER' | null>(null);
   const [newName, setNewName] = useState('');
   const [newPhone, setNewPhone] = useState('');
   const [newAddr, setNewAddr] = useState('');
-  const [newLimit, setNewLimit] = useState('5000');
+  const [newLimit, setNewLimit] = useState('5000.00');
+  const [creditAdjTarget, setCreditAdjTarget] = useState<Customer | null>(null);
+  const [creditAdjDelta, setCreditAdjDelta] = useState('');
+  const [creditAdjReason, setCreditAdjReason] = useState('');
   const [reversePaymentTarget, setReversePaymentTarget] = useState<PaymentRow | null>(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const paymentIdempKeyRef = useRef(newIdempotencyKey());
+  const currencySym = getDisplayCurrencySymbol();
 
   async function load() {
     const res = await apiFetch<{ customers: Customer[]; suppliers: Supplier[]; payments: PaymentRow[] }>('/api/parties');
@@ -74,19 +86,27 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
 
   async function handlePaymentSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!payModal) return;
+    if (!payModal || submittingPay) return;
     setError('');
+    const err = checkStrictDecimalInput(payAmount, 'currency', 'Payment amount');
+    if (err) {
+      setError(err);
+      return;
+    }
+    setSubmittingPay(true);
     try {
       const res = await apiFetch<{ paymentNumber: string }>('/api/payments', {
         method: 'POST',
+        headers: { 'Idempotency-Key': paymentIdempKeyRef.current },
         body: JSON.stringify({
           partyType: payModal.partyType,
           partyId: payModal.partyId,
           method: payMethod,
-          amount: payAmount,
+          amount: payAmount.trim(),
           referenceNo: payRef,
         }),
       });
+      paymentIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Payment ${res.paymentNumber} posted (${payMethod} ${formatBDT(payAmount)}).`);
       setPayModal(null);
       setPayAmount('');
@@ -94,17 +114,31 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Payment failed');
+    } finally {
+      setSubmittingPay(false);
     }
   }
 
   async function handleAddParty(e: React.FormEvent) {
     e.preventDefault();
     setError('');
+    if (showAddModal === 'CUSTOMER') {
+      const limitErr = checkStrictDecimalInput(newLimit || '0', 'currency', 'Credit limit', { allowZero: true });
+      if (limitErr) {
+        setError(limitErr);
+        return;
+      }
+    }
     try {
       if (showAddModal === 'CUSTOMER') {
         await apiFetch('/api/customers', {
           method: 'POST',
-          body: JSON.stringify({ name: newName, phone: newPhone, address: newAddr, creditLimit: newLimit }),
+          body: JSON.stringify({
+            name: newName,
+            phone: newPhone,
+            address: newAddr,
+            creditLimit: (newLimit || '0').trim(),
+          }),
         });
       } else {
         await apiFetch('/api/suppliers', {
@@ -117,9 +151,41 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
       setNewName('');
       setNewPhone('');
       setNewAddr('');
+      setNewLimit('5000.00');
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save party');
+    }
+  }
+
+  async function handleCreditAdjustmentSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!creditAdjTarget) return;
+    setError('');
+    const rawDelta = creditAdjDelta.trim();
+    if (!/^-?\d{1,18}(\.\d{1,2})?$/.test(rawDelta) || Number(rawDelta) === 0) {
+      setError('Balance adjustment must be a non-zero monetary value with up to 2 decimal places (use negative to reduce due).');
+      return;
+    }
+    if (!creditAdjReason.trim()) {
+      setError('Mandatory audit reason is required for customer balance adjustments.');
+      return;
+    }
+    try {
+      await apiFetch(`/api/customers/${creditAdjTarget.id}/credit-adjustment`, {
+        method: 'POST',
+        body: JSON.stringify({
+          amountDelta: rawDelta,
+          reason: creditAdjReason.trim(),
+        }),
+      });
+      setNotice(`Customer balance adjusted for ${creditAdjTarget.name}.`);
+      setCreditAdjTarget(null);
+      setCreditAdjDelta('');
+      setCreditAdjReason('');
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Balance adjustment failed');
     }
   }
 
@@ -222,12 +288,29 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                   <td className={`px-4 py-2.5 text-right font-mono-num font-bold ${Number(c.current_balance) > 0 ? 'text-amber-700' : 'text-slate-800'}`}>
                     {formatBDT(c.current_balance)}
                   </td>
-                  <td className="px-4 py-2.5 text-right">
+                  <td className="px-4 py-2.5 text-right space-x-3 whitespace-nowrap">
+                    {user.permissions['parties.manage'] && c.code !== 'CUST-WALKIN' && (
+                      <button
+                        type="button"
+                        disabled={!writable}
+                        onClick={() => {
+                          setCreditAdjTarget(c);
+                          setCreditAdjDelta('');
+                          setCreditAdjReason('');
+                        }}
+                        className="inline-flex items-center gap-1 text-slate-600 hover:underline font-medium"
+                      >
+                        <SlidersHorizontal className="w-3.5 h-3.5" /> Adjust Due
+                      </button>
+                    )}
                     {user.permissions['payments.record'] && c.code !== 'CUST-WALKIN' && (
                       <button
                         type="button"
                         disabled={!writable}
-                        onClick={() => setPayModal({ partyType: 'CUSTOMER', partyId: c.id, name: c.name })}
+                        onClick={() => {
+                          paymentIdempKeyRef.current = newIdempotencyKey();
+                          setPayModal({ partyType: 'CUSTOMER', partyId: c.id, name: c.name });
+                        }}
                         className="inline-flex items-center gap-1 text-teal-700 hover:underline font-medium"
                       >
                         <Wallet className="w-3.5 h-3.5" /> Collect Due
@@ -270,7 +353,10 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                       <button
                         type="button"
                         disabled={!writable}
-                        onClick={() => setPayModal({ partyType: 'SUPPLIER', partyId: s.id, name: s.name })}
+                        onClick={() => {
+                          paymentIdempKeyRef.current = newIdempotencyKey();
+                          setPayModal({ partyType: 'SUPPLIER', partyId: s.id, name: s.name });
+                        }}
                         className="inline-flex items-center gap-1 text-teal-700 hover:underline font-medium"
                       >
                         <Wallet className="w-3.5 h-3.5" /> Pay Supplier
@@ -351,12 +437,12 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                 </select>
               </div>
               <div>
-                <label className="block text-slate-600 mb-1">Amount (৳)</label>
+                <label className="block text-slate-600 mb-1">Amount ({currencySym}) *</label>
                 <input
-                  type="number"
-                  step="0.01"
-                  min="0.01"
+                  type="text"
+                  inputMode="decimal"
                   required
+                  placeholder="0.00"
                   value={payAmount}
                   onChange={(e) => setPayAmount(e.target.value)}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num"
@@ -376,8 +462,12 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
               <button type="button" onClick={() => setPayModal(null)} className="px-4 py-2 text-xs bg-slate-100 rounded-md">
                 Cancel
               </button>
-              <button type="submit" className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md">
-                Post Payment
+              <button
+                type="submit"
+                disabled={submittingPay}
+                className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
+              >
+                {submittingPay ? 'Posting...' : 'Post Payment'}
               </button>
             </div>
           </form>
@@ -405,8 +495,14 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
               </div>
               {showAddModal === 'CUSTOMER' && (
                 <div>
-                  <label className="block text-slate-600 mb-1">Credit Limit (৳, 0 = Unlimited)</label>
-                  <input type="number" min="0" value={newLimit} onChange={(e) => setNewLimit(e.target.value)} className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num" />
+                  <label className="block text-slate-600 mb-1">Credit Limit ({currencySym}, 0 = Unlimited)</label>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={newLimit}
+                    onChange={(e) => setNewLimit(e.target.value)}
+                    className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num"
+                  />
                 </div>
               )}
             </div>
@@ -417,6 +513,47 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
           </form>
         </div>
       )}
+
+      {creditAdjTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <form onSubmit={handleCreditAdjustmentSubmit} className="bg-white border border-slate-200 rounded-lg w-full max-w-md p-6 space-y-3 text-xs">
+            <h3 className="text-base font-bold text-slate-900">
+              Adjust Customer Due · {creditAdjTarget.name}
+            </h3>
+            <p className="text-slate-500">
+              Current Due: <strong className="font-mono-num">{formatBDT(creditAdjTarget.current_balance)}</strong>. Positive adds to due; negative reduces due.
+            </p>
+            <div>
+              <label className="block text-slate-600 mb-1">Adjustment Delta ({currencySym}) *</label>
+              <input
+                type="text"
+                inputMode="decimal"
+                required
+                placeholder="e.g. -50.00 or 100.00"
+                value={creditAdjDelta}
+                onChange={(e) => setCreditAdjDelta(e.target.value)}
+                className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num"
+              />
+            </div>
+            <div>
+              <label className="block text-slate-600 mb-1">Mandatory Audit Reason *</label>
+              <input
+                type="text"
+                required
+                placeholder="Write-off rounding or opening balance reconciliation..."
+                value={creditAdjReason}
+                onChange={(e) => setCreditAdjReason(e.target.value)}
+                className="w-full px-2.5 py-2 border border-slate-300 rounded"
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+              <button type="button" onClick={() => setCreditAdjTarget(null)} className="px-4 py-2 text-xs bg-slate-100 rounded-md">Cancel</button>
+              <button type="submit" className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md">Apply Adjustment</button>
+            </div>
+          </form>
+        </div>
+      )}
+
       <ReasonPromptModal
         open={Boolean(reversePaymentTarget)}
         title={`Reverse Payment ${reversePaymentTarget?.payment_number || ''}`}

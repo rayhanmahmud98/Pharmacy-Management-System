@@ -25,14 +25,25 @@ export function getDb(): DatabaseSync {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA synchronous = NORMAL;');
   db.exec('PRAGMA foreign_keys = ON;');
-  db.exec('PRAGMA busy_timeout = 5000;');
+  db.exec('PRAGMA busy_timeout = 8000;');
   initSchema(db);
   _db = db;
   return db;
 }
 
+export function checkpointWal(): void {
+  if (_db) {
+    try {
+      _db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+    } catch {
+      // ignore if closing or read-only
+    }
+  }
+}
+
 export function closeDb(): void {
   if (_db) {
+    checkpointWal();
     _db.close();
     _db = null;
   }
@@ -47,7 +58,6 @@ export function nowIso(): string {
 }
 
 export function todayDate(): string {
-  // Use local date in YYYY-MM-DD (Asia/Dhaka UTC+6 friendly or system date)
   const d = new Date();
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -55,14 +65,39 @@ export function todayDate(): string {
   return `${y}-${m}-${day}`;
 }
 
+/**
+ * Atomic sequential document number generator backed by doc_sequences.
+ * Must be called inside a transaction (BEGIN IMMEDIATE) to guarantee zero collisions.
+ */
 export function generateDocNumber(db: DatabaseSync, prefix: string, table: string, column: string): string {
   const datePart = todayDate().replace(/-/g, '');
-  const likePattern = `${prefix}-${datePart}-%`;
-  const row = db
-    .prepare(`SELECT COUNT(*) as cnt FROM ${table} WHERE ${column} LIKE ?`)
-    .get(likePattern) as { cnt: number };
-  const seq = String((row?.cnt ?? 0) + 1).padStart(4, '0');
-  return `${prefix}-${datePart}-${seq}`;
+  const seqKey = `${prefix}-${datePart}`;
+  const existing = db.prepare('SELECT current_val FROM doc_sequences WHERE seq_key = ?').get(seqKey) as
+    | { current_val: number }
+    | undefined;
+
+  let nextVal: number;
+  if (!existing) {
+    // Initialize from max existing suffix on the table for this date prefix if any exist
+    const likePattern = `${seqKey}-%`;
+    const rows = db
+      .prepare(`SELECT ${column} as doc_no FROM ${table} WHERE ${column} LIKE ?`)
+      .all(likePattern) as Array<{ doc_no: string }>;
+    let maxExisting = 0;
+    for (const r of rows) {
+      const parts = String(r.doc_no || '').split('-');
+      const tail = Number.parseInt(parts[parts.length - 1] || '0', 10);
+      if (Number.isFinite(tail) && tail > maxExisting) maxExisting = tail;
+    }
+    nextVal = maxExisting + 1;
+    db.prepare('INSERT INTO doc_sequences (seq_key, current_val) VALUES (?, ?)').run(seqKey, nextVal);
+  } else {
+    nextVal = existing.current_val + 1;
+    db.prepare('UPDATE doc_sequences SET current_val = ? WHERE seq_key = ?').run(nextVal, seqKey);
+  }
+
+  const seq = String(nextVal).padStart(4, '0');
+  return `${seqKey}-${seq}`;
 }
 
 export function withTransaction<T>(fn: (db: DatabaseSync) => T): T {
@@ -82,21 +117,65 @@ export function withTransaction<T>(fn: (db: DatabaseSync) => T): T {
   }
 }
 
+function addColumnIfMissing(db: DatabaseSync, table: string, column: string, definition: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
+  }
+}
+
 function initSchema(db: DatabaseSync): void {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS doc_sequences (
+      seq_key TEXT PRIMARY KEY,
+      current_val INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS idempotency_keys (
+      idempotency_key TEXT NOT NULL,
+      endpoint TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      response_status INTEGER NOT NULL,
+      response_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (idempotency_key, endpoint, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS login_attempts (
+      username_key TEXT NOT NULL,
+      ip_address TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      first_attempt_at TEXT NOT NULL,
+      locked_until TEXT,
+      PRIMARY KEY (username_key, ip_address)
+    );
+
+    CREATE TABLE IF NOT EXISTS license_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_verified_utc TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS pharmacy_settings (
       id INTEGER PRIMARY KEY CHECK (id = 1),
-      pharmacy_name TEXT NOT NULL DEFAULT 'Dhaka Care Pharmacy',
-      pharmacy_name_bn TEXT NOT NULL DEFAULT 'ঢাকা কেয়ার ফার্মেসি',
-      drug_license_no TEXT NOT NULL DEFAULT 'DL-DHK-2026-0418',
-      address TEXT NOT NULL DEFAULT 'House 14, Road 6, Dhanmondi, Dhaka 1205',
-      phone TEXT NOT NULL DEFAULT '+880 1711-000111',
-      email TEXT NOT NULL DEFAULT 'contact@dhakacarepharmacy.local',
+      pharmacy_name TEXT NOT NULL DEFAULT 'MediNest',
+      pharmacy_name_bn TEXT NOT NULL DEFAULT '',
+      drug_license_no TEXT NOT NULL DEFAULT 'REG-MN-2026-0001',
+      address TEXT NOT NULL DEFAULT '120 Medical Center Road, Suite 100',
+      phone TEXT NOT NULL DEFAULT '+1 (555) 010-2040',
+      email TEXT NOT NULL DEFAULT 'support@medinest.local',
+      website TEXT NOT NULL DEFAULT 'https://medinest.local',
+      currency TEXT NOT NULL DEFAULT 'BDT',
+      currency_symbol TEXT NOT NULL DEFAULT '৳',
+      timezone TEXT NOT NULL DEFAULT 'Asia/Dhaka',
+      default_low_stock_threshold TEXT NOT NULL DEFAULT '10',
       logo_data_url TEXT NOT NULL DEFAULT '',
-      receipt_footer TEXT NOT NULL DEFAULT 'ধন্যবাদ। প্রেসক্রিপশন ছাড়া অ্যান্টিবায়োটিক বিক্রি করা হয় না।',
+      receipt_footer TEXT NOT NULL DEFAULT 'Thank you for choosing MediNest Pharmacy. Please retain this receipt for returns or inquiries.',
       expiry_warning_days INTEGER NOT NULL DEFAULT 90,
       backup_retention_count INTEGER NOT NULL DEFAULT 14,
-      printer_type TEXT NOT NULL DEFAULT 'THERMAL_80MM',
+      printer_type TEXT NOT NULL DEFAULT 'A5',
+      session_timeout_minutes INTEGER NOT NULL DEFAULT 960,
       setup_completed INTEGER NOT NULL DEFAULT 1,
       updated_at TEXT NOT NULL
     );
@@ -132,6 +211,8 @@ function initSchema(db: DatabaseSync): void {
       role_id TEXT NOT NULL REFERENCES roles(id),
       is_super_admin INTEGER NOT NULL DEFAULT 0,
       is_active INTEGER NOT NULL DEFAULT 1,
+      must_change_password INTEGER NOT NULL DEFAULT 0,
+      last_login_at TEXT,
       preferences_json TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -169,6 +250,8 @@ function initSchema(db: DatabaseSync): void {
 
     CREATE TABLE IF NOT EXISTS medicines (
       id TEXT PRIMARY KEY,
+      medicine_code TEXT NOT NULL DEFAULT '',
+      barcode TEXT NOT NULL DEFAULT '',
       brand_name TEXT NOT NULL,
       generic_name TEXT NOT NULL,
       bangla_name TEXT NOT NULL DEFAULT '',
@@ -177,6 +260,7 @@ function initSchema(db: DatabaseSync): void {
       dosage_form TEXT NOT NULL DEFAULT '',
       category_id TEXT REFERENCES categories(id),
       manufacturer_id TEXT REFERENCES manufacturers(id),
+      storage_info TEXT NOT NULL DEFAULT '',
       description TEXT NOT NULL DEFAULT '',
       base_unit_name TEXT NOT NULL,
       min_stock_level TEXT NOT NULL DEFAULT '0',
@@ -269,7 +353,7 @@ function initSchema(db: DatabaseSync): void {
       initial_qty_base TEXT NOT NULL,
       current_qty_base TEXT NOT NULL,
       base_unit_name TEXT NOT NULL,
-      status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'QUARANTINED', 'EXPIRED', 'WRITTEN_OFF', 'INACTIVE')),
+      status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'QUARANTINED', 'EXPIRED', 'WRITTEN_OFF', 'INACTIVE', 'DEPLETED', 'DAMAGED')),
       notes TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -518,13 +602,17 @@ function initSchema(db: DatabaseSync): void {
       seq INTEGER NOT NULL,
       user_id TEXT,
       username TEXT NOT NULL DEFAULT 'system',
+      session_id TEXT NOT NULL DEFAULT '',
+      ip_address TEXT NOT NULL DEFAULT '',
       action TEXT NOT NULL,
       module TEXT NOT NULL,
       target_type TEXT NOT NULL,
       target_id TEXT NOT NULL,
       transaction_ref TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'SUCCESS',
       before_state TEXT NOT NULL DEFAULT '{}',
       after_state TEXT NOT NULL DEFAULT '{}',
+      metadata_json TEXT NOT NULL DEFAULT '{}',
       reason TEXT NOT NULL DEFAULT '',
       prev_hash TEXT NOT NULL,
       entry_hash TEXT NOT NULL,
@@ -544,14 +632,80 @@ function initSchema(db: DatabaseSync): void {
       created_by TEXT,
       created_at TEXT NOT NULL
     );
+  `);
 
+  // Additive migrations for pre-existing databases
+  addColumnIfMissing(db, 'pharmacy_settings', 'website', "TEXT NOT NULL DEFAULT 'https://medinest.local'");
+  addColumnIfMissing(db, 'pharmacy_settings', 'currency', "TEXT NOT NULL DEFAULT 'BDT'");
+  addColumnIfMissing(db, 'pharmacy_settings', 'currency_symbol', "TEXT NOT NULL DEFAULT '৳'");
+  addColumnIfMissing(db, 'pharmacy_settings', 'timezone', "TEXT NOT NULL DEFAULT 'Asia/Dhaka'");
+  addColumnIfMissing(db, 'pharmacy_settings', 'default_low_stock_threshold', "TEXT NOT NULL DEFAULT '10'");
+  addColumnIfMissing(db, 'pharmacy_settings', 'session_timeout_minutes', 'INTEGER NOT NULL DEFAULT 960');
+
+  addColumnIfMissing(db, 'users', 'must_change_password', 'INTEGER NOT NULL DEFAULT 0');
+  addColumnIfMissing(db, 'users', 'last_login_at', 'TEXT');
+
+  addColumnIfMissing(db, 'medicines', 'medicine_code', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, 'medicines', 'barcode', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, 'medicines', 'storage_info', "TEXT NOT NULL DEFAULT ''");
+
+  addColumnIfMissing(db, 'audit_logs', 'session_id', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, 'audit_logs', 'ip_address', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, 'audit_logs', 'status', "TEXT NOT NULL DEFAULT 'SUCCESS'");
+  addColumnIfMissing(db, 'audit_logs', 'metadata_json', "TEXT NOT NULL DEFAULT '{}'");
+
+  db.exec(`
     CREATE INDEX IF NOT EXISTS idx_medicines_brand ON medicines(brand_name);
     CREATE INDEX IF NOT EXISTS idx_medicines_generic ON medicines(generic_name);
+    CREATE INDEX IF NOT EXISTS idx_medicines_code ON medicines(medicine_code);
+    CREATE INDEX IF NOT EXISTS idx_medicines_barcode ON medicines(barcode);
     CREATE INDEX IF NOT EXISTS idx_batches_medicine_expiry ON batches(medicine_id, status, expiry_date);
     CREATE INDEX IF NOT EXISTS idx_stock_movements_batch ON stock_movements(batch_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(sale_date, status);
     CREATE INDEX IF NOT EXISTS idx_purchases_date ON purchases(purchase_date, status);
     CREATE INDEX IF NOT EXISTS idx_audit_seq ON audit_logs(seq);
+    CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action, module);
     CREATE INDEX IF NOT EXISTS idx_cash_movements_session ON cash_movements(cash_session_id, created_at);
   `);
+
+  // One-time safe upgrade of untouched legacy template defaults in pre-existing local DBs
+  const curSettings = db
+    .prepare('SELECT pharmacy_name, printer_type, receipt_footer FROM pharmacy_settings WHERE id = 1')
+    .get() as { pharmacy_name: string; printer_type: string; receipt_footer: string } | undefined;
+
+  if (curSettings && curSettings.pharmacy_name === 'Dhaka Care Pharmacy') {
+    db.prepare(
+      `UPDATE pharmacy_settings
+       SET pharmacy_name = 'MediNest',
+           pharmacy_name_bn = '',
+           drug_license_no = 'REG-MN-2026-0001',
+           address = '120 Medical Center Road, Suite 100',
+           phone = '+1 (555) 010-2040',
+           email = 'support@medinest.local',
+           website = 'https://medinest.local',
+           receipt_footer = 'Thank you for choosing MediNest Pharmacy. Please retain this receipt for returns or inquiries.',
+           printer_type = 'A5',
+           updated_at = ?
+       WHERE id = 1`
+    ).run(nowIso());
+  } else if (curSettings && curSettings.printer_type === 'THERMAL_80MM') {
+    db.prepare("UPDATE pharmacy_settings SET printer_type = 'A5', pharmacy_name_bn = '' WHERE id = 1").run();
+  }
+
+  // Assign deterministic medicine codes to any legacy medicines missing medicine_code
+  const uncodedMeds = db
+    .prepare("SELECT id FROM medicines WHERE medicine_code = '' ORDER BY created_at ASC, brand_name ASC")
+    .all() as Array<{ id: string }>;
+  if (uncodedMeds.length > 0) {
+    const existingCount = (
+      db.prepare("SELECT COUNT(*) as cnt FROM medicines WHERE medicine_code != ''").get() as { cnt: number }
+    ).cnt;
+    let nextCodeNum = existingCount + 1;
+    const updCode = db.prepare('UPDATE medicines SET medicine_code = ? WHERE id = ?');
+    for (const m of uncodedMeds) {
+      updCode.run(`MED-${String(nextCodeNum).padStart(4, '0')}`, m.id);
+      nextCodeNum++;
+    }
+  }
 }

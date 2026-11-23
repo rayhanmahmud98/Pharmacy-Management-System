@@ -1,43 +1,201 @@
 import Decimal from 'decimal.js';
 
-Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_UP });
+Decimal.set({ precision: 36, rounding: Decimal.ROUND_HALF_UP });
 
 export type DecimalInput = Decimal | string | number;
 
+const STRICT_DECIMAL_RE = /^-?\d+(\.\d+)?$/;
+const MAX_INTEGER_DIGITS = 18;
+
+export interface StrictDecimalOptions {
+  fieldName?: string;
+  maxIntDigits?: number;
+  maxFracDigits: number;
+  allowZero?: boolean;
+  allowNegative?: boolean;
+}
+
+/**
+ * Strictly parses a numeric value WITHOUT silent rounding or truncation of user input.
+ * Rejects empty strings, NaN, Infinity, scientific notation, >18 integer digits,
+ * and fractional digits exceeding maxFracDigits.
+ */
+export function parseStrictDecimal(value: DecimalInput, opts: StrictDecimalOptions): Decimal {
+  const fieldName = opts.fieldName || 'Value';
+  const maxInt = opts.maxIntDigits ?? MAX_INTEGER_DIGITS;
+  const maxFrac = opts.maxFracDigits;
+  const allowZero = opts.allowZero ?? true;
+  const allowNegative = opts.allowNegative ?? false;
+
+  let dec: Decimal;
+
+  if (value instanceof Decimal) {
+    if (!value.isFinite() || value.isNaN()) {
+      throw new Error(`${fieldName} is not a valid finite number`);
+    }
+    const fixed = value.toFixed();
+    const parts = fixed.replace(/^-/, '').split('.');
+    if (parts[0].length > maxInt) {
+      throw new Error(`${fieldName} exceeds maximum ${maxInt} integer digits`);
+    }
+    if ((parts[1]?.length ?? 0) > maxFrac) {
+      throw new Error(`${fieldName} cannot have more than ${maxFrac} decimal places`);
+    }
+    dec = value;
+  } else {
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) {
+        throw new Error(`${fieldName} is not a valid finite number`);
+      }
+    }
+    const raw = String(value ?? '').trim();
+    if (!raw) {
+      throw new Error(`${fieldName} is required`);
+    }
+    if (!STRICT_DECIMAL_RE.test(raw)) {
+      throw new Error(`${fieldName} has invalid numeric format '${raw}'`);
+    }
+    const unsigned = raw.startsWith('-') ? raw.slice(1) : raw;
+    const [intPart, fracPart = ''] = unsigned.split('.');
+    const significantIntLen = intPart.replace(/^0+/, '').length || 1;
+    if (intPart.length > maxInt || significantIntLen > maxInt) {
+      throw new Error(`${fieldName} exceeds maximum ${maxInt} integer digits`);
+    }
+    if (fracPart.length > maxFrac) {
+      throw new Error(`${fieldName} cannot have more than ${maxFrac} decimal places`);
+    }
+    dec = new Decimal(raw);
+  }
+
+  if (!allowNegative && dec.lt(0)) {
+    throw new Error(`${fieldName} cannot be negative`);
+  }
+  if (!allowZero && dec.eq(0)) {
+    throw new Error(`${fieldName} must be strictly greater than zero`);
+  }
+  return dec;
+}
+
+export function validateCurrencyInput(
+  value: DecimalInput,
+  fieldName = 'Amount',
+  opts?: { allowZero?: boolean; allowNegative?: boolean }
+): Decimal {
+  return parseStrictDecimal(value, {
+    fieldName,
+    maxIntDigits: MAX_INTEGER_DIGITS,
+    maxFracDigits: 2,
+    allowZero: opts?.allowZero ?? true,
+    allowNegative: opts?.allowNegative ?? false,
+  });
+}
+
+export function validateQuantityInput(
+  value: DecimalInput,
+  fieldName = 'Quantity',
+  opts?: { allowZero?: boolean; allowNegative?: boolean }
+): Decimal {
+  return parseStrictDecimal(value, {
+    fieldName,
+    maxIntDigits: MAX_INTEGER_DIGITS,
+    maxFracDigits: 6,
+    allowZero: opts?.allowZero ?? true,
+    allowNegative: opts?.allowNegative ?? false,
+  });
+}
+
+export function validateConversionInput(value: DecimalInput, fieldName = 'Conversion ratio'): Decimal {
+  return parseStrictDecimal(value, {
+    fieldName,
+    maxIntDigits: MAX_INTEGER_DIGITS,
+    maxFracDigits: 6,
+    allowZero: false,
+    allowNegative: false,
+  });
+}
+
+export function validateCostInput(
+  value: DecimalInput,
+  fieldName = 'Cost per base unit',
+  opts?: { allowZero?: boolean }
+): Decimal {
+  return parseStrictDecimal(value, {
+    fieldName,
+    maxIntDigits: MAX_INTEGER_DIGITS,
+    maxFracDigits: 6,
+    allowZero: opts?.allowZero ?? true,
+    allowNegative: false,
+  });
+}
+
 export function d(value: DecimalInput): Decimal {
-  if (value instanceof Decimal) return value;
+  if (value instanceof Decimal) {
+    if (!value.isFinite() || value.isNaN()) throw new Error('Invalid numeric value');
+    return value;
+  }
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new Error('Invalid numeric value');
-    return new Decimal(value.toString());
+    const rawNum = value.toString();
+    if (/[eE]/.test(rawNum)) {
+      return new Decimal(value.toFixed(10));
+    }
+    return new Decimal(rawNum);
   }
   const str = String(value ?? '').trim();
   if (!str) throw new Error('Empty numeric value');
+  if (!STRICT_DECIMAL_RE.test(str)) {
+    throw new Error(`Invalid numeric format '${str}'`);
+  }
   return new Decimal(str);
 }
 
-export function money(value: DecimalInput): Decimal {
+/** Explicit boundary rounding ONLY for calculated financial totals (never for raw user input). */
+export function roundMoney(value: Decimal): Decimal {
   return d(value).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
 }
 
-export function qty(value: DecimalInput): Decimal {
-  return d(value).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+/** Explicit boundary rounding ONLY for derived base quantities (max 6 decimals). */
+export function roundQty(value: Decimal): Decimal {
+  return d(value).toDecimalPlaces(6, Decimal.ROUND_HALF_UP);
 }
 
-export function ratio(value: DecimalInput): Decimal {
-  const val = d(value).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
-  if (val.lte(0)) {
-    throw new Error('Conversion ratio must be strictly greater than zero');
-  }
-  return val;
+/** Explicit boundary rounding ONLY for derived per-base-unit cost snapshots (max 6 decimals). */
+export function roundCost6(value: Decimal): Decimal {
+  return d(value).toDecimalPlaces(6, Decimal.ROUND_HALF_UP);
+}
+
+/**
+ * Validates currency input strictly (max 2 decimals, max 18 integer digits) without silent rounding.
+ */
+export function money(value: DecimalInput, fieldName = 'Amount'): Decimal {
+  return validateCurrencyInput(value, fieldName, { allowZero: true, allowNegative: true });
+}
+
+/**
+ * Validates quantity input strictly (max 6 decimals, max 18 integer digits) without silent rounding.
+ */
+export function qty(value: DecimalInput, fieldName = 'Quantity'): Decimal {
+  return validateQuantityInput(value, fieldName, { allowZero: true, allowNegative: true });
+}
+
+/**
+ * Validates unit conversion ratio strictly (max 6 decimals, max 18 integer digits, > 0).
+ */
+export function ratio(value: DecimalInput, fieldName = 'Conversion ratio'): Decimal {
+  return validateConversionInput(value, fieldName);
+}
+
+/**
+ * Validates per-base cost snapshot strictly (max 6 decimals, max 18 integer digits, >= 0).
+ */
+export function cost6(value: DecimalInput, fieldName = 'Cost per base unit'): Decimal {
+  return validateCostInput(value, fieldName, { allowZero: true });
 }
 
 export function convertToBaseUnits(inputQty: DecimalInput, conversionRatio: DecimalInput): Decimal {
-  const q = qty(inputQty);
-  const r = ratio(conversionRatio);
-  if (q.lte(0)) {
-    throw new Error('Quantity must be strictly greater than zero');
-  }
-  return qty(q.mul(r));
+  const q = validateQuantityInput(inputQty, 'Quantity', { allowZero: false });
+  const r = validateConversionInput(conversionRatio, 'Conversion ratio');
+  return roundQty(q.mul(r));
 }
 
 export interface LineCalcInput {
@@ -55,20 +213,17 @@ export interface LineCalcResult {
 }
 
 export function computeLineTotals(input: LineCalcInput): LineCalcResult {
-  const qInput = qty(input.quantityInput);
-  if (qInput.lte(0)) throw new Error('Line quantity must be positive');
-  const conv = ratio(input.conversionRatio);
-  const price = money(input.unitPriceOrCost);
-  if (price.lt(0)) throw new Error('Unit price/cost cannot be negative');
-  const disc = money(input.discountAmount ?? 0);
-  if (disc.lt(0)) throw new Error('Line discount cannot be negative');
+  const qInput = validateQuantityInput(input.quantityInput, 'Line quantity', { allowZero: false });
+  const conv = validateConversionInput(input.conversionRatio, 'Conversion ratio');
+  const price = validateCurrencyInput(input.unitPriceOrCost, 'Unit price/cost', { allowZero: true });
+  const disc = validateCurrencyInput(input.discountAmount ?? '0', 'Line discount', { allowZero: true });
 
-  const quantityBase = qty(qInput.mul(conv));
-  const grossTotal = money(qInput.mul(price));
+  const quantityBase = roundQty(qInput.mul(conv));
+  const grossTotal = roundMoney(qInput.mul(price));
   if (disc.gt(grossTotal)) {
     throw new Error('Line discount cannot exceed gross line total');
   }
-  const netTotal = money(grossTotal.sub(disc));
+  const netTotal = roundMoney(grossTotal.sub(disc));
   return { quantityBase, grossTotal, discount: disc, netTotal };
 }
 
@@ -93,23 +248,21 @@ export function computeInvoiceTotals(input: InvoiceTotalsInput): InvoiceTotalsRe
   let lineNetSum = new Decimal(0);
 
   for (const line of input.lines) {
-    grossSubtotal = grossSubtotal.add(money(line.grossTotal));
-    lineDiscountTotal = lineDiscountTotal.add(money(line.discount));
-    lineNetSum = lineNetSum.add(money(line.netTotal));
+    grossSubtotal = grossSubtotal.add(validateCurrencyInput(line.grossTotal, 'Line gross total'));
+    lineDiscountTotal = lineDiscountTotal.add(validateCurrencyInput(line.discount, 'Line discount'));
+    lineNetSum = lineNetSum.add(validateCurrencyInput(line.netTotal, 'Line net total'));
   }
 
-  grossSubtotal = money(grossSubtotal);
-  lineDiscountTotal = money(lineDiscountTotal);
-  const invDisc = money(input.invoiceDiscount ?? 0);
-  if (invDisc.lt(0)) throw new Error('Invoice discount cannot be negative');
+  grossSubtotal = roundMoney(grossSubtotal);
+  lineDiscountTotal = roundMoney(lineDiscountTotal);
+  const invDisc = validateCurrencyInput(input.invoiceDiscount ?? '0', 'Invoice discount', { allowZero: true });
   if (invDisc.gt(lineNetSum)) throw new Error('Invoice discount cannot exceed net subtotal');
 
-  const netTotal = money(lineNetSum.sub(invDisc));
-  const paid = money(input.paidAmount ?? 0);
-  if (paid.lt(0)) throw new Error('Paid amount cannot be negative');
+  const netTotal = roundMoney(lineNetSum.sub(invDisc));
+  const paid = validateCurrencyInput(input.paidAmount ?? '0', 'Paid amount', { allowZero: true });
   if (paid.gt(netTotal)) throw new Error('Paid amount cannot exceed net invoice total');
 
-  const dueAmount = money(netTotal.sub(paid));
+  const dueAmount = roundMoney(netTotal.sub(paid));
   return {
     grossSubtotal,
     lineDiscountTotal,
@@ -125,7 +278,7 @@ export interface BatchCandidate {
   batchNumber: string;
   expiryDate: string; // YYYY-MM-DD
   receivedDate: string; // YYYY-MM-DD or ISO
-  status: 'ACTIVE' | 'QUARANTINED' | 'EXPIRED' | 'WRITTEN_OFF' | 'INACTIVE';
+  status: 'ACTIVE' | 'QUARANTINED' | 'EXPIRED' | 'WRITTEN_OFF' | 'INACTIVE' | 'DEPLETED' | 'DAMAGED';
   currentQtyBase: DecimalInput;
   purchaseCostPerBase: DecimalInput;
 }
@@ -145,12 +298,11 @@ export function allocateBatchesFEFO(
   asOfDate: string, // YYYY-MM-DD
   manualBatchId?: string | null
 ): BatchAllocationResult[] {
-  const needed = qty(requiredQtyBase);
-  if (needed.lte(0)) throw new Error('Required quantity must be positive');
+  const needed = validateQuantityInput(requiredQtyBase, 'Required quantity', { allowZero: false });
 
   const eligible = candidates.filter((b) => {
     if (b.status !== 'ACTIVE') return false;
-    if (b.expiryDate <= asOfDate) return false; // Expired on or before today cannot be sold normally
+    if (b.expiryDate <= asOfDate) return false;
     if (qty(b.currentQtyBase).lte(0)) return false;
     return true;
   });
@@ -167,10 +319,10 @@ export function allocateBatchesFEFO(
     const available = qty(chosen.currentQtyBase);
     if (available.lt(needed)) {
       throw new Error(
-        `Insufficient stock in selected batch ${chosen.batchNumber}: available ${available.toFixed(2)}, requested ${needed.toFixed(2)}`
+        `Insufficient stock in selected batch ${chosen.batchNumber}: available ${available.toFixed(6)}, requested ${needed.toFixed(6)}`
       );
     }
-    const cost = d(chosen.purchaseCostPerBase).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+    const cost = cost6(chosen.purchaseCostPerBase);
     return [
       {
         batchId: chosen.id,
@@ -178,7 +330,7 @@ export function allocateBatchesFEFO(
         expiryDate: chosen.expiryDate,
         qtyBase: needed,
         costPerBaseSnapshot: cost,
-        cogsTotal: money(needed.mul(cost)),
+        cogsTotal: roundMoney(needed.mul(cost)),
       },
     ];
   }
@@ -197,22 +349,22 @@ export function allocateBatchesFEFO(
     const available = qty(batch.currentQtyBase);
     if (available.lte(0)) continue;
     const take = Decimal.min(available, remaining);
-    const cost = d(batch.purchaseCostPerBase).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+    const cost = cost6(batch.purchaseCostPerBase);
     allocations.push({
       batchId: batch.id,
       batchNumber: batch.batchNumber,
       expiryDate: batch.expiryDate,
       qtyBase: take,
       costPerBaseSnapshot: cost,
-      cogsTotal: money(take.mul(cost)),
+      cogsTotal: roundMoney(take.mul(cost)),
     });
-    remaining = qty(remaining.sub(take));
+    remaining = roundQty(remaining.sub(take));
   }
 
   if (remaining.gt(0)) {
     const totalAvail = eligible.reduce((acc, b) => acc.add(qty(b.currentQtyBase)), new Decimal(0));
     throw new Error(
-      `Insufficient sellable stock: requested ${needed.toFixed(2)} base units, available ${totalAvail.toFixed(2)}`
+      `Insufficient sellable stock: requested ${needed.toFixed(6)} base units, available ${totalAvail.toFixed(6)}`
     );
   }
 
@@ -223,12 +375,11 @@ export function computeReturnCogsReversal(
   originalAllocations: Array<{ batchId: string; qtyBase: DecimalInput; costPerBaseSnapshot: DecimalInput }>,
   returnQtyBase: DecimalInput
 ): Array<{ batchId: string; qtyBase: Decimal; costPerBaseSnapshot: Decimal; cogsReversed: Decimal }> {
-  let remaining = qty(returnQtyBase);
-  if (remaining.lte(0)) throw new Error('Return quantity must be positive');
+  let remaining = validateQuantityInput(returnQtyBase, 'Return quantity', { allowZero: false });
 
   const totalOrig = originalAllocations.reduce((s, a) => s.add(qty(a.qtyBase)), new Decimal(0));
   if (remaining.gt(totalOrig)) {
-    throw new Error(`Return quantity (${remaining.toFixed(2)}) exceeds available sold quantity (${totalOrig.toFixed(2)})`);
+    throw new Error(`Return quantity (${remaining.toFixed(6)}) exceeds available sold quantity (${totalOrig.toFixed(6)})`);
   }
 
   const results: Array<{ batchId: string; qtyBase: Decimal; costPerBaseSnapshot: Decimal; cogsReversed: Decimal }> = [];
@@ -237,14 +388,14 @@ export function computeReturnCogsReversal(
     const avail = qty(alloc.qtyBase);
     if (avail.lte(0)) continue;
     const take = Decimal.min(avail, remaining);
-    const cost = d(alloc.costPerBaseSnapshot).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+    const cost = cost6(alloc.costPerBaseSnapshot);
     results.push({
       batchId: alloc.batchId,
       qtyBase: take,
       costPerBaseSnapshot: cost,
-      cogsReversed: money(take.mul(cost)),
+      cogsReversed: roundMoney(take.mul(cost)),
     });
-    remaining = qty(remaining.sub(take));
+    remaining = roundQty(remaining.sub(take));
   }
   return results;
 }
@@ -255,11 +406,16 @@ export function computeExpectedCash(
   cashPaid: DecimalInput,
   cashAdjustments: DecimalInput
 ): Decimal {
-  return money(d(openingCash).add(d(cashReceived)).sub(d(cashPaid)).add(d(cashAdjustments)));
+  return roundMoney(
+    money(openingCash, 'Opening cash')
+      .add(money(cashReceived, 'Cash received'))
+      .sub(money(cashPaid, 'Cash paid'))
+      .add(money(cashAdjustments, 'Cash adjustments'))
+  );
 }
 
 export function computeCashVariance(actualCash: DecimalInput, expectedCash: DecimalInput): Decimal {
-  return money(d(actualCash).sub(d(expectedCash)));
+  return roundMoney(money(actualCash, 'Actual cash').sub(money(expectedCash, 'Expected cash')));
 }
 
 export interface PermissionContext {

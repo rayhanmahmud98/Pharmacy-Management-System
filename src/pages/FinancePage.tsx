@@ -1,6 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Lock, Plus, Unlock } from 'lucide-react';
-import { apiFetch, formatBDT } from '../lib/api';
+import {
+  apiFetch,
+  checkStrictDecimalInput,
+  formatBDT,
+  getDisplayCurrencySymbol,
+  newIdempotencyKey,
+} from '../lib/api';
 import { ReasonPromptModal } from '../components/ActionModals';
 import type { AuthUser } from '../types';
 
@@ -64,7 +70,7 @@ interface Props {
 
 export const FinancePage: React.FC<Props> = ({ user, writable }) => {
   const [data, setData] = useState<FinanceData | null>(null);
-  const [openingCash, setOpeningCash] = useState('5000');
+  const [openingCash, setOpeningCash] = useState('5000.00');
   const [actualCash, setActualCash] = useState('');
   const [varianceReason, setVarianceReason] = useState('');
   const [forceClose, setForceClose] = useState(false);
@@ -78,8 +84,13 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
     notes: '',
   });
   const [reverseExpenseTarget, setReverseExpenseTarget] = useState<{ id: string; num: string } | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const openIdempKeyRef = useRef(newIdempotencyKey());
+  const closeIdempKeyRef = useRef(newIdempotencyKey());
+  const expenseIdempKeyRef = useRef(newIdempotencyKey());
+  const currencySym = getDisplayCurrencySymbol();
 
   async function load() {
     const res = await apiFetch<FinanceData>('/api/finance');
@@ -98,54 +109,86 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
 
   async function handleOpenSession(e: React.FormEvent) {
     e.preventDefault();
+    if (submitting) return;
     setError('');
+    const err = checkStrictDecimalInput(openingCash, 'currency', 'Opening cash', { allowZero: true });
+    if (err) {
+      setError(err);
+      return;
+    }
+    setSubmitting(true);
     try {
       const res = await apiFetch<{ sessionNumber: string }>('/api/cash-sessions/open', {
         method: 'POST',
-        body: JSON.stringify({ openingCash }),
+        headers: { 'Idempotency-Key': openIdempKeyRef.current },
+        body: JSON.stringify({ openingCash: openingCash.trim() }),
       });
+      openIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Cash session ${res.sessionNumber} opened.`);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to open session');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function handleCloseSession(e: React.FormEvent) {
     e.preventDefault();
-    if (!data?.activeSummary) return;
+    if (!data?.activeSummary || submitting) return;
     setError('');
+    const err = checkStrictDecimalInput(actualCash, 'currency', 'Actual counted cash', { allowZero: true });
+    if (err) {
+      setError(err);
+      return;
+    }
+    setSubmitting(true);
     try {
       const res = await apiFetch<{ sessionNumber: string; variance: string }>(
         `/api/cash-sessions/${data.activeSummary.session.id}/close`,
         {
           method: 'POST',
-          body: JSON.stringify({ actualCash, varianceReason, forceClose }),
+          headers: { 'Idempotency-Key': closeIdempKeyRef.current },
+          body: JSON.stringify({ actualCash: actualCash.trim(), varianceReason, forceClose }),
         }
       );
+      closeIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Cash session ${res.sessionNumber} closed (Variance: ${formatBDT(res.variance)}).`);
       setVarianceReason('');
       setForceClose(false);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to close session');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function handleCreateExpense(e: React.FormEvent) {
     e.preventDefault();
+    if (submitting) return;
     setError('');
+    const err = checkStrictDecimalInput(expForm.amount, 'currency', 'Expense amount');
+    if (err) {
+      setError(err);
+      return;
+    }
+    setSubmitting(true);
     try {
       const res = await apiFetch<{ expenseNumber: string }>('/api/expenses', {
         method: 'POST',
-        body: JSON.stringify(expForm),
+        headers: { 'Idempotency-Key': expenseIdempKeyRef.current },
+        body: JSON.stringify({ ...expForm, amount: expForm.amount.trim() }),
       });
+      expenseIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Expense ${res.expenseNumber} posted.`);
       setShowExpenseModal(false);
       setExpForm((p) => ({ ...p, name: '', amount: '', referenceNo: '', notes: '' }));
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Expense failed');
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -242,11 +285,10 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
                 <form onSubmit={handleCloseSession} className="pt-3 border-t border-slate-200 space-y-3 text-xs">
                   <div className="font-semibold text-slate-800">Close Cash Session (Manual Physical Count)</div>
                   <div>
-                    <label className="block text-slate-600 mb-1">Actual Counted Cash (৳)</label>
+                    <label className="block text-slate-600 mb-1">Actual Counted Cash ({currencySym})</label>
                     <input
-                      type="number"
-                      step="0.01"
-                      min="0"
+                      type="text"
+                      inputMode="decimal"
                       required
                       value={actualCash}
                       onChange={(e) => setActualCash(e.target.value)}
@@ -277,11 +319,11 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
                   )}
                   <button
                     type="submit"
-                    disabled={!writable}
+                    disabled={!writable || submitting}
                     className="w-full inline-flex items-center justify-center gap-2 py-2 px-4 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md"
                   >
                     <Lock className="w-3.5 h-3.5" />
-                    Close & Reconcile Cash Session
+                    {submitting ? 'Closing...' : 'Close & Reconcile Cash Session'}
                   </button>
                 </form>
               )}
@@ -293,11 +335,10 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
                 Open a cash session with your starting physical drawer float before taking cash sales or paying cash expenses.
               </p>
               <div>
-                <label className="block text-slate-600 mb-1">Opening Cash Float (৳)</label>
+                <label className="block text-slate-600 mb-1">Opening Cash Float ({currencySym})</label>
                 <input
-                  type="number"
-                  step="0.01"
-                  min="0"
+                  type="text"
+                  inputMode="decimal"
                   required
                   value={openingCash}
                   onChange={(e) => setOpeningCash(e.target.value)}
@@ -306,10 +347,10 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
               </div>
               <button
                 type="submit"
-                disabled={!writable || !user.permissions['cash.open']}
+                disabled={!writable || !user.permissions['cash.open'] || submitting}
                 className="w-full py-2 px-4 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
               >
-                Open Cash Session
+                {submitting ? 'Opening...' : 'Open Cash Session'}
               </button>
             </form>
           )}
@@ -471,12 +512,12 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-slate-600 mb-1">Amount (৳) *</label>
+                  <label className="block text-slate-600 mb-1">Amount ({currencySym}) *</label>
                   <input
-                    type="number"
-                    step="0.01"
-                    min="0.01"
+                    type="text"
+                    inputMode="decimal"
                     required
+                    placeholder="0.00"
                     value={expForm.amount}
                     onChange={(e) => setExpForm({ ...expForm, amount: e.target.value })}
                     className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num"
@@ -499,7 +540,13 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
             </div>
             <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
               <button type="button" onClick={() => setShowExpenseModal(false)} className="px-4 py-2 text-xs bg-slate-100 rounded-md">Cancel</button>
-              <button type="submit" className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md">Post Expense</button>
+              <button
+                type="submit"
+                disabled={submitting}
+                className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
+              >
+                {submitting ? 'Posting...' : 'Post Expense'}
+              </button>
             </div>
           </form>
         </div>

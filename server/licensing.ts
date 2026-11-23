@@ -1,16 +1,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
-import { LICENSE_PATH, todayDate } from './db.ts';
+import { LICENSE_PATH, getDb, nowIso, todayDate } from './db.ts';
 
 // PUBLIC VERIFICATION KEY ONLY — Private signing key NEVER resides in customer software.
-// Corresponding private key belongs exclusively to developer License Manager CLI (tools/generate_license.ts).
-export const LICENSE_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAY3P2tA3aG5l2g3zVJv6H9y1K2m3N4p5Q6r7S8t9U0vW=
------END PUBLIC KEY-----`;
-
-// We allow a runtime-configured public key file or fall back to generated/verified keypair on initial seed setup
-// Wait: let's make sure the public key is a valid SPKI Ed25519 key! Let's generate a real deterministic Ed25519 public key constant below.
 export const REAL_ED25519_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAuV3J3nE1C/9K8zK8wE4oT7g8rF2k7b4Q1m0w9p6R4lQ=
 -----END PUBLIC KEY-----`;
@@ -38,6 +31,8 @@ export interface LicenseStatus {
   payload: LicensePayload | null;
 }
 
+const CLOCK_ROLLBACK_TOLERANCE_MS = 5 * 60 * 1000; // 5 minutes
+
 export function getDeviceFingerprint(): string {
   const raw = `${os.hostname()}|${os.platform()}|${os.arch()}|${os.cpus()?.[0]?.model ?? 'cpu'}`;
   return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 24).toUpperCase();
@@ -55,8 +50,6 @@ export function canonicalLicensePayload(payload: LicensePayload): string {
   });
 }
 
-// Note: During dev/demo, we store only the public key PEM in data/license_pub.pem if provisioned by License Manager,
-// or use our official embedded public key. Private key is NEVER stored inside the application.
 export function getActivePublicKeyPem(): string {
   const overridePub = LICENSE_PATH.replace('license.json', 'license_public.pem');
   if (fs.existsSync(overridePub)) {
@@ -65,7 +58,43 @@ export function getActivePublicKeyPem(): string {
   return REAL_ED25519_PUBLIC_KEY_PEM;
 }
 
-export function verifySignedLicense(signed: SignedLicenseFile, publicKeyPem?: string): LicenseStatus {
+function checkAndAdvanceVerifiedClock(nowUtcIso: string): { rollbackDetected: boolean; lastVerifiedUtc: string | null } {
+  try {
+    const db = getDb();
+    const row = db
+      .prepare('SELECT last_verified_utc FROM license_state WHERE id = 1')
+      .get() as { last_verified_utc: string } | undefined;
+
+    const nowMs = Date.parse(nowUtcIso);
+    if (row) {
+      const lastMs = Date.parse(row.last_verified_utc);
+      if (Number.isFinite(lastMs) && nowMs + CLOCK_ROLLBACK_TOLERANCE_MS < lastMs) {
+        return { rollbackDetected: true, lastVerifiedUtc: row.last_verified_utc };
+      }
+      if (!Number.isFinite(lastMs) || nowMs > lastMs) {
+        db.prepare('UPDATE license_state SET last_verified_utc = ?, updated_at = ? WHERE id = 1').run(
+          nowUtcIso,
+          nowUtcIso
+        );
+      }
+      return { rollbackDetected: false, lastVerifiedUtc: row.last_verified_utc };
+    }
+
+    db.prepare('INSERT INTO license_state (id, last_verified_utc, updated_at) VALUES (1, ?, ?)').run(
+      nowUtcIso,
+      nowUtcIso
+    );
+    return { rollbackDetected: false, lastVerifiedUtc: null };
+  } catch {
+    return { rollbackDetected: false, lastVerifiedUtc: null };
+  }
+}
+
+export function verifySignedLicense(
+  signed: SignedLicenseFile,
+  publicKeyPem?: string,
+  options: { checkClockRollback?: boolean } = {}
+): LicenseStatus {
   const deviceFp = getDeviceFingerprint();
   try {
     if (!signed?.payload || !signed?.signatureBase64) {
@@ -104,6 +133,19 @@ export function verifySignedLicense(signed: SignedLicenseFile, publicKeyPem?: st
         deviceFingerprint: deviceFp,
         payload: signed.payload,
       };
+    }
+
+    if (options.checkClockRollback !== false) {
+      const clockCheck = checkAndAdvanceVerifiedClock(nowIso());
+      if (clockCheck.rollbackDetected) {
+        return {
+          status: 'INVALID_READONLY',
+          writable: false,
+          message: `System clock rollback detected (clock earlier than last verified UTC ${clockCheck.lastVerifiedUtc}). Read-Only mode active; restore accurate system time.`,
+          deviceFingerprint: deviceFp,
+          payload: signed.payload,
+        };
+      }
     }
 
     if (signed.payload.licenseType !== 'LIFETIME' && signed.payload.expiryDate) {

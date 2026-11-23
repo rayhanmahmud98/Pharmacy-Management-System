@@ -2,8 +2,8 @@
 
 @layer base {
   :root {
-    --font-display: 'Plus Jakarta Sans', 'Noto Sans Bengali', system-ui, sans-serif;
-    --font-body: 'DM Sans', 'Noto Sans Bengali', system-ui, sans-serif;
+    --font-display: 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-body: 'DM Sans', system-ui, sans-serif;
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
   }
 
@@ -28,6 +28,11 @@
   font-variant-numeric: tabular-nums;
 }
 
+@page {
+  size: A5 portrait;
+  margin: 8mm;
+}
+
 @media print {
   body * {
     visibility: hidden !important;
@@ -41,11 +46,19 @@
     left: 0 !important;
     top: 0 !important;
     width: 100% !important;
+    max-width: none !important;
     background: #ffffff !important;
     color: #000000 !important;
     padding: 0 !important;
     margin: 0 !important;
     box-shadow: none !important;
     border: none !important;
+  }
+  #printable-receipt-area thead {
+    display: table-header-group;
+  }
+  #printable-receipt-area tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
   }
 }

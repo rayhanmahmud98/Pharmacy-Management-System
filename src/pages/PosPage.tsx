@@ -1,6 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import Decimal from 'decimal.js';
 import { CheckCircle2, Plus, Search, Trash2 } from 'lucide-react';
-import { apiFetch, formatBDT, formatQty } from '../lib/api';
+import {
+  apiFetch,
+  checkStrictDecimalInput,
+  formatMoney,
+  formatQty,
+  newIdempotencyKey,
+} from '../lib/api';
 import type { AuthUser, Medicine, PharmacySettings, SaleRecord } from '../types';
 import { ReceiptPrintModal } from '../components/ReceiptPrintModal';
 
@@ -53,6 +60,8 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
   const [successMsg, setSuccessMsg] = useState('');
   const [completedSale, setCompletedSale] = useState<SaleRecord | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const idempotencyKeyRef = useRef<string>(newIdempotencyKey());
+  const currencySym = settings.currency_symbol || '৳';
 
   async function loadCatalog(q = '') {
     const [medRes, partyRes] = await Promise.all([
@@ -89,7 +98,8 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
       (m) =>
         m.brand_name.toLowerCase().includes(q) ||
         m.generic_name.toLowerCase().includes(q) ||
-        m.bangla_name.toLowerCase().includes(q) ||
+        (m.medicine_code || '').toLowerCase().includes(q) ||
+        (m.barcode || '').toLowerCase().includes(q) ||
         m.strength.toLowerCase().includes(q)
     );
   }, [medicines, search]);
@@ -104,10 +114,16 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
       return;
     }
     const today = new Date().toISOString().slice(0, 10);
-    const activeBatches = med.batches.filter((b) => b.status === 'ACTIVE' && b.expiry_date > today && Number(b.current_qty_base) > 0);
-    const baseSellingPrice = Number(activeBatches[0]?.selling_price_per_base || 0);
-    const unitPrice = (baseSellingPrice * Number(defaultUnit.conversion_to_base)).toFixed(2);
+    const activeBatches = med.batches.filter(
+      (b) => b.status === 'ACTIVE' && b.expiry_date > today && Number(b.current_qty_base) > 0
+    );
+    const baseSellingPrice = new Decimal(activeBatches[0]?.selling_price_per_base || '0');
+    const unitPrice = baseSellingPrice
+      .mul(new Decimal(defaultUnit.conversion_to_base))
+      .toDecimalPlaces(2, Decimal.ROUND_HALF_UP)
+      .toFixed(2);
 
+    idempotencyKeyRef.current = newIdempotencyKey();
     setCart((prev) => [
       ...prev,
       {
@@ -124,6 +140,7 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
   }
 
   function updateCartLine(key: string, patch: Partial<CartLine>) {
+    idempotencyKeyRef.current = newIdempotencyKey();
     setCart((prev) =>
       prev.map((line) => {
         if (line.key !== key) return line;
@@ -133,7 +150,10 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
           const today = new Date().toISOString().slice(0, 10);
           const activeBatch = line.medicine.batches.find((b) => b.status === 'ACTIVE' && b.expiry_date > today);
           if (newUnit && activeBatch) {
-            updated.unitPrice = (Number(activeBatch.selling_price_per_base) * Number(newUnit.conversion_to_base)).toFixed(2);
+            updated.unitPrice = new Decimal(activeBatch.selling_price_per_base)
+              .mul(new Decimal(newUnit.conversion_to_base))
+              .toDecimalPlaces(2, Decimal.ROUND_HALF_UP)
+              .toFixed(2);
           }
         }
         return updated;
@@ -142,24 +162,51 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
   }
 
   const cartSummary = useMemo(() => {
-    let gross = 0;
-    let lineDisc = 0;
+    let gross = new Decimal(0);
+    let lineDisc = new Decimal(0);
     for (const l of cart) {
-      const q = Number(l.quantityInput || 0);
-      const p = Number(l.unitPrice || 0);
-      const d = Number(l.lineDiscount || 0);
-      gross += q * p;
-      lineDisc += d;
+      try {
+        const q = new Decimal(l.quantityInput || '0');
+        const p = new Decimal(l.unitPrice || '0');
+        const d = new Decimal(l.lineDiscount || '0');
+        if (q.isFinite() && p.isFinite()) gross = gross.add(q.mul(p));
+        if (d.isFinite()) lineDisc = lineDisc.add(d);
+      } catch {
+        // Ignore intermediate invalid edit while typing; validated on submit
+      }
     }
-    const invDisc = Number(invoiceDiscount || 0);
-    const net = Math.max(0, gross - lineDisc - invDisc);
-    const paid = payments.reduce((sum, p) => sum + Number(p.amount || 0), 0);
-    const due = Math.max(0, net - paid);
-    return { gross, lineDisc, invDisc, net, paid, due };
+    let invDisc = new Decimal(0);
+    try {
+      invDisc = new Decimal(invoiceDiscount || '0');
+    } catch {
+      invDisc = new Decimal(0);
+    }
+    const netRaw = gross.sub(lineDisc).sub(invDisc);
+    const net = (netRaw.lt(0) ? new Decimal(0) : netRaw).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+    let paid = new Decimal(0);
+    for (const p of payments) {
+      try {
+        paid = paid.add(new Decimal(p.amount || '0'));
+      } catch {
+        // Ignore transient input
+      }
+    }
+    const paidRounded = paid.toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+    const dueRaw = net.sub(paidRounded);
+    const due = dueRaw.lt(0) ? new Decimal(0) : dueRaw;
+    return {
+      gross: gross.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2),
+      lineDisc: lineDisc.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2),
+      invDisc: invDisc.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2),
+      net: net.toFixed(2),
+      paid: paidRounded.toFixed(2),
+      due: due.toFixed(2),
+    };
   }, [cart, invoiceDiscount, payments]);
 
   function fillExactCash() {
-    setPayments([{ key: 'p1', method: 'CASH', amount: cartSummary.net.toFixed(2), referenceNo: '' }]);
+    idempotencyKeyRef.current = newIdempotencyKey();
+    setPayments([{ key: 'p1', method: 'CASH', amount: cartSummary.net, referenceNo: '' }]);
   }
 
   async function handleCheckout(e: React.FormEvent) {
@@ -168,12 +215,53 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
       setError('License is in Read-Only mode. Sales cannot be posted.');
       return;
     }
+
+    // Strict client-side decimal checks before posting
+    for (const l of cart) {
+      const qErr = checkStrictDecimalInput(l.quantityInput, 'qty', `Quantity for ${l.medicine.brand_name}`);
+      if (qErr) {
+        setError(qErr);
+        return;
+      }
+      const pErr = checkStrictDecimalInput(l.unitPrice, 'currency', `Unit price for ${l.medicine.brand_name}`, {
+        allowZero: true,
+      });
+      if (pErr) {
+        setError(pErr);
+        return;
+      }
+      const dErr = checkStrictDecimalInput(l.lineDiscount || '0', 'currency', `Line discount for ${l.medicine.brand_name}`, {
+        allowZero: true,
+      });
+      if (dErr) {
+        setError(dErr);
+        return;
+      }
+    }
+    const invErr = checkStrictDecimalInput(invoiceDiscount || '0', 'currency', 'Invoice discount', { allowZero: true });
+    if (invErr) {
+      setError(invErr);
+      return;
+    }
+    for (const p of payments) {
+      if (p.amount && p.amount.trim() !== '') {
+        const payErr = checkStrictDecimalInput(p.amount, 'currency', `${p.method} payment amount`, { allowZero: true });
+        if (payErr) {
+          setError(payErr);
+          return;
+        }
+      }
+    }
+
     setError('');
     setSuccessMsg('');
     setSubmitting(true);
     try {
       const res = await apiFetch<{ saleId: string; invoiceNumber: string; netTotal: string }>('/api/sales', {
         method: 'POST',
+        headers: {
+          'Idempotency-Key': idempotencyKeyRef.current,
+        },
         body: JSON.stringify({
           customerId: selectedCustomerId || null,
           invoiceDiscount: invoiceDiscount || '0',
@@ -191,10 +279,11 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
         }),
       });
 
+      idempotencyKeyRef.current = newIdempotencyKey();
       const salesData = await apiFetch<{ sales: SaleRecord[] }>('/api/sales');
       const created = salesData.sales.find((s) => s.id === res.saleId) || null;
       setCompletedSale(created);
-      setSuccessMsg(`Sale ${res.invoiceNumber} completed (${formatBDT(res.netTotal)})`);
+      setSuccessMsg(`Sale ${res.invoiceNumber} completed (${formatMoney(res.netTotal, currencySym)})`);
       setCart([]);
       setInvoiceDiscount('0');
       setNotes('');
@@ -215,7 +304,7 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
         <div>
           <h1 className="text-xl font-bold text-slate-900">Point of Sale (FEFO Counter)</h1>
           <p className="text-xs text-slate-500">
-            Press <kbd className="px-1.5 py-0.5 bg-slate-200 rounded text-[11px] font-mono-num">F2</kbd> to focus medicine search · Expired & quarantined batches are automatically excluded
+            Press <kbd className="px-1.5 py-0.5 bg-slate-200 rounded text-[11px] font-mono-num">F2</kbd> to focus search · Scan barcode + Enter to quick-add · Expired &amp; quarantined batches are excluded
           </p>
         </div>
         {successMsg && (
@@ -241,10 +330,25 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
               <input
                 ref={searchRef}
                 type="text"
-                aria-label="Search medicine by brand, generic, strength, or Bangla name"
-                placeholder="Search brand, generic, strength, বাংলা নাম..."
+                aria-label="Search medicine by brand, generic, code, barcode, or strength"
+                placeholder="Search brand, generic, code, barcode, strength..."
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && search.trim()) {
+                    e.preventDefault();
+                    const q = search.trim().toLowerCase();
+                    const exact = medicines.find(
+                      (m) =>
+                        (m.barcode && m.barcode.toLowerCase() === q) ||
+                        (m.medicine_code && m.medicine_code.toLowerCase() === q)
+                    );
+                    if (exact && Number(exact.sellable_stock_base || 0) > 0) {
+                      addMedicineToCart(exact);
+                      setSearch('');
+                    }
+                  }
+                }}
                 className="w-full pl-9 pr-3 py-2 text-sm border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-600"
               />
             </div>
@@ -253,7 +357,9 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
           <div className="max-h-[580px] overflow-y-auto divide-y divide-slate-100">
             {filteredMeds.map((med) => {
               const sellable = Number(med.sellable_stock_base || 0);
-              const earliestActive = med.batches.find((b) => b.status === 'ACTIVE' && b.expiry_date > today && Number(b.current_qty_base) > 0);
+              const earliestActive = med.batches.find(
+                (b) => b.status === 'ACTIVE' && b.expiry_date > today && Number(b.current_qty_base) > 0
+              );
               return (
                 <button
                   key={med.id}
@@ -268,11 +374,11 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
                       {med.rx_required ? <span className="ml-2 text-[11px] text-amber-700 font-medium">Rx</span> : null}
                     </div>
                     <div className="text-xs text-slate-500 truncate">
-                      {med.generic_name} {med.bangla_name ? `· ${med.bangla_name}` : ''}
+                      {med.generic_name} {med.medicine_code ? `· ${med.medicine_code}` : ''}
                     </div>
                     <div className="text-[11px] text-slate-500 mt-0.5 font-mono-num">
                       {earliestActive
-                        ? `FEFO: ${earliestActive.batch_number} · Exp ${earliestActive.expiry_date} · ${formatBDT(earliestActive.selling_price_per_base)}/${med.base_unit_name}`
+                        ? `FEFO: ${earliestActive.batch_number} · Exp ${earliestActive.expiry_date} · ${formatMoney(earliestActive.selling_price_per_base, currencySym)}/${med.base_unit_name}`
                         : 'No sellable active batch'}
                     </div>
                   </div>
@@ -286,7 +392,7 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
               );
             })}
             {filteredMeds.length === 0 && (
-              <div className="p-6 text-center text-xs text-slate-500">No medicines matched "{search}".</div>
+              <div className="p-6 text-center text-xs text-slate-500">No medicines matched &ldquo;{search}&rdquo;.</div>
             )}
           </div>
         </div>
@@ -301,12 +407,15 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
               <select
                 id="pos-customer"
                 value={selectedCustomerId}
-                onChange={(e) => setSelectedCustomerId(e.target.value)}
+                onChange={(e) => {
+                  idempotencyKeyRef.current = newIdempotencyKey();
+                  setSelectedCustomerId(e.target.value);
+                }}
                 className="w-full px-3 py-1.5 text-sm border border-slate-300 rounded-md bg-white"
               >
                 {customers.map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.name} {c.phone ? `(${c.phone})` : ''} {Number(c.current_balance) > 0 ? `— Due ${formatBDT(c.current_balance)}` : ''}
+                    {c.name} {c.phone ? `(${c.phone})` : ''} {Number(c.current_balance) > 0 ? `— Due ${formatMoney(c.current_balance, currencySym)}` : ''}
                   </option>
                 ))}
               </select>
@@ -317,22 +426,28 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
             </div>
           </div>
 
-          {/* Cart Table */}
           {cart.length === 0 ? (
             <div className="py-10 text-center text-xs text-slate-500 border border-dashed border-slate-200 rounded-md">
-              Select medicines from the left catalog to start billing.
+              Select medicines from the left catalog or scan a barcode to start billing.
             </div>
           ) : (
             <div className="space-y-3">
               {cart.map((line) => {
                 const saleUnits = line.medicine.units.filter((u) => u.is_active && u.allow_sale);
                 const selectedUnit = saleUnits.find((u) => u.id === line.unitId) || saleUnits[0];
-                const conv = Number(selectedUnit?.conversion_to_base || 1);
-                const qtyBase = Number(line.quantityInput || 0) * conv;
-                const lineNet = Math.max(
-                  0,
-                  Number(line.quantityInput || 0) * Number(line.unitPrice || 0) - Number(line.lineDiscount || 0)
-                );
+                const conv = new Decimal(selectedUnit?.conversion_to_base || '1');
+                let qtyBase = new Decimal(0);
+                let lineNet = new Decimal(0);
+                try {
+                  qtyBase = new Decimal(line.quantityInput || '0').mul(conv);
+                  lineNet = new Decimal(line.quantityInput || '0')
+                    .mul(new Decimal(line.unitPrice || '0'))
+                    .sub(new Decimal(line.lineDiscount || '0'));
+                  if (lineNet.lt(0)) lineNet = new Decimal(0);
+                } catch {
+                  qtyBase = new Decimal(0);
+                  lineNet = new Decimal(0);
+                }
                 const activeBatches = line.medicine.batches.filter(
                   (b) => b.status === 'ACTIVE' && b.expiry_date > today && Number(b.current_qty_base) > 0
                 );
@@ -345,14 +460,17 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
                           {line.medicine.brand_name} {line.medicine.strength}
                         </div>
                         <div className="text-[11px] text-slate-500 font-mono-num">
-                          1 {selectedUnit?.unit_name} = {formatQty(conv)} {line.medicine.base_unit_name} · Base deduction:{' '}
-                          {formatQty(qtyBase)} {line.medicine.base_unit_name}
+                          1 {selectedUnit?.unit_name} = {formatQty(conv.toString())} {line.medicine.base_unit_name} · Base deduction:{' '}
+                          {formatQty(qtyBase.toFixed(6))} {line.medicine.base_unit_name}
                         </div>
                       </div>
                       <button
                         type="button"
                         aria-label={`Remove ${line.medicine.brand_name}`}
-                        onClick={() => setCart((prev) => prev.filter((c) => c.key !== line.key))}
+                        onClick={() => {
+                          idempotencyKeyRef.current = newIdempotencyKey();
+                          setCart((prev) => prev.filter((c) => c.key !== line.key));
+                        }}
                         className="p-1.5 text-slate-400 hover:text-red-600"
                       >
                         <Trash2 className="w-4 h-4" />
@@ -378,9 +496,8 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
                       <div>
                         <label className="block text-[11px] text-slate-500 mb-0.5">Qty</label>
                         <input
-                          type="number"
-                          step="0.01"
-                          min="0.01"
+                          type="text"
+                          inputMode="decimal"
                           aria-label={`Quantity for ${line.medicine.brand_name}`}
                           value={line.quantityInput}
                           onChange={(e) => updateCartLine(line.key, { quantityInput: e.target.value })}
@@ -390,9 +507,8 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
                       <div>
                         <label className="block text-[11px] text-slate-500 mb-0.5">Price / Unit</label>
                         <input
-                          type="number"
-                          step="0.01"
-                          min="0"
+                          type="text"
+                          inputMode="decimal"
                           aria-label={`Price for ${line.medicine.brand_name}`}
                           value={line.unitPrice}
                           onChange={(e) => updateCartLine(line.key, { unitPrice: e.target.value })}
@@ -400,11 +516,10 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
                         />
                       </div>
                       <div>
-                        <label className="block text-[11px] text-slate-500 mb-0.5">Line Disc (৳)</label>
+                        <label className="block text-[11px] text-slate-500 mb-0.5">Line Disc ({currencySym})</label>
                         <input
-                          type="number"
-                          step="0.01"
-                          min="0"
+                          type="text"
+                          inputMode="decimal"
                           disabled={!user.permissions['pos.discount']}
                           aria-label={`Discount for ${line.medicine.brand_name}`}
                           value={line.lineDiscount}
@@ -414,7 +529,9 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
                       </div>
                       <div className="text-right">
                         <div className="text-[11px] text-slate-500">Line Total</div>
-                        <div className="text-sm font-bold font-mono-num text-slate-900">{formatBDT(lineNet)}</div>
+                        <div className="text-sm font-bold font-mono-num text-slate-900">
+                          {formatMoney(lineNet.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2), currencySym)}
+                        </div>
                       </div>
                     </div>
 
@@ -466,12 +583,13 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
                   </button>
                   <button
                     type="button"
-                    onClick={() =>
+                    onClick={() => {
+                      idempotencyKeyRef.current = newIdempotencyKey();
                       setPayments((prev) => [
                         ...prev,
                         { key: `p-${Date.now()}`, method: 'BKASH', amount: '', referenceNo: '' },
-                      ])
-                    }
+                      ]);
+                    }}
                     className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-700 hover:text-slate-900 whitespace-nowrap"
                   >
                     <Plus className="w-3 h-3 shrink-0" /> Split Pay
@@ -484,13 +602,14 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
                   <select
                     aria-label={`Payment method ${idx + 1}`}
                     value={p.method}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      idempotencyKeyRef.current = newIdempotencyKey();
                       setPayments((prev) =>
                         prev.map((x) =>
                           x.key === p.key ? { ...x, method: e.target.value as PaymentEntry['method'] } : x
                         )
-                      )
-                    }
+                      );
+                    }}
                     className="col-span-4 px-2 py-1.5 text-xs border border-slate-300 rounded bg-white"
                   >
                     <option value="CASH">Cash</option>
@@ -502,17 +621,17 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
                     <option value="OTHER">Other</option>
                   </select>
                   <input
-                    type="number"
-                    step="0.01"
-                    min="0"
+                    type="text"
+                    inputMode="decimal"
                     placeholder="Amount"
                     aria-label={`Payment amount ${idx + 1}`}
                     value={p.amount}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      idempotencyKeyRef.current = newIdempotencyKey();
                       setPayments((prev) =>
                         prev.map((x) => (x.key === p.key ? { ...x, amount: e.target.value } : x))
-                      )
-                    }
+                      );
+                    }}
                     className="col-span-4 px-2 py-1.5 text-xs border border-slate-300 rounded font-mono-num"
                   />
                   <input
@@ -520,11 +639,12 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
                     placeholder="Ref / TrxID"
                     aria-label={`Payment reference ${idx + 1}`}
                     value={p.referenceNo}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      idempotencyKeyRef.current = newIdempotencyKey();
                       setPayments((prev) =>
                         prev.map((x) => (x.key === p.key ? { ...x, referenceNo: e.target.value } : x))
-                      )
-                    }
+                      );
+                    }}
                     className="col-span-4 px-2 py-1.5 text-xs border border-slate-300 rounded"
                   />
                 </div>
@@ -541,38 +661,40 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
             <div className="bg-slate-50 border border-slate-200 rounded-md p-3 space-y-2 text-xs">
               <div className="flex justify-between">
                 <span className="text-slate-600">Gross Subtotal</span>
-                <span className="font-mono-num font-medium">{formatBDT(cartSummary.gross)}</span>
+                <span className="font-mono-num font-medium">{formatMoney(cartSummary.gross, currencySym)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-600">Line Discounts</span>
-                <span className="font-mono-num">-{formatBDT(cartSummary.lineDisc)}</span>
+                <span className="font-mono-num">-{formatMoney(cartSummary.lineDisc, currencySym)}</span>
               </div>
               <div className="flex justify-between items-center gap-2">
                 <label htmlFor="pos-inv-disc" className="text-slate-600">
-                  Invoice Discount (৳)
+                  Invoice Discount ({currencySym})
                 </label>
                 <input
                   id="pos-inv-disc"
-                  type="number"
-                  step="0.01"
-                  min="0"
+                  type="text"
+                  inputMode="decimal"
                   disabled={!user.permissions['pos.discount']}
                   value={invoiceDiscount}
-                  onChange={(e) => setInvoiceDiscount(e.target.value)}
+                  onChange={(e) => {
+                    idempotencyKeyRef.current = newIdempotencyKey();
+                    setInvoiceDiscount(e.target.value);
+                  }}
                   className="w-24 px-2 py-1 text-right font-mono-num border border-slate-300 rounded bg-white disabled:bg-slate-100"
                 />
               </div>
               <div className="flex justify-between pt-2 border-t border-slate-300 text-sm font-bold text-slate-900">
                 <span>Net Total</span>
-                <span className="font-mono-num">{formatBDT(cartSummary.net)}</span>
+                <span className="font-mono-num">{formatMoney(cartSummary.net, currencySym)}</span>
               </div>
               <div className="flex justify-between text-slate-700">
                 <span>Total Paid</span>
-                <span className="font-mono-num font-medium">{formatBDT(cartSummary.paid)}</span>
+                <span className="font-mono-num font-medium">{formatMoney(cartSummary.paid, currencySym)}</span>
               </div>
               <div className="flex justify-between font-semibold text-amber-700">
                 <span>Balance Due</span>
-                <span className="font-mono-num">{formatBDT(cartSummary.due)}</span>
+                <span className="font-mono-num">{formatMoney(cartSummary.due, currencySym)}</span>
               </div>
             </div>
           </div>
@@ -581,6 +703,7 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
             <button
               type="button"
               onClick={() => {
+                idempotencyKeyRef.current = newIdempotencyKey();
                 setCart([]);
                 setInvoiceDiscount('0');
                 setPayments([{ key: 'p1', method: 'CASH', amount: '', referenceNo: '' }]);
