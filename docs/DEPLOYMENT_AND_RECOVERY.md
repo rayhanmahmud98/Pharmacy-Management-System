@@ -38,13 +38,14 @@ On startup, MediNest logs all active LAN IPv4 addresses (for example `http://192
 - Data files are stored under `PHARMACY_DATA_DIR` (defaults to `./data/`):
   - `pharmacy.db`, `pharmacy.db-wal`, `pharmacy.db-shm`
   - `backups/medinest-backup-*.sqlite`
-  - `license.json`, `license_public.pem`
-- **Creating Backups**: Use **Admin -> Verified SQLite Backups -> Create Verified Backup Now**. MediNest uses native SQLite online backup (`VACUUM INTO` / backup API) and verifies the output file with `PRAGMA integrity_check` plus SHA-256 checksum recording.
-- **Restoring Backups**: Restoring from Admin automatically captures a pre-restore safety snapshot before swapping the database file and re-running `PRAGMA integrity_check`.
+  - `license.json`
+- **Creating Backups**: Use **Admin -> Verified SQLite Backups -> Create Verified Backup Now**. MediNest uses native SQLite online backup (`backup`) and verifies the output file with `PRAGMA integrity_check` plus SHA-256 checksum recording.
+- **Restoring Backups**: Restoring from Admin verifies the stored SHA-256 checksum against the backup file on disk, validates `PRAGMA integrity_check`, captures a `PRE_RESTORE` safety snapshot before swapping the database file, and re-runs `PRAGMA integrity_check` (rolling back automatically if post-restore verification fails).
 - **Clean Shutdown**: `SIGINT` and `SIGTERM` run `PRAGMA wal_checkpoint(TRUNCATE)` before closing SQLite cleanly.
 
 ## 6. Offline Ed25519 Licensing & Audit Verification
-- Licenses are verified completely offline using the bundled Ed25519 public key (`license_public.pem`).
+- Licenses are verified completely offline using the vendor Ed25519 public key compiled directly into the server binary (external public-key files in the data directory are never trusted).
+- For non-production local development only, `NODE_ENV=development` supports explicit opt-in via `MEDINEST_DEV_LICENSE_BYPASS=1`.
 - UTC timestamps are persisted monotonically in `license_state.last_verified_utc` (5-minute tolerance) to detect system clock rollbacks.
-- If expired or invalid, the app enters **Read-Only Recovery Mode**: billing and mutations pause while Excel exports, reports, invoice reprints, and verified backups remain accessible.
+- If missing, expired, or invalid, the app enters **Read-Only Recovery Mode**: billing and mutations pause while Excel exports, reports, invoice reprints, and verified backups remain accessible.
 - Every sensitive action appends to `audit_logs` linked by a local SHA-256 hash chain verifiable in **Admin -> Audit Log & Hash Chain**.

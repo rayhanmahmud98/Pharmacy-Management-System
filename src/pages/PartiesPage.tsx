@@ -17,6 +17,7 @@ interface Customer {
   phone: string;
   address: string;
   current_balance: string;
+  advance_balance?: string;
   credit_limit: string;
 }
 
@@ -28,6 +29,7 @@ interface Supplier {
   phone: string;
   return_policy_days: number;
   current_balance: string;
+  advance_balance?: string;
 }
 
 interface PaymentRow {
@@ -44,6 +46,19 @@ interface PaymentRow {
   created_at: string;
 }
 
+interface AdvanceLedgerRow {
+  id: string;
+  party_type: string;
+  party_id: string;
+  entry_type: string;
+  source_type: string;
+  source_id: string;
+  amount_signed: string;
+  notes: string;
+  user_name: string;
+  created_at: string;
+}
+
 interface Props {
   user: AuthUser;
   writable: boolean;
@@ -54,6 +69,7 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [payments, setPayments] = useState<PaymentRow[]>([]);
+  const [advanceLedger, setAdvanceLedger] = useState<AdvanceLedgerRow[]>([]);
   const [payModal, setPayModal] = useState<{ partyType: 'CUSTOMER' | 'SUPPLIER'; partyId: string; name: string } | null>(null);
   const [payMethod, setPayMethod] = useState<'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD'>('CASH');
   const [payAmount, setPayAmount] = useState('');
@@ -74,10 +90,16 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
   const currencySym = getDisplayCurrencySymbol();
 
   async function load() {
-    const res = await apiFetch<{ customers: Customer[]; suppliers: Supplier[]; payments: PaymentRow[] }>('/api/parties');
+    const res = await apiFetch<{
+      customers: Customer[];
+      suppliers: Supplier[];
+      payments: PaymentRow[];
+      advanceLedger?: AdvanceLedgerRow[];
+    }>('/api/parties');
     setCustomers(res.customers);
     setSuppliers(res.suppliers);
     setPayments(res.payments);
+    setAdvanceLedger(res.advanceLedger || []);
   }
 
   useEffect(() => {
@@ -95,7 +117,12 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
     }
     setSubmittingPay(true);
     try {
-      const res = await apiFetch<{ paymentNumber: string }>('/api/payments', {
+      const res = await apiFetch<{
+        paymentNumber: string;
+        allocatedToDocs?: string;
+        openingApplied?: string;
+        advanceAdded?: string;
+      }>('/api/payments', {
         method: 'POST',
         headers: { 'Idempotency-Key': paymentIdempKeyRef.current },
         body: JSON.stringify({
@@ -107,7 +134,11 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
         }),
       });
       paymentIdempKeyRef.current = newIdempotencyKey();
-      setNotice(`Payment ${res.paymentNumber} posted (${payMethod} ${formatBDT(payAmount)}).`);
+      const advNote =
+        res.advanceAdded && Number(res.advanceAdded) > 0
+          ? ` (Advance credit recorded: ${formatBDT(res.advanceAdded)})`
+          : '';
+      setNotice(`Payment ${res.paymentNumber} posted (${payMethod} ${formatBDT(payAmount)})${advNote}.`);
       setPayModal(null);
       setPayAmount('');
       setPayRef('');
@@ -273,6 +304,7 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                 <th className="text-left px-4 py-2.5 font-medium">Phone & Address</th>
                 <th className="text-right px-4 py-2.5 font-medium">Credit Limit</th>
                 <th className="text-right px-4 py-2.5 font-medium">Current Due</th>
+                <th className="text-right px-4 py-2.5 font-medium">Advance Credit</th>
                 <th className="text-right px-4 py-2.5 font-medium">Action</th>
               </tr>
             </thead>
@@ -287,6 +319,9 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                   <td className="px-4 py-2.5 text-right font-mono-num">{formatBDT(c.credit_limit)}</td>
                   <td className={`px-4 py-2.5 text-right font-mono-num font-bold ${Number(c.current_balance) > 0 ? 'text-amber-700' : 'text-slate-800'}`}>
                     {formatBDT(c.current_balance)}
+                  </td>
+                  <td className={`px-4 py-2.5 text-right font-mono-num font-semibold ${Number(c.advance_balance || 0) > 0 ? 'text-emerald-700' : 'text-slate-400'}`}>
+                    {formatBDT(c.advance_balance || '0.00')}
                   </td>
                   <td className="px-4 py-2.5 text-right space-x-3 whitespace-nowrap">
                     {user.permissions['parties.manage'] && c.code !== 'CUST-WALKIN' && (
@@ -332,6 +367,7 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                 <th className="text-left px-4 py-2.5 font-medium">Code · Supplier</th>
                 <th className="text-left px-4 py-2.5 font-medium">Contact & Policy</th>
                 <th className="text-right px-4 py-2.5 font-medium">Payable Due</th>
+                <th className="text-right px-4 py-2.5 font-medium">Advance Credit</th>
                 <th className="text-right px-4 py-2.5 font-medium">Action</th>
               </tr>
             </thead>
@@ -347,6 +383,9 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                   </td>
                   <td className={`px-4 py-2.5 text-right font-mono-num font-bold ${Number(s.current_balance) > 0 ? 'text-red-700' : 'text-slate-800'}`}>
                     {formatBDT(s.current_balance)}
+                  </td>
+                  <td className={`px-4 py-2.5 text-right font-mono-num font-semibold ${Number(s.advance_balance || 0) > 0 ? 'text-emerald-700' : 'text-slate-400'}`}>
+                    {formatBDT(s.advance_balance || '0.00')}
                   </td>
                   <td className="px-4 py-2.5 text-right">
                     {user.permissions['payments.record'] && (
@@ -371,46 +410,84 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
       )}
 
       {tab === 'payments' && (
-        <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
-          <table className="w-full text-xs">
-            <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
-              <tr>
-                <th className="text-left px-4 py-2.5 font-medium">Payment #</th>
-                <th className="text-left px-4 py-2.5 font-medium">Party / Dir</th>
-                <th className="text-left px-4 py-2.5 font-medium">Method / Ref</th>
-                <th className="text-right px-4 py-2.5 font-medium">Amount</th>
-                <th className="text-left px-4 py-2.5 font-medium">Status</th>
-                <th className="text-right px-4 py-2.5 font-medium">Action</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {payments.map((p) => (
-                <tr key={p.id}>
-                  <td className="px-4 py-2.5 font-mono-num font-semibold">{p.payment_number}</td>
-                  <td className="px-4 py-2.5">{p.party_type} · {p.direction}</td>
-                  <td className="px-4 py-2.5">
-                    {p.method} {p.reference_no ? `(${p.reference_no})` : ''}
-                  </td>
-                  <td className="px-4 py-2.5 text-right font-mono-num font-semibold">{formatBDT(p.amount)}</td>
-                  <td className="px-4 py-2.5 font-semibold">
-                    <span className={p.status === 'POSTED' ? 'text-emerald-700' : 'text-red-700'}>{p.status}</span>
-                  </td>
-                  <td className="px-4 py-2.5 text-right">
-                    {p.status === 'POSTED' && user.permissions['payments.reverse'] && (
-                      <button
-                        type="button"
-                        disabled={!writable}
-                        onClick={() => handleReversePayment(p)}
-                        className="text-red-700 hover:underline font-medium"
-                      >
-                        Reverse
-                      </button>
-                    )}
-                  </td>
+        <div className="space-y-4">
+          <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                <tr>
+                  <th className="text-left px-4 py-2.5 font-medium">Payment #</th>
+                  <th className="text-left px-4 py-2.5 font-medium">Party / Dir</th>
+                  <th className="text-left px-4 py-2.5 font-medium">Method / Ref</th>
+                  <th className="text-right px-4 py-2.5 font-medium">Amount</th>
+                  <th className="text-left px-4 py-2.5 font-medium">Status</th>
+                  <th className="text-right px-4 py-2.5 font-medium">Action</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {payments.map((p) => (
+                  <tr key={p.id}>
+                    <td className="px-4 py-2.5 font-mono-num font-semibold">{p.payment_number}</td>
+                    <td className="px-4 py-2.5">{p.party_type} · {p.direction}</td>
+                    <td className="px-4 py-2.5">
+                      {p.method} {p.reference_no ? `(${p.reference_no})` : ''}
+                    </td>
+                    <td className="px-4 py-2.5 text-right font-mono-num font-semibold">{formatBDT(p.amount)}</td>
+                    <td className="px-4 py-2.5 font-semibold">
+                      <span className={p.status === 'POSTED' ? 'text-emerald-700' : 'text-red-700'}>{p.status}</span>
+                    </td>
+                    <td className="px-4 py-2.5 text-right">
+                      {p.status === 'POSTED' && user.permissions['payments.reverse'] && (
+                        <button
+                          type="button"
+                          disabled={!writable}
+                          onClick={() => handleReversePayment(p)}
+                          className="text-red-700 hover:underline font-medium"
+                        >
+                          Reverse
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {advanceLedger.length > 0 && (
+            <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
+              <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-700">
+                Party Advance Credit Ledger ({advanceLedger.length})
+              </div>
+              <table className="w-full text-xs">
+                <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                  <tr>
+                    <th className="text-left px-4 py-2 font-medium">Party</th>
+                    <th className="text-left px-4 py-2 font-medium">Entry Type</th>
+                    <th className="text-left px-4 py-2 font-medium">Notes</th>
+                    <th className="text-right px-4 py-2 font-medium">Amount</th>
+                    <th className="text-left px-4 py-2 font-medium">User</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {advanceLedger.map((al) => (
+                    <tr key={al.id}>
+                      <td className="px-4 py-2 font-medium">{al.party_type}</td>
+                      <td className="px-4 py-2 font-mono-num">{al.entry_type}</td>
+                      <td className="px-4 py-2 text-slate-600">{al.notes}</td>
+                      <td
+                        className={`px-4 py-2 text-right font-mono-num font-semibold ${
+                          Number(al.amount_signed) >= 0 ? 'text-emerald-700' : 'text-amber-700'
+                        }`}
+                      >
+                        {formatBDT(al.amount_signed)}
+                      </td>
+                      <td className="px-4 py-2 text-slate-500">{al.user_name}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
 

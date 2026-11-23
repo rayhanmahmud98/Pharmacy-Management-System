@@ -1,0 +1,1325 @@
+# PHARMACY MANAGEMENT SYSTEM — CONTROLLED SECURITY & BUSINESS LOGIC REPAIR
+
+## ROLE
+
+Act as a senior software engineer, database engineer, security auditor, and pharmacy-management-system domain specialist.
+
+You are working on an existing, substantially completed Pharmacy Management System. Your task is to perform a **controlled repair of identified defects**, not rebuild, redesign, rewrite, or replace the application.
+
+You must prioritize:
+
+1. Data integrity
+2. Financial accuracy
+3. Inventory integrity
+4. Security
+5. Transaction reliability
+6. Backward compatibility
+7. Preservation of existing functionality
+
+Work carefully. This is an existing application with implemented business logic. Unnecessary refactoring is prohibited.
+
+---
+
+# 1. PROJECT PRESERVATION RULES
+
+The existing project uses:
+
+- React
+- TypeScript
+- Vite
+- Node.js
+- Express
+- SQLite
+- `node:sqlite`
+- `decimal.js`
+- Existing service-based backend architecture
+- Existing authentication and permission system
+- Existing inventory, POS, purchase, finance, reporting, audit, backup, and licensing modules
+
+## STRICT RULES
+
+- Do not rebuild the application.
+- Do not migrate the project to another framework.
+- Do not migrate SQLite to PostgreSQL during this task.
+- Do not replace the existing architecture.
+- Do not redesign the UI.
+- Do not remove existing features.
+- Do not change the existing workflow unless required to correct a verified defect.
+- Do not introduce unnecessary dependencies.
+- Do not rename large numbers of files.
+- Do not modify unrelated modules.
+- Do not replace functioning code with mock implementations.
+- Do not simplify complex business logic merely to make implementation easier.
+- Do not make destructive database changes.
+- Do not reset, delete, recreate, or overwrite existing databases.
+- Do not modify historical transactions or financial records to make new logic appear correct.
+- Do not change historical transaction calculations retrospectively unless a separate, explicitly approved data correction procedure is provided.
+- Do not hardcode demo data into production logic.
+- Do not silently round financial or quantity inputs.
+- Do not claim that tests passed unless you actually executed them.
+
+Preserve existing data and backward compatibility wherever possible.
+
+---
+
+# 2. DEVELOPMENT WORKFLOW — MANDATORY
+
+Before making any changes:
+
+### Step 1 — Inspect
+
+Inspect the existing implementation of every affected:
+
+- Service
+- Database table
+- API route
+- Transaction
+- Validation function
+- Related report
+- Audit-log implementation
+- Existing test
+
+### Step 2 — Confirm the problem
+
+For every issue listed below:
+
+- Verify that the problem actually exists in the current code.
+- Identify the exact file and function.
+- Trace the existing transaction flow.
+- Determine which other modules depend on the affected logic.
+- Identify potential consequences of changing it.
+
+If an audit finding is already fixed in the current code, do not reintroduce the bug or make unnecessary changes.
+
+### Step 3 — Plan
+
+Before modifying code, create a concise repair plan containing:
+
+- Issue
+- Root cause
+- Files to be modified
+- Proposed fix
+- Risks
+- Tests required
+
+### Step 4 — Implement
+
+Implement fixes in small, targeted changes.
+
+### Step 5 — Verify
+
+For every modification:
+
+- Run the relevant tests.
+- Add regression tests.
+- Run TypeScript checks.
+- Run the production build where possible.
+- Verify related business logic.
+- Check for unintended side effects.
+
+If a test cannot be executed because of missing dependencies or environment limitations, clearly report it. Do not pretend it passed.
+
+---
+
+# 3. PHASE 1 — SECURITY AND DATA PROTECTION
+
+## ISSUE 1 — DATABASE FILES AND PRIVATE DATA IN GIT
+
+### Investigate
+
+Inspect:
+
+- `.gitignore`
+- `data/`
+- Database files
+- SQLite WAL and SHM files
+- Backup files
+- Repository tracking status
+
+Potentially exposed files include:
+
+- `data/pharmacy.db`
+- `data/pharmacy.db-wal`
+- `data/pharmacy.db-shm`
+- SQLite backups
+- Other application-generated private data
+
+### Required actions
+
+Update `.gitignore` appropriately.
+
+At minimum, prevent future accidental commits of:
+
+- Production database files
+- SQLite files
+- SQLite WAL and SHM files
+- Local application data
+- Local backups
+- Private license files
+- Private keys
+- Environment files containing secrets
+- Temporary files
+- Local logs containing sensitive information
+
+Use suitable exclusions, for example:
+
+```gitignore
+# Local application data
+data/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+
+# Backups
+backups/
+*.backup
+*.bak
+
+# Environment secrets
+.env
+.env.local
+.env.production
+
+# Private license and signing files
+license_private.pem
+private_key.pem
+
+# Logs
+logs/
+*.log
+```
+
+Preserve safe example configuration files such as `.env.example`.
+
+### Important
+
+If database files are already tracked in Git:
+
+- Identify the tracked files.
+- Do not simply add `.gitignore` and assume the problem is solved.
+- Remove sensitive data files from future Git tracking safely.
+- Do not delete the local database.
+- Do not delete user data.
+- Do not rewrite Git history without explicitly explaining the consequences and obtaining approval.
+
+If any real sensitive data was exposed, clearly flag the incident and recommend repository-history cleanup and credential rotation where applicable.
+
+---
+
+## ISSUE 2 — DEFAULT ADMINISTRATOR CREDENTIALS
+
+### Investigate
+
+Inspect the existing user seed process, authentication flow, password-change functionality, and `must_change_password` implementation.
+
+Known default accounts may include:
+
+- admin
+- manager
+- cashier
+
+Known default passwords may exist in seed code.
+
+Do not assume these are safe.
+
+### Required behavior
+
+For newly initialized installations:
+
+- Default accounts must be securely handled.
+- Users with seeded/default passwords must be required to change their password on first login.
+- Password-change enforcement must be backend-enforced.
+- Frontend restrictions alone are insufficient.
+- Users must not bypass password-change enforcement by calling API endpoints directly.
+- Users must not access sensitive operational modules before completing mandatory password changes.
+- Existing sessions should be handled safely.
+- Password changes should be audited.
+- Passwords must never be stored or logged in plaintext.
+
+If the existing application supports first-run setup, prefer a secure initial administrator setup workflow.
+
+If an existing installation already has users and data, do not reset their passwords or modify their accounts automatically.
+
+### Tests required
+
+- Seeded admin must be forced to change password.
+- Seeded manager must be forced to change password.
+- Seeded cashier must be forced to change password.
+- Backend blocks protected operations before required password change.
+- After password change, normal authorization works.
+- Existing user accounts remain intact.
+
+---
+
+## ISSUE 3 — OFFLINE LICENSING AND SIGNING KEY ARCHITECTURE
+
+### Investigate
+
+Inspect:
+
+- `server/seed.ts`
+- License service
+- License validation
+- Key generation
+- Signing
+- Verification
+- License file creation
+- Device fingerprint handling
+- Expiration logic
+- Trial logic
+- Restricted mode
+
+Audit concern: the current implementation may generate a signing keypair locally when the license files are missing and sign its own license, including a wildcard device fingerprint.
+
+This behavior must be verified.
+
+### Required architecture
+
+The customer installation must never generate its own trusted licensing authority.
+
+The intended architecture is:
+
+**Developer/licensing environment**
+
+- Holds the private signing key.
+- Generates and signs customer licenses.
+- Never distributes the private signing key.
+- Has a separate license-generation process.
+
+**Customer installation**
+
+- Contains the trusted public verification key.
+- Receives signed license files.
+- Verifies license signatures.
+- Cannot generate valid production licenses by generating its own keypair.
+
+### Required changes
+
+If local license generation currently creates its own trusted license:
+
+- Remove that behavior from the customer installation.
+- Remove customer-side private signing key generation.
+- Do not automatically issue a self-signed production license.
+- Do not use a wildcard fingerprint to bypass licensing restrictions unless this is explicitly intended for a clearly defined developer-only mode.
+- Ensure the trusted public key is fixed and correctly distributed.
+- Ensure invalid licenses are rejected.
+- Ensure expired licenses are handled according to existing policy.
+- Ensure restricted mode does not destroy customer data.
+- Preserve historical data and read-only access where existing policy supports it.
+- Do not create a new licensing scheme unnecessarily.
+
+### Important
+
+Do not accidentally break the developer's existing testing workflow.
+
+Separate:
+
+- Development mode
+- Test license mode
+- Trial mode
+- Production license mode
+
+Any developer bypass must be clearly separated from production code and must not accidentally activate in a production installation.
+
+### Tests required
+
+- Valid signed license accepted.
+- Invalid signature rejected.
+- License modified after signing rejected.
+- Expired license handled correctly.
+- Missing license handled correctly.
+- Customer installation cannot create its own trusted production signing key.
+- Device restrictions work if configured.
+- Restricted mode preserves data.
+
+---
+
+# 4. PHASE 2 — FINANCIAL AND INVENTORY INTEGRITY
+
+## ISSUE 4 — DUPLICATE SALES RETURN LINES CAN EXCEED RETURNABLE QUANTITY
+
+### Investigate
+
+Inspect the sales return workflow in:
+
+`server/services/salesService.ts`
+
+Investigate return validation and processing.
+
+Potential issue:
+
+Multiple entries for the same `saleLineId` within a single return request may each validate against the same previous returned quantity, allowing the combined return quantity to exceed the remaining quantity.
+
+### Example
+
+Original sale:
+
+- 10 units sold.
+
+Return request:
+
+- Line 1: 6 units
+- Line 2: 6 units
+
+Total requested return: 12 units.
+
+The application must reject this.
+
+### Required fix
+
+Before processing:
+
+1. Validate all return entries.
+2. Aggregate requested quantities by `saleLineId`.
+3. Ensure the aggregated quantity does not exceed the remaining returnable quantity.
+4. Validate against original sold quantity.
+5. Validate against previously completed returns.
+6. Validate all quantities using Decimal arithmetic.
+7. Validate the requested return amount before any stock movement.
+8. Process the complete operation atomically.
+9. Prevent partial writes if any validation fails.
+
+Alternatively, duplicate lines may be combined safely, but the final combined quantity must be validated.
+
+### Tests required
+
+- Normal partial return succeeds.
+- Full return succeeds.
+- Return exceeding original quantity fails.
+- Previously returned quantity is accounted for.
+- Duplicate return lines are aggregated.
+- Duplicate lines exceeding the remaining quantity are rejected.
+- Stock cannot become negative through returns.
+- Failed return leaves no partial financial or inventory changes.
+
+---
+
+## ISSUE 5 — DUPLICATE PURCHASE RETURN LINES CAN EXCEED AVAILABLE STOCK
+
+### Investigate
+
+Inspect:
+
+`server/services/purchaseService.ts`
+
+Investigate purchase return validation.
+
+Potential issue:
+
+Multiple entries for the same purchase line or batch in a single return request may independently pass stock validation against the same initial stock quantity.
+
+### Example
+
+Available batch stock:
+
+80 units.
+
+One return request:
+
+- Line 1: 50 units
+- Line 2: 50 units
+
+Total requested:
+
+100 units.
+
+The system must reject this.
+
+### Required fix
+
+- Aggregate duplicate purchase return entries.
+- Validate combined requested quantity.
+- Validate remaining returnable quantity from the original purchase.
+- Validate current available stock in the corresponding batch.
+- Validate quarantine, expired, damaged, and otherwise restricted stock according to existing rules.
+- Perform validation before stock mutation.
+- Use a single atomic transaction.
+- Prevent negative stock.
+- Preserve the batch relationship.
+
+### Tests required
+
+- Normal purchase return succeeds.
+- Return greater than original purchase quantity fails.
+- Return greater than available stock fails.
+- Duplicate return lines are correctly aggregated.
+- Duplicate lines exceeding available stock are rejected.
+- Failed return leaves no partial writes.
+- Supplier settlement remains consistent.
+
+---
+
+## ISSUE 6 — SALES RETURN REFUND DOES NOT PROPERLY ACCOUNT FOR INVOICE-LEVEL DISCOUNT
+
+### Investigate
+
+Inspect:
+
+`server/services/salesService.ts`
+
+Inspect:
+
+- Sale subtotal
+- Line discounts
+- Invoice-level discounts
+- Net invoice value
+- Return valuation
+- Refund calculations
+- COGS reversal
+
+Potential issue:
+
+Return valuation may use a sale line's net amount without properly allocating an invoice-level discount.
+
+### Example
+
+Sale:
+
+| Item | Amount |
+|---|---:|
+| Medicine A | 100 |
+| Medicine B | 100 |
+| Subtotal | 200 |
+| Invoice discount | 20 |
+| Total | 180 |
+
+Under proportional allocation:
+
+Medicine A's effective value is 90, not 100.
+
+### Required fix
+
+Implement a consistent, documented return valuation policy.
+
+Preferred policy:
+
+- Allocate invoice-level discounts proportionally across sale lines.
+- Preserve the final effective line amount in the completed sale snapshot.
+- Use the historical effective net line amount for return calculations.
+- Ensure partial returns are valued correctly.
+- Ensure cumulative returns cannot exceed the effective original value.
+- Use Decimal arithmetic.
+- Preserve historical invoice records.
+
+Do not use current medicine selling prices to value historical returns.
+
+Do not silently change historical completed sales.
+
+If a different accounting policy is already implemented and is correct, document it and preserve it rather than introducing a conflicting calculation.
+
+### Tests required
+
+- Invoice with no discount.
+- Invoice with line discount.
+- Invoice with invoice-level discount.
+- Invoice with both discount types.
+- Partial return.
+- Multiple partial returns.
+- Full return.
+- Return after previous partial return.
+- Refund total matches historical net amount.
+- No over-refund possible.
+
+---
+
+## ISSUE 7 — CUSTOMER RETURN SETTLEMENT DOES NOT PROPERLY RECONCILE INVOICE DUE
+
+### Investigate
+
+Inspect:
+
+`server/services/salesService.ts`
+
+Inspect:
+
+- Sale `paid_amount`
+- Sale `due_amount`
+- Customer balance
+- Customer credit
+- Cash refund
+- Customer credit settlement
+- Payment allocations
+- Sales returns
+- Invoice statements
+- Customer statements
+- Due reports
+
+Potential issue:
+
+Sales returns may affect customer balances without properly reconciling the original sale invoice's remaining receivable.
+
+### Example
+
+Original sale:
+
+- Invoice: ৳1,000
+- Paid: ৳400
+- Due: ৳600
+
+Return:
+
+- Returned items worth ৳200
+
+The return must correctly affect the customer's outstanding obligation or refund/credit according to the selected settlement policy.
+
+### Required fix
+
+Establish a consistent return settlement allocation policy.
+
+Each return settlement must clearly define how it affects:
+
+- Original invoice outstanding
+- Customer receivable
+- Customer credit balance
+- Cash refund
+- Non-cash refund
+- Payment allocation history
+- Sales return ledger
+- Reports
+
+Do not update customer balance independently in a way that creates divergence from invoice records.
+
+Do not blindly overwrite historical paid or due fields.
+
+Prefer explicit return settlement/allocation records and derive or reconcile balances from transaction history.
+
+### Tests required
+
+- Return on fully paid invoice.
+- Return on partially paid invoice.
+- Return on unpaid invoice.
+- Cash refund.
+- Customer credit.
+- Multiple partial returns.
+- Customer balance reconciles.
+- Invoice due reconciles.
+- Statement reconciles.
+- No duplicated credit or refund.
+
+---
+
+## ISSUE 8 — SUPPLIER RETURN DOES NOT PROPERLY RECONCILE PURCHASE INVOICE DUE
+
+### Investigate
+
+Inspect:
+
+`server/services/purchaseService.ts`
+
+Inspect:
+
+- Purchase invoice amount
+- Purchase paid amount
+- Purchase due
+- Supplier balance
+- Supplier credit
+- Supplier refund
+- Purchase return
+- Payment allocation
+- Supplier statements
+
+### Required fix
+
+Ensure supplier returns correctly reconcile:
+
+- Original purchase invoice outstanding
+- Supplier balance
+- Supplier credit
+- Supplier refund
+- Supplier payment allocations
+- Purchase return history
+
+A supplier credit must not exist only at party-balance level if the invoice-level financial records remain inconsistent.
+
+### Tests required
+
+- Return against fully paid purchase.
+- Return against partially paid purchase.
+- Return against unpaid purchase.
+- Supplier credit settlement.
+- Supplier cash refund.
+- Multiple partial returns.
+- Supplier balance reconciliation.
+- Purchase due reconciliation.
+
+---
+
+## ISSUE 9 — RECEIVING SAME BATCH AT DIFFERENT COST MAY OVERWRITE HISTORICAL COST
+
+### Investigate
+
+Inspect:
+
+`server/services/purchaseService.ts`
+
+Investigate batch creation and merging logic.
+
+Potential issue:
+
+If a purchase receipt matches an existing batch by medicine, batch number, and expiry date, the existing batch quantity may be increased while the purchase cost is overwritten with the latest purchase cost.
+
+This can incorrectly assign the latest acquisition cost to all remaining stock in the batch.
+
+### Example
+
+First receipt:
+
+- 100 units
+- Cost: ৳2.00 per unit
+
+Second receipt:
+
+- 100 units
+- Cost: ৳2.50 per unit
+
+If both receipts merge into one batch and cost becomes ৳2.50, the system may incorrectly value all 200 units at ৳2.50.
+
+### Required fix
+
+First inspect the existing costing model.
+
+Do not make an unnecessary architecture change if historical cost snapshots and stock layers already correctly preserve actual costs.
+
+If the defect is confirmed, choose a compatible approach.
+
+Preferred options:
+
+### Option A — Separate stock cost layers
+
+Maintain separate receipt cost layers, even when physical batch number and expiry are identical.
+
+Each layer must preserve:
+
+- Receipt reference
+- Quantity received
+- Remaining quantity
+- Unit acquisition cost
+- Purchase reference
+- Batch number
+- Expiry date
+
+### Option B — Weighted-average costing
+
+If the existing system intentionally merges batches, calculate weighted-average cost correctly.
+
+Formula:
+
+\[
+\text{Weighted Average Cost} =
+\frac{
+(Q_1 \times C_1) + (Q_2 \times C_2)
+}{
+Q_1 + Q_2
+}
+\]
+
+Use Decimal arithmetic.
+
+### Mandatory
+
+- Never simply overwrite historical batch cost with the latest receipt cost if existing stock has a different acquisition cost.
+- Preserve historical sale COGS snapshots.
+- Preserve purchase records.
+- Preserve batch traceability.
+- Avoid migrations that destroy historical costing data.
+
+### Tests required
+
+- Same batch, same cost.
+- Same batch, different cost.
+- Different expiry.
+- Partial stock remaining.
+- Sale from merged stock.
+- COGS remains correct.
+- Stock valuation remains correct.
+- Purchase history remains correct.
+
+---
+
+# 5. PHASE 3 — ACCOUNTING AND RELIABILITY
+
+## ISSUE 10 — CUSTOMER/SUPPLIER ADVANCE PAYMENT HANDLING
+
+### Investigate
+
+Inspect:
+
+`server/services/financeService.ts`
+
+Inspect customer and supplier payment allocation logic.
+
+Potential issue:
+
+Payments larger than outstanding invoices may leave an unallocated amount without a sufficiently explicit advance/credit record.
+
+### Example
+
+Customer outstanding:
+
+- Invoice A: ৳300
+- Invoice B: ৳200
+
+Payment received:
+
+- ৳700
+
+The system must account for all ৳700.
+
+### Required policy
+
+Either:
+
+**Policy A:** Reject excess payments.
+
+Or:
+
+**Policy B:** Allow advance payments and explicitly record unapplied credit.
+
+Prefer Policy B if the current system already supports customer advances or commercial workflows require them.
+
+### Required behavior
+
+- All received payment amounts must be accounted for.
+- Invoice allocation must be explicit.
+- Remaining advance must be tracked.
+- Advance balances must appear in statements.
+- Advance credit must be available for future invoices where appropriate.
+- Reversals must correctly reverse allocations and advances.
+- Supplier advances must follow equivalent rules if supported.
+
+### Tests required
+
+- Exact payment.
+- Partial payment.
+- Payment exceeding due.
+- Multiple invoice allocation.
+- Advance payment.
+- Advance application.
+- Payment reversal.
+- Balance reconciliation.
+
+---
+
+## ISSUE 11 — IDEMPOTENCY RECORD MUST BE ATOMIC WITH THE TRANSACTION
+
+### Investigate
+
+Inspect:
+
+- `server/routes.ts`
+- Idempotency middleware
+- Database transaction helpers
+- Sale
+- Purchase
+- Payment
+- Expense
+- Stock adjustment
+
+Potential issue:
+
+Business transactions may commit before the corresponding idempotency record is stored.
+
+This creates a crash window where a retry can potentially execute the same transaction again.
+
+### Required fix
+
+Design the idempotency workflow so that the business transaction and its durable idempotency result are atomic whenever possible.
+
+Requirements:
+
+- Idempotency key scoped correctly.
+- Request fingerprint/hash.
+- Detect same key with different request payload.
+- Detect duplicate requests.
+- Store completed response.
+- Prevent repeated stock mutation.
+- Prevent repeated payment recording.
+- Prevent duplicate invoice creation.
+- Handle interrupted requests.
+- Handle concurrent duplicate requests.
+- Maintain existing API compatibility.
+
+Do not implement a superficial in-memory lock as the only solution.
+
+Use database-level transaction and uniqueness constraints where appropriate.
+
+### Tests required
+
+- Same request, same idempotency key.
+- Same request, different idempotency key.
+- Different request, same key.
+- Simultaneous duplicate requests.
+- Interrupted transaction.
+- Retry after successful commit.
+- Retry after failed transaction.
+
+---
+
+## ISSUE 12 — BACKUP RESTORE MUST VERIFY SHA-256
+
+### Investigate
+
+Inspect:
+
+`server/services/backupService.ts`
+
+Inspect:
+
+- Backup generation
+- SHA-256 calculation
+- Backup records
+- Restore workflow
+- Integrity checking
+- Pre-restore backup
+
+Potential issue:
+
+The restore workflow may verify SQLite structural integrity but not compare the backup file's actual SHA-256 against the hash stored when the backup was created.
+
+### Required fix
+
+Before restoring:
+
+1. Identify the selected backup record.
+2. Read the stored expected SHA-256.
+3. Calculate the current file SHA-256.
+4. Compare the values.
+5. Reject if mismatched.
+6. Run SQLite integrity check.
+7. Create a pre-restore backup of the current database.
+8. Restore safely.
+9. Verify the restored database.
+10. Record the result in audit logs.
+
+Do not restore a corrupted, tampered, or unverified backup.
+
+### Tests required
+
+- Correct backup hash.
+- Modified backup file.
+- Missing backup file.
+- Corrupted SQLite backup.
+- Restore failure.
+- Pre-restore backup failure.
+- Successful restore.
+- Post-restore verification.
+- Backup audit record.
+
+---
+
+# 6. NUMERIC PRECISION POLICY — PRESERVE
+
+Do not weaken or replace the current Decimal-based numerical policy.
+
+The authoritative policy should be:
+
+## Money
+
+- BDT input precision: maximum 2 decimal places.
+- Reject excessive input precision.
+- Do not silently round user input.
+- Explicitly define rounding for derived calculations.
+
+## Quantity
+
+- Maximum 6 decimal places.
+- Maximum 18 integer digits.
+- No silent rounding.
+- Reject overflow.
+
+## Unit conversion
+
+- Decimal arithmetic.
+- Maximum 6 decimal places for direct conversion ratios.
+- Snapshot conversion values on transactions.
+- Historical transactions must not change when medicine conversion configuration changes.
+
+## Cost
+
+- Decimal arithmetic.
+- Preserve historical cost snapshots.
+- Do not use binary floating point for authoritative financial values.
+
+## Database
+
+Investigate existing SQLite `REAL` conversions and casts.
+
+Do not blindly remove every cast.
+
+Determine whether the cast affects:
+
+- Stock
+- Cost
+- Financial balances
+- Reporting
+- Sorting
+- Filtering
+
+Correct only the places where binary floating-point conversion creates authoritative calculation or comparison risks.
+
+Preserve backward compatibility and existing data.
+
+---
+
+# 7. AUDIT LOG REQUIREMENTS
+
+Every fix must preserve the audit system.
+
+Audit the affected workflows to ensure:
+
+- Sales return is logged.
+- Purchase return is logged.
+- Refund is logged.
+- Credit settlement is logged.
+- Payment allocation is logged.
+- Stock movement is logged.
+- License changes are logged.
+- Password changes are logged.
+- Backup verification is logged.
+- Restore attempts and results are logged.
+- Failed critical operations are logged appropriately.
+
+Audit entries must not contain:
+
+- Plaintext passwords
+- Private keys
+- API secrets
+- Unnecessary sensitive customer information
+
+Ensure financial and inventory transactions are not committed without their required transaction audit records when the audit event is intended to be part of the transaction.
+
+Do not introduce audit-log gaps.
+
+---
+
+# 8. DOCUMENTATION CONSISTENCY
+
+Inspect existing documentation, particularly:
+
+`docs/PHASE_0_SPECIFICATION.md`
+
+Investigate inconsistencies between:
+
+- Quantity precision
+- Conversion precision
+- Monetary precision
+- Cost precision
+- Return valuation
+- Batch costing
+- Licensing
+- Backup procedures
+
+If the implementation uses 6 decimal places for quantity and conversion values but documentation specifies 4, update the documentation to match the authoritative implementation.
+
+Do not create conflicting numeric policies in multiple documents.
+
+---
+
+# 9. TESTING REQUIREMENTS
+
+Add or update regression tests for all repaired defects.
+
+Run the existing test suite if possible.
+
+If the project currently lacks a working test script, inspect the existing test framework and add a minimal appropriate script without replacing the existing testing architecture.
+
+Suggested scripts, adapted to the existing project:
+
+```json
+{
+  "scripts": {
+    "test": "run the existing test suite",
+    "typecheck": "run TypeScript checks",
+    "build": "run the existing production build"
+  }
+}
+```
+
+Do not copy these placeholder commands literally. Use the correct commands for the actual test framework already present.
+
+### Test the following
+
+#### Sales
+
+- Duplicate return lines
+- Return quantity overflow
+- Previously returned quantity
+- Invoice-level discounts
+- Partial refunds
+- Full refunds
+- COGS reversal
+- Customer credit settlement
+- Invoice due reconciliation
+
+#### Purchases
+
+- Duplicate purchase return lines
+- Batch stock validation
+- Purchase return quantity limits
+- Supplier credit
+- Supplier refund
+- Purchase due reconciliation
+- Different costs for same batch
+
+#### Finance
+
+- Exact payment
+- Partial payment
+- Excess payment
+- Advance credit
+- Payment allocation
+- Reversal
+
+#### Inventory
+
+- Negative stock prevention
+- FEFO
+- Batch cost
+- Stock layers or weighted average
+- Concurrent transactions
+
+#### Security
+
+- Forced password change
+- Unauthorized API access
+- Permission enforcement
+- License verification
+- Restricted mode
+
+#### Backup
+
+- Hash verification
+- Integrity check
+- Safe restoration
+- Pre-restore backup
+- Recovery failure
+
+#### Idempotency
+
+- Duplicate request
+- Concurrent duplicate request
+- Interrupted request
+- Retry
+
+---
+
+# 10. IMPLEMENTATION RULES
+
+For every fix:
+
+1. Inspect before modifying.
+2. Confirm the issue exists.
+3. Make the smallest viable change.
+4. Preserve current architecture.
+5. Preserve database compatibility.
+6. Add regression tests.
+7. Run the tests.
+8. Check related services.
+9. Review for unintended side effects.
+10. Document what changed.
+
+Do not perform unrelated formatting across the repository.
+
+Do not make speculative fixes to areas that have not been verified.
+
+Do not delete existing tests merely because they fail.
+
+Do not change test expectations simply to make the implementation pass unless the existing expectation is demonstrably incorrect.
+
+Do not weaken validations.
+
+Do not suppress errors to hide failures.
+
+Do not use `any` unnecessarily to bypass TypeScript safety.
+
+Do not make frontend-only fixes for backend business logic defects.
+
+Do not silently convert errors into successful responses.
+
+---
+
+# 11. EXECUTION ORDER
+
+Follow this order:
+
+## Phase A — Inspect and report
+
+Verify each identified issue.
+
+Report:
+
+- Confirmed issue
+- Already fixed issue
+- Not reproducible
+- Additional issue discovered
+
+## Phase B — Critical security
+
+Fix:
+
+1. Repository data protection
+2. Default credential handling
+3. Forced password change
+4. Licensing architecture
+
+## Phase C — Financial and inventory integrity
+
+Fix:
+
+5. Duplicate sales return validation
+6. Duplicate purchase return validation
+7. Invoice-level discount return valuation
+8. Sales return due reconciliation
+9. Supplier return due reconciliation
+10. Batch cost overwrite
+
+## Phase D — Reliability
+
+Fix:
+
+11. Customer/supplier advance payment allocation
+12. Idempotency atomicity
+13. Backup hash verification
+
+## Phase E — Verification
+
+Run:
+
+- Regression tests
+- TypeScript check
+- Production build
+- Related integration tests
+
+## Phase F — Documentation
+
+Update documentation only for verified behavior changes.
+
+---
+
+# 12. DATABASE MIGRATION SAFETY
+
+If any database schema change is required:
+
+- Use the existing migration mechanism.
+- Make the migration backward-conscious.
+- Do not delete existing data.
+- Do not rebuild tables without preserving records.
+- Do not reset the database.
+- Do not create fake replacement data.
+- Test the migration against a copy of an existing database.
+- Verify row counts.
+- Verify foreign-key relationships.
+- Verify stock totals.
+- Verify financial balances.
+- Verify transaction history.
+- Verify audit logs.
+- Verify rollback or recovery strategy where possible.
+
+Never execute destructive database operations against the user's production database.
+
+---
+
+# 13. FINAL REPORT FORMAT
+
+After completing the work, provide a report in this format:
+
+## A. Executive Summary
+
+- What was fixed
+- Overall remaining risk
+- Whether the application is safer than before
+
+## B. Issue-by-Issue Status
+
+For each issue:
+
+| Issue | Status | Root cause | Files changed | Tests |
+|---|---|---|---|
+
+Use only these status values:
+
+- FIXED
+- ALREADY FIXED
+- NOT REPRODUCED
+- PARTIALLY FIXED
+- BLOCKED
+- NOT STARTED
+
+## C. Files Modified
+
+List each file and why it was changed.
+
+## D. Database Changes
+
+List:
+
+- Schema changes
+- Migration files
+- Data impact
+- Backward compatibility
+- Recovery strategy
+
+If no database schema change was needed, explicitly say so.
+
+## E. Testing Results
+
+Report actual results:
+
+- Tests executed
+- Tests passed
+- Tests failed
+- Tests skipped
+- TypeScript check
+- Production build
+
+Do not claim verification that did not occur.
+
+## F. Remaining Risks
+
+List issues that still require attention.
+
+## G. Deployment Recommendation
+
+Choose exactly one:
+
+- READY FOR PRODUCTION
+- READY AFTER MINOR FIXES
+- NEEDS IMPORTANT FIXES
+- NOT PRODUCTION READY
+
+Explain the decision.
+
+## H. Next Steps
+
+Give the next three most important actions only.
+
+---
+
+# 14. FINAL OBJECTIVE
+
+The goal is not to make the project look more impressive.
+
+The goal is to make the existing Pharmacy Management System safer for real-world use by correcting verified defects that could cause:
+
+- Financial loss
+- Incorrect refunds
+- Incorrect customer balances
+- Incorrect supplier balances
+- Stock corruption
+- Negative inventory
+- Incorrect COGS
+- Incorrect profit reporting
+- Duplicate transactions
+- Security breaches
+- License bypass
+- Data loss during backup or restoration
+
+**Preserve the working application. Fix the root causes. Verify the fixes. Do not rebuild.**
+
+Start by inspecting the current source code and producing the Phase A verification report. Then proceed with the repair phases in order, using minimal targeted changes and regression tests.

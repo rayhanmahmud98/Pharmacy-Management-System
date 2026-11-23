@@ -42,7 +42,13 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
-  const [profileForm, setProfileForm] = useState({ fullName: '', phone: '', email: '', newPassword: '' });
+  const [profileForm, setProfileForm] = useState({
+    fullName: '',
+    phone: '',
+    email: '',
+    currentPassword: '',
+    newPassword: '',
+  });
   const [profileMsg, setProfileMsg] = useState('');
   const [profileErr, setProfileErr] = useState('');
   const [forcePw, setForcePw] = useState({ newPassword: '', confirmPassword: '' });
@@ -183,6 +189,7 @@ export default function App() {
                   fullName: user.fullName,
                   phone: user.phone || '',
                   email: user.email || '',
+                  currentPassword: '',
                   newPassword: '',
                 });
                 setProfileMsg('');
@@ -310,7 +317,7 @@ export default function App() {
                   Password Update Required
                 </h2>
                 <p className="text-[11px] text-slate-500">
-                  Your password was reset by an administrator. Choose a new password to continue.
+                  A password update is required before accessing pharmacy operations. Choose a new password to continue.
                 </p>
               </div>
             </div>
@@ -448,6 +455,21 @@ export default function App() {
                   className="w-full px-2.5 py-2 border border-slate-300 rounded"
                 />
               </div>
+              {profileForm.newPassword.length > 0 && (
+                <div>
+                  <label htmlFor="profile-current-password" className="block text-slate-600 mb-1">
+                    Current Password (required to change password) *
+                  </label>
+                  <input
+                    id="profile-current-password"
+                    type="password"
+                    required
+                    value={profileForm.currentPassword}
+                    onChange={(e) => setProfileForm({ ...profileForm, currentPassword: e.target.value })}
+                    className="w-full px-2.5 py-2 border border-slate-300 rounded"
+                  />
+                </div>
+              )}
             </div>
             <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
               <button

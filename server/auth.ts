@@ -321,9 +321,24 @@ export function requireCsrfProtection(req: Request, res: Response, next: NextFun
   res.status(403).json({ error: 'Missing CSRF validation header or same-origin Origin' });
 }
 
+export function requireAuthenticatedSession(req: Request, res: Response, next: NextFunction): void {
+  if (!req.authUser) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+  next();
+}
+
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   if (!req.authUser) {
     res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+  if (req.authUser.mustChangePassword) {
+    res.status(403).json({
+      error: 'Password update required before accessing pharmacy operations',
+      code: 'PASSWORD_CHANGE_REQUIRED',
+    });
     return;
   }
   next();
@@ -333,6 +348,13 @@ export function requirePermission(permissionCode: string) {
   return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.authUser) {
       res.status(401).json({ error: 'Authentication required' });
+      return;
+    }
+    if (req.authUser.mustChangePassword) {
+      res.status(403).json({
+        error: 'Password update required before accessing pharmacy operations',
+        code: 'PASSWORD_CHANGE_REQUIRED',
+      });
       return;
     }
     const perms = getUserEffectivePermissions(req.authUser.id);

@@ -15,6 +15,7 @@ import {
   loadAuthUserById,
   recordFailedLoginAttempt,
   requireAuth,
+  requireAuthenticatedSession,
   requireCsrfProtection,
   requirePermission,
   requireWritableLicense,
@@ -91,12 +92,26 @@ export function buildApiRouter() {
       }
     };
 
+  function canonicalJson(val: unknown): string {
+    if (val === null || typeof val !== 'object') {
+      return JSON.stringify(val);
+    }
+    if (Array.isArray(val)) {
+      return '[' + val.map((item) => (item === undefined ? 'null' : canonicalJson(item))).join(',') + ']';
+    }
+    const obj = val as Record<string, unknown>;
+    const keys = Object.keys(obj)
+      .filter((k) => obj[k] !== undefined)
+      .sort();
+    return '{' + keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(',') + '}';
+  }
+
   const withIdempotency = async (
     req: express.Request,
     res: express.Response,
     endpoint: string,
     defaultStatus: number,
-    fn: () => Promise<unknown> | unknown
+    fn: () => unknown
   ) => {
     const headerKey = req.get('x-idempotency-key') || req.get('idempotency-key');
     const bodyKey =
@@ -111,42 +126,49 @@ export function buildApiRouter() {
       return;
     }
 
-    const db = getDb();
     const userId = req.authUser?.id || 'anonymous';
     const bodyClone = req.body && typeof req.body === 'object' ? { ...(req.body as Record<string, unknown>) } : {};
     delete bodyClone.idempotencyKey;
-    const requestHash = crypto.createHash('sha256').update(JSON.stringify(bodyClone)).digest('hex');
+    const requestHash = crypto.createHash('sha256').update(canonicalJson(bodyClone)).digest('hex');
 
-    const existing = db
-      .prepare(
-        'SELECT request_hash, response_status, response_json FROM idempotency_keys WHERE idempotency_key = ? AND endpoint = ? AND user_id = ?'
-      )
-      .get(key, endpoint, userId) as
-      | { request_hash: string; response_status: number; response_json: string }
-      | undefined;
+    const outcome = withTransaction((tx) => {
+      const existing = tx
+        .prepare(
+          'SELECT request_hash, response_status, response_json FROM idempotency_keys WHERE idempotency_key = ? AND endpoint = ? AND user_id = ?'
+        )
+        .get(key, endpoint, userId) as
+        | { request_hash: string; response_status: number; response_json: string }
+        | undefined;
 
-    if (existing) {
-      if (existing.request_hash !== requestHash) {
-        res.status(409).json({
-          error: 'Idempotency key was already used with a different request payload. Start a new submission.',
-        });
-        return;
+      if (existing) {
+        if (existing.request_hash !== requestHash) {
+          return {
+            status: 409,
+            body: {
+              error: 'Idempotency key was already used with a different request payload. Start a new submission.',
+            },
+          };
+        }
+        return {
+          status: existing.response_status,
+          body: JSON.parse(existing.response_json) as unknown,
+        };
       }
-      res.status(existing.response_status).json(JSON.parse(existing.response_json));
-      return;
-    }
 
-    const result = await fn();
-    const serialized = JSON.stringify(result);
-    try {
-      db.prepare(
+      const result = fn();
+      if (result instanceof Promise) {
+        throw new Error('Idempotent handlers must be synchronous to remain atomic within SQLite transactions');
+      }
+      const serialized = JSON.stringify(result);
+      tx.prepare(
         `INSERT INTO idempotency_keys (idempotency_key, endpoint, user_id, request_hash, response_status, response_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
       ).run(key, endpoint, userId, requestHash, defaultStatus, serialized, nowIso());
-    } catch {
-      // Ignore rare race insert on identical key; response still valid
-    }
-    res.status(defaultStatus).json(result);
+
+      return { status: defaultStatus, body: result };
+    });
+
+    res.status(outcome.status).json(outcome.body);
   };
 
   // --- AUTH & BOOTSTRAP ---
@@ -299,7 +321,7 @@ export function buildApiRouter() {
 
   router.post(
     '/auth/change-password',
-    requireAuth,
+    requireAuthenticatedSession,
     handle((req, res) => {
       const { currentPassword, newPassword } = req.body as {
         currentPassword?: string;
@@ -318,8 +340,13 @@ export function buildApiRouter() {
         if (!currentPassword || !verifyPassword(currentPassword, row.password_hash)) {
           throw new Error('Current password is incorrect');
         }
-      } else if (currentPassword && !verifyPassword(currentPassword, row.password_hash)) {
-        throw new Error('Current password is incorrect');
+      } else {
+        if (currentPassword && !verifyPassword(currentPassword, row.password_hash)) {
+          throw new Error('Current password is incorrect');
+        }
+        if (verifyPassword(newPassword, row.password_hash)) {
+          throw new Error('New password must be different from your temporary or default password');
+        }
       }
 
       const ipAddress = extractClientIp(req);
@@ -330,6 +357,11 @@ export function buildApiRouter() {
           ts,
           req.authUser!.id
         );
+        if (req.sessionToken) {
+          tx.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.authUser!.id, req.sessionToken);
+        } else {
+          tx.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.authUser!.id);
+        }
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
@@ -350,16 +382,28 @@ export function buildApiRouter() {
     '/auth/profile',
     requireAuth,
     handle((req, res) => {
-      const { fullName, phone, email, newPassword } = req.body as {
+      const { fullName, phone, email, currentPassword, newPassword } = req.body as {
         fullName?: string;
         phone?: string;
         email?: string;
+        currentPassword?: string;
         newPassword?: string;
       };
       if (!fullName?.trim()) throw new Error('Full name is required');
       if (newPassword && newPassword.length < 6) {
         throw new Error('New password must be at least 6 characters');
       }
+
+      if (newPassword && newPassword.length >= 6) {
+        const row = getDb()
+          .prepare('SELECT password_hash FROM users WHERE id = ?')
+          .get(req.authUser!.id) as { password_hash: string } | undefined;
+        if (!row) throw new Error('User not found');
+        if (!currentPassword || !verifyPassword(currentPassword, row.password_hash)) {
+          throw new Error('Current password is required and must match to set a new password');
+        }
+      }
+
       withTransaction((tx) => {
         const ts = nowIso();
         tx.prepare('UPDATE users SET full_name = ?, phone = ?, email = ?, updated_at = ? WHERE id = ?').run(
@@ -370,11 +414,16 @@ export function buildApiRouter() {
           req.authUser!.id
         );
         if (newPassword && newPassword.length >= 6) {
-          tx.prepare('UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?').run(
+          tx.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?').run(
             hashPassword(newPassword),
             ts,
             req.authUser!.id
           );
+          if (req.sessionToken) {
+            tx.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.authUser!.id, req.sessionToken);
+          } else {
+            tx.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.authUser!.id);
+          }
         }
         recordAudit(tx, {
           userId: req.authUser!.id,
@@ -683,11 +732,12 @@ export function buildApiRouter() {
     handle(async (req, res) => {
       const id = String(req.params.id);
       await withIdempotency(req, res, `POST:/purchases/${id}/receive`, 200, () => {
-        const { paidAmount, paymentMethod } = req.body as {
+        const { paidAmount, paymentMethod, applyAdvance } = req.body as {
           paidAmount?: string;
           paymentMethod?: 'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD' | 'OTHER';
+          applyAdvance?: boolean;
         };
-        receiveDraftPurchase(req.authUser!, id, paidAmount, paymentMethod);
+        receiveDraftPurchase(req.authUser!, id, paidAmount, paymentMethod, applyAdvance);
         return { ok: true };
       });
     })
@@ -863,7 +913,15 @@ export function buildApiRouter() {
            ORDER BY p.created_at DESC LIMIT 100`
         )
         .all();
-      res.json({ customers, suppliers, payments });
+      const advanceLedger = db
+        .prepare(
+          `SELECT pal.*, u.full_name as user_name
+           FROM party_advance_ledger pal
+           JOIN users u ON u.id = pal.created_by
+           ORDER BY pal.created_at DESC LIMIT 150`
+        )
+        .all();
+      res.json({ customers, suppliers, payments, advanceLedger });
     })
   );
 
@@ -1392,6 +1450,7 @@ export function buildApiRouter() {
           nowIso(),
           targetId
         );
+        tx.prepare('DELETE FROM sessions WHERE user_id = ?').run(targetId);
         recordAudit(tx, {
           userId: req.authUser!.id,
           username: req.authUser!.username,
@@ -1582,20 +1641,39 @@ export function buildApiRouter() {
     requirePermission('admin.license'),
     handle((req, res) => {
       const signed = req.body as SignedLicenseFile;
-      const status = installLicenseFile(signed);
-      withTransaction((tx) => {
-        recordAudit(tx, {
-          userId: req.authUser!.id,
-          username: req.authUser!.username,
-          ipAddress: extractClientIp(req),
-          action: 'INSTALL_LICENSE',
-          module: 'licensing',
-          targetType: 'LICENSE',
-          targetId: status.payload?.licenseId || 'UNKNOWN',
-          afterState: { status: status.status, pharmacyName: status.payload?.pharmacyName },
+      try {
+        const status = installLicenseFile(signed);
+        withTransaction((tx) => {
+          recordAudit(tx, {
+            userId: req.authUser!.id,
+            username: req.authUser!.username,
+            ipAddress: extractClientIp(req),
+            action: 'INSTALL_LICENSE',
+            module: 'licensing',
+            targetType: 'LICENSE',
+            targetId: status.payload?.licenseId || 'UNKNOWN',
+            status: 'SUCCESS',
+            afterState: { status: status.status, pharmacyName: status.payload?.pharmacyName },
+          });
         });
-      });
-      res.json(status);
+        res.json(status);
+      } catch (err) {
+        const msg = (err as Error).message || 'Invalid license payload';
+        withTransaction((tx) => {
+          recordAudit(tx, {
+            userId: req.authUser!.id,
+            username: req.authUser!.username,
+            ipAddress: extractClientIp(req),
+            action: 'INSTALL_LICENSE',
+            module: 'licensing',
+            targetType: 'LICENSE',
+            targetId: signed?.payload?.licenseId || 'INVALID',
+            status: 'FAILURE',
+            reason: msg,
+          });
+        });
+        throw err;
+      }
     })
   );
 

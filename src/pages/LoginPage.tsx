@@ -9,8 +9,8 @@ interface Props {
 }
 
 export const LoginPage: React.FC<Props> = ({ settings, onLoggedIn }) => {
-  const [username, setUsername] = useState('admin');
-  const [password, setPassword] = useState('Admin@123');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -104,29 +104,6 @@ export const LoginPage: React.FC<Props> = ({ settings, onLoggedIn }) => {
           </button>
         </form>
 
-        <div className="mt-6 pt-5 border-t border-slate-200">
-          <p className="text-xs font-medium text-slate-500 mb-2">Quick Workstation Role Switch</p>
-          <div className="grid grid-cols-3 gap-2">
-            {[
-              { label: 'Admin', u: 'admin', p: 'Admin@123' },
-              { label: 'Manager', u: 'manager', p: 'Manager@123' },
-              { label: 'Cashier', u: 'cashier', p: 'Cashier@123' },
-            ].map((acc) => (
-              <button
-                key={acc.u}
-                type="button"
-                onClick={() => {
-                  setUsername(acc.u);
-                  setPassword(acc.p);
-                  submitLogin(acc.u, acc.p);
-                }}
-                className="px-2.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md border border-slate-200 whitespace-nowrap"
-              >
-                {acc.label}
-              </button>
-            ))}
-          </div>
-        </div>
       </div>
     </div>
   );

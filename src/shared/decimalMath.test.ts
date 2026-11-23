@@ -2,11 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   allocateBatchesFEFO,
+  allocateInvoiceDiscountAcrossLines,
   computeCashVariance,
   computeExpectedCash,
   computeInvoiceTotals,
   computeLineTotals,
   computeReturnCogsReversal,
+  computeWeightedAverageCost,
   convertToBaseUnits,
   resolvePermission,
   roundCost6,

@@ -51,11 +51,39 @@ export function canonicalLicensePayload(payload: LicensePayload): string {
 }
 
 export function getActivePublicKeyPem(): string {
-  const overridePub = LICENSE_PATH.replace('license.json', 'license_public.pem');
-  if (fs.existsSync(overridePub)) {
-    return fs.readFileSync(overridePub, 'utf8');
+  // Customer/production installs strictly verify against the embedded vendor public key.
+  // Arbitrary public-key files inside the mutable data directory are never trusted.
+  if (process.env.NODE_ENV === 'test' && process.env.MEDINEST_TEST_LICENSE_PUBKEY_PEM?.trim()) {
+    return process.env.MEDINEST_TEST_LICENSE_PUBKEY_PEM.trim();
   }
   return REAL_ED25519_PUBLIC_KEY_PEM;
+}
+
+const VALID_LICENSE_TYPES = new Set(['TRIAL', 'TIME_LIMITED', 'LIFETIME']);
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function validatePayloadFields(payload: LicensePayload): string | null {
+  if (!payload.licenseId?.trim() || !payload.customerId?.trim() || !payload.pharmacyName?.trim()) {
+    return 'License payload is missing required identity fields.';
+  }
+  if (!VALID_LICENSE_TYPES.has(payload.licenseType)) {
+    return `Unsupported license type '${String(payload.licenseType)}'.`;
+  }
+  if (!ISO_DATE_RE.test(String(payload.issueDate || ''))) {
+    return 'License issueDate must be YYYY-MM-DD.';
+  }
+  if (payload.licenseType !== 'LIFETIME') {
+    if (!payload.expiryDate || !ISO_DATE_RE.test(payload.expiryDate)) {
+      return 'Time-limited/trial license requires a valid YYYY-MM-DD expiryDate.';
+    }
+    if (payload.expiryDate < payload.issueDate) {
+      return 'License expiryDate cannot precede issueDate.';
+    }
+  }
+  if (!payload.deviceFingerprint?.trim()) {
+    return 'License payload is missing deviceFingerprint.';
+  }
+  return null;
 }
 
 function checkAndAdvanceVerifiedClock(nowUtcIso: string): { rollbackDetected: boolean; lastVerifiedUtc: string | null } {
@@ -102,6 +130,17 @@ export function verifySignedLicense(
         status: 'INVALID_READONLY',
         writable: false,
         message: 'Malformed license structure. Application is in Read-Only recovery mode.',
+        deviceFingerprint: deviceFp,
+        payload: null,
+      };
+    }
+
+    const fieldError = validatePayloadFields(signed.payload);
+    if (fieldError) {
+      return {
+        status: 'INVALID_READONLY',
+        writable: false,
+        message: `${fieldError} Read-Only recovery mode active.`,
         deviceFingerprint: deviceFp,
         payload: null,
       };
@@ -184,6 +223,16 @@ export function verifySignedLicense(
 
 export function getCurrentLicenseStatus(): LicenseStatus {
   const deviceFp = getDeviceFingerprint();
+  // Explicit developer-only bypass; strictly disabled in production and default test runs.
+  if (process.env.NODE_ENV === 'development' && process.env.MEDINEST_DEV_LICENSE_BYPASS === '1') {
+    return {
+      status: 'ACTIVE',
+      writable: true,
+      message: 'Development Mode (Explicit Dev License Override Active)',
+      deviceFingerprint: deviceFp,
+      payload: null,
+    };
+  }
   if (!fs.existsSync(LICENSE_PATH)) {
     return {
       status: 'UNLICENSED_READONLY',
@@ -209,7 +258,7 @@ export function getCurrentLicenseStatus(): LicenseStatus {
 
 export function installLicenseFile(signed: SignedLicenseFile): LicenseStatus {
   const check = verifySignedLicense(signed);
-  if (!check.writable && check.status === 'INVALID_READONLY') {
+  if (!check.writable) {
     throw new Error(check.message);
   }
   fs.writeFileSync(LICENSE_PATH, JSON.stringify(signed, null, 2), 'utf8');

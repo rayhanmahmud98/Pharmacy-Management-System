@@ -4,6 +4,7 @@ import { recordAudit } from '../audit.ts';
 import type { AuthUser } from '../auth.ts';
 import {
   allocateBatchesFEFO,
+  allocateInvoiceDiscountAcrossLines,
   computeInvoiceTotals,
   computeLineTotals,
   computeReturnCogsReversal,
@@ -40,6 +41,7 @@ export function completeSale(
     customerId?: string | null;
     saleDate?: string;
     invoiceDiscount?: string;
+    applyAdvance?: boolean;
     notes?: string;
     lines: SaleLineInput[];
     payments: SalePaymentInput[];
@@ -57,10 +59,12 @@ export function completeSale(
   }
 
   return withTransaction((tx) => {
-    let customer: { id: string; name: string; current_balance: string; credit_limit: string } | undefined;
+    let customer:
+      | { id: string; name: string; current_balance: string; advance_balance: string; credit_limit: string }
+      | undefined;
     if (input.customerId) {
       customer = tx
-        .prepare('SELECT id, name, current_balance, credit_limit FROM customers WHERE id = ? AND is_active = 1')
+        .prepare('SELECT id, name, current_balance, advance_balance, credit_limit FROM customers WHERE id = ? AND is_active = 1')
         .get(input.customerId) as typeof customer;
       if (!customer) throw new Error('Selected customer not found or inactive');
     }
@@ -170,13 +174,34 @@ export function completeSale(
       paidAmount: totalPaid,
     });
 
-    if (totals.dueAmount.gt(0)) {
+    const effectiveLineTotals = allocateInvoiceDiscountAcrossLines(
+      preparedLines.map((l) => l.calc.netTotal),
+      totals.invoiceDiscount
+    );
+
+    // Apply customer advance balance if available & enabled
+    let advanceApplied = new Decimal(0);
+    let finalDueAmount = totals.dueAmount;
+    if (
+      customer &&
+      customer.name !== 'Walk-in Customer' &&
+      input.applyAdvance !== false &&
+      totals.dueAmount.gt(0)
+    ) {
+      const advAvail = money(customer.advance_balance || '0.00');
+      if (advAvail.gt(0)) {
+        advanceApplied = Decimal.min(advAvail, totals.dueAmount);
+        finalDueAmount = roundMoney(totals.dueAmount.sub(advanceApplied));
+      }
+    }
+
+    if (finalDueAmount.gt(0)) {
       if (!customer || customer.name === 'Walk-in Customer') {
         throw new Error('Credit / due sales require selecting a registered customer');
       }
       const limit = money(customer.credit_limit);
       if (limit.gt(0)) {
-        const projected = roundMoney(d(customer.current_balance).add(totals.dueAmount));
+        const projected = roundMoney(d(customer.current_balance).add(finalDueAmount));
         if (projected.gt(limit)) {
           throw new Error(
             `Customer credit limit exceeded: limit ${limit.toFixed(2)}, projected balance ${projected.toFixed(2)}`
@@ -190,8 +215,8 @@ export function completeSale(
     tx.prepare(
       `INSERT INTO sales (
         id, invoice_number, customer_id, sale_date, status, gross_subtotal, line_discount_total,
-        invoice_discount, net_total, paid_amount, due_amount, total_cogs, notes, created_by, created_at
-      ) VALUES (?, ?, ?, ?, 'COMPLETED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        invoice_discount, net_total, paid_amount, due_amount, advance_applied, total_cogs, notes, created_by, created_at
+      ) VALUES (?, ?, ?, ?, 'COMPLETED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       saleId,
       invoiceNumber,
@@ -202,7 +227,8 @@ export function completeSale(
       totals.invoiceDiscount.toFixed(2),
       totals.netTotal.toFixed(2),
       totals.paidAmount.toFixed(2),
-      totals.dueAmount.toFixed(2),
+      finalDueAmount.toFixed(2),
+      advanceApplied.toFixed(2),
       totalCogs.toFixed(2),
       (input.notes || '').trim(),
       user.id,
@@ -212,8 +238,8 @@ export function completeSale(
     const insertLine = tx.prepare(
       `INSERT INTO sale_lines (
         id, sale_id, medicine_id, unit_id, unit_name_snapshot, conversion_ratio_snapshot,
-        qty_input, qty_base, unit_price, gross_total, line_discount, line_total, cogs_total
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        qty_input, qty_base, unit_price, gross_total, line_discount, line_total, effective_line_total, cogs_total
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertAlloc = tx.prepare(
       `INSERT INTO sale_batch_allocations (
@@ -227,7 +253,9 @@ export function completeSale(
       ) VALUES (?, ?, ?, ?, 'SALE', 'SALE', ?, ?, ?, ?, ?, ?)`
     );
 
-    for (const item of preparedLines) {
+    for (let idx = 0; idx < preparedLines.length; idx++) {
+      const item = preparedLines[idx];
+      const effLineTotal = effectiveLineTotals[idx];
       const lineId = uuid();
       insertLine.run(
         lineId,
@@ -242,6 +270,7 @@ export function completeSale(
         item.calc.grossTotal.toFixed(2),
         item.calc.discount.toFixed(2),
         item.calc.netTotal.toFixed(2),
+        effLineTotal.toFixed(2),
         item.lineCogs.toFixed(2)
       );
 
@@ -335,9 +364,30 @@ export function completeSale(
       );
     }
 
-    if (customer && totals.dueAmount.gt(0)) {
+    if (customer && advanceApplied.gt(0)) {
+      const nextAdv = roundMoney(money(customer.advance_balance || '0.00').sub(advanceApplied));
+      tx.prepare('UPDATE customers SET advance_balance = ?, updated_at = ? WHERE id = ?').run(
+        nextAdv.toFixed(2),
+        ts,
+        customer.id
+      );
+      tx.prepare(
+        `INSERT INTO party_advance_ledger (id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at)
+         VALUES (?, 'CUSTOMER', ?, 'APPLIED_TO_INVOICE', 'SALE', ?, ?, ?, ?, ?)`
+      ).run(
+        uuid(),
+        customer.id,
+        saleId,
+        advanceApplied.neg().toFixed(2),
+        `Advance applied to ${invoiceNumber}`,
+        user.id,
+        ts
+      );
+    }
+
+    if (customer && finalDueAmount.gt(0)) {
       tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-        roundMoney(d(customer.current_balance).add(totals.dueAmount)).toFixed(2),
+        roundMoney(d(customer.current_balance).add(finalDueAmount)).toFixed(2),
         ts,
         customer.id
       );
@@ -354,7 +404,8 @@ export function completeSale(
       afterState: {
         netTotal: totals.netTotal.toFixed(2),
         paid: totals.paidAmount.toFixed(2),
-        due: totals.dueAmount.toFixed(2),
+        advanceApplied: advanceApplied.toFixed(2),
+        due: finalDueAmount.toFixed(2),
         cashOnly: roundMoney(cashPaidTotal).toFixed(2),
         cogs: totalCogs.toFixed(2),
       },
@@ -365,7 +416,8 @@ export function completeSale(
       invoiceNumber,
       netTotal: totals.netTotal.toFixed(2),
       paidAmount: totals.paidAmount.toFixed(2),
-      dueAmount: totals.dueAmount.toFixed(2),
+      advanceApplied: advanceApplied.toFixed(2),
+      dueAmount: finalDueAmount.toFixed(2),
       totalCogs: totalCogs.toFixed(2),
     };
   });
@@ -393,12 +445,97 @@ export function createSalesReturn(
 
   return withTransaction((tx) => {
     const sale = tx.prepare('SELECT * FROM sales WHERE id = ?').get(input.saleId) as
-      | { id: string; invoice_number: string; customer_id: string | null; status: string; net_total: string; due_amount: string }
+      | {
+          id: string;
+          invoice_number: string;
+          customer_id: string | null;
+          status: string;
+          invoice_discount: string;
+          net_total: string;
+          paid_amount: string;
+          due_amount: string;
+        }
       | undefined;
     if (!sale || sale.status !== 'COMPLETED') throw new Error('Only COMPLETED sales can be returned');
 
     if (input.settlementType === 'CUSTOMER_CREDIT' && !sale.customer_id) {
       throw new Error('Customer credit settlement requires a linked customer on the original sale');
+    }
+
+    const allSaleLines = tx
+      .prepare('SELECT id, medicine_id, qty_base, line_total, effective_line_total FROM sale_lines WHERE sale_id = ? ORDER BY rowid ASC')
+      .all(sale.id) as Array<{
+      id: string;
+      medicine_id: string;
+      qty_base: string;
+      line_total: string;
+      effective_line_total: string;
+    }>;
+
+    // Determine exact net-of-invoice-discount value for every line on this invoice
+    const computedLegacyEffective = allocateInvoiceDiscountAcrossLines(
+      allSaleLines.map((l) => l.line_total),
+      sale.invoice_discount || '0'
+    );
+    const saleLineMap = new Map<
+      string,
+      { id: string; medicineId: string; qtyBase: Decimal; effectiveLineTotal: Decimal }
+    >();
+    allSaleLines.forEach((sl, idx) => {
+      const eff = sl.effective_line_total?.trim()
+        ? money(sl.effective_line_total)
+        : computedLegacyEffective[idx];
+      saleLineMap.set(sl.id, {
+        id: sl.id,
+        medicineId: sl.medicine_id,
+        qtyBase: qty(sl.qty_base),
+        effectiveLineTotal: eff,
+      });
+    });
+
+    // Track cumulative returns & remaining batch allocations IN MEMORY across all input lines
+    // so duplicate saleLineId entries in the same submission are validated cumulatively.
+    const qtyReturnedByLine = new Map<string, Decimal>();
+    const refundedByLine = new Map<string, Decimal>();
+    const remainingAllocsByLine = new Map<
+      string,
+      Array<{ batchId: string; qtyBase: Decimal; costPerBaseSnapshot: string }>
+    >();
+
+    function ensureLineTrackingLoaded(saleLineId: string) {
+      if (qtyReturnedByLine.has(saleLineId)) return;
+      const prevLines = tx
+        .prepare('SELECT batch_id, qty_base, refund_line_total FROM sales_return_lines WHERE sale_line_id = ?')
+        .all(saleLineId) as Array<{ batch_id: string; qty_base: string; refund_line_total: string }>;
+
+      let alreadyReturned = new Decimal(0);
+      let alreadyRefunded = new Decimal(0);
+      const prevPerBatch = new Map<string, Decimal>();
+      for (const pr of prevLines) {
+        const qPrev = qty(pr.qty_base);
+        alreadyReturned = alreadyReturned.add(qPrev);
+        alreadyRefunded = alreadyRefunded.add(money(pr.refund_line_total));
+        prevPerBatch.set(pr.batch_id, (prevPerBatch.get(pr.batch_id) || new Decimal(0)).add(qPrev));
+      }
+      qtyReturnedByLine.set(saleLineId, alreadyReturned);
+      refundedByLine.set(saleLineId, roundMoney(alreadyRefunded));
+
+      const origAllocs = tx
+        .prepare('SELECT batch_id, qty_base, cost_per_base_snapshot FROM sale_batch_allocations WHERE sale_line_id = ? ORDER BY rowid ASC')
+        .all(saleLineId) as Array<{ batch_id: string; qty_base: string; cost_per_base_snapshot: string }>;
+
+      const remAllocs = origAllocs
+        .map((oa) => {
+          const usedPrev = prevPerBatch.get(oa.batch_id) || new Decimal(0);
+          const avail = roundQty(qty(oa.qty_base).sub(usedPrev));
+          return {
+            batchId: oa.batch_id,
+            qtyBase: avail.gt(0) ? avail : new Decimal(0),
+            costPerBaseSnapshot: oa.cost_per_base_snapshot,
+          };
+        })
+        .filter((x) => x.qtyBase.gt(0));
+      remainingAllocsByLine.set(saleLineId, remAllocs);
     }
 
     const ts = nowIso();
@@ -420,57 +557,64 @@ export function createSalesReturn(
       const qRet = validateQuantityInput(reqLine.qtyBase, 'Return quantity', { allowZero: true });
       if (qRet.lte(0)) continue;
 
-      const sl = tx.prepare('SELECT * FROM sale_lines WHERE id = ? AND sale_id = ?').get(reqLine.saleLineId, sale.id) as
-        | { id: string; medicine_id: string; qty_base: string; line_total: string }
-        | undefined;
+      const sl = saleLineMap.get(reqLine.saleLineId);
       if (!sl) throw new Error('Sale line not found on this invoice');
 
-      const prevLines = tx
-        .prepare('SELECT batch_id, qty_base FROM sales_return_lines WHERE sale_line_id = ?')
-        .all(sl.id) as Array<{ batch_id: string; qty_base: string }>;
+      ensureLineTrackingLoaded(sl.id);
 
-      let alreadyReturned = new Decimal(0);
-      const prevPerBatch = new Map<string, Decimal>();
-      for (const pr of prevLines) {
-        const qPrev = qty(pr.qty_base);
-        alreadyReturned = alreadyReturned.add(qPrev);
-        prevPerBatch.set(pr.batch_id, (prevPerBatch.get(pr.batch_id) || new Decimal(0)).add(qPrev));
-      }
-
-      const maxReturnable = roundQty(d(sl.qty_base).sub(alreadyReturned));
+      const curReturned = qtyReturnedByLine.get(sl.id)!;
+      const maxReturnable = roundQty(sl.qtyBase.sub(curReturned));
       if (qRet.gt(maxReturnable)) {
         throw new Error(`Return quantity ${qRet.toFixed(6)} exceeds remaining returnable quantity ${maxReturnable.toFixed(6)}`);
       }
 
-      const origAllocs = tx
-        .prepare('SELECT batch_id, qty_base, cost_per_base_snapshot FROM sale_batch_allocations WHERE sale_line_id = ?')
-        .all(sl.id) as Array<{ batch_id: string; qty_base: string; cost_per_base_snapshot: string }>;
+      const remAllocs = remainingAllocsByLine.get(sl.id)!;
+      const cogsSplits = computeReturnCogsReversal(remAllocs, qRet);
 
-      const remainingOrigAllocs = origAllocs
-        .map((oa) => {
-          const usedPrev = prevPerBatch.get(oa.batch_id) || new Decimal(0);
-          const avail = roundQty(qty(oa.qty_base).sub(usedPrev));
-          return {
-            batchId: oa.batch_id,
-            qtyBase: avail.gt(0) ? avail : new Decimal(0),
-            costPerBaseSnapshot: oa.cost_per_base_snapshot,
-          };
-        })
-        .filter((x) => x.qtyBase.gt(0));
+      // Decrement in-memory remaining batch allocations so subsequent lines with the same saleLineId cannot reuse them
+      for (const sp of cogsSplits) {
+        for (const ra of remAllocs) {
+          if (ra.batchId === sp.batchId && ra.qtyBase.gt(0)) {
+            ra.qtyBase = roundQty(ra.qtyBase.sub(sp.qtyBase));
+            break;
+          }
+        }
+      }
+      remainingAllocsByLine.set(
+        sl.id,
+        remAllocs.filter((x) => x.qtyBase.gt(0))
+      );
 
-      const cogsSplits = computeReturnCogsReversal(remainingOrigAllocs, qRet);
-      const effectivePricePerBase = d(sl.line_total).div(d(sl.qty_base));
+      // Compute return refund value using exact net effective line total (after invoice discount)
+      const prevLineRefund = refundedByLine.get(sl.id)!;
+      const remainingLineValue = roundMoney(Decimal.max(new Decimal(0), sl.effectiveLineTotal.sub(prevLineRefund)));
+      const isFinalRemainder = qRet.eq(maxReturnable);
+      let lineRefundTotal = isFinalRemainder
+        ? remainingLineValue
+        : roundMoney(qRet.mul(sl.effectiveLineTotal).div(sl.qtyBase));
+      if (lineRefundTotal.gt(remainingLineValue)) {
+        lineRefundTotal = remainingLineValue;
+      }
 
-      const splitWithRefund = cogsSplits.map((sp) => {
-        const refundPart = roundMoney(sp.qtyBase.mul(effectivePricePerBase));
-        totalRefundValue = totalRefundValue.add(refundPart);
+      // Split lineRefundTotal across batch splits cleanly so sum(refundPart) === lineRefundTotal
+      let allocatedRefund = new Decimal(0);
+      const splitWithRefund = cogsSplits.map((sp, idx) => {
+        const refundPart =
+          idx === cogsSplits.length - 1
+            ? roundMoney(lineRefundTotal.sub(allocatedRefund))
+            : roundMoney(lineRefundTotal.mul(sp.qtyBase).div(qRet));
+        allocatedRefund = allocatedRefund.add(refundPart);
         totalCogsReversed = totalCogsReversed.add(sp.cogsReversed);
         return { ...sp, refundPart };
       });
+      totalRefundValue = totalRefundValue.add(lineRefundTotal);
+
+      qtyReturnedByLine.set(sl.id, roundQty(curReturned.add(qRet)));
+      refundedByLine.set(sl.id, roundMoney(prevLineRefund.add(lineRefundTotal)));
 
       preparedReturnLines.push({
         saleLineId: sl.id,
-        medicineId: sl.medicine_id,
+        medicineId: sl.medicineId,
         disposition: reqLine.disposition,
         allocs: splitWithRefund,
       });
@@ -480,14 +624,33 @@ export function createSalesReturn(
     totalRefundValue = roundMoney(totalRefundValue);
     totalCogsReversed = roundMoney(totalCogsReversed);
 
+    const salePaid = money(sale.paid_amount);
+    const saleDue = money(sale.due_amount);
+
+    if (input.settlementType === 'CASH_REFUND' || input.settlementType === 'MFS_REFUND') {
+      if (totalRefundValue.gt(salePaid)) {
+        throw new Error(
+          `Cannot issue ${input.settlementType} of ${totalRefundValue.toFixed(2)}: exceeds remaining paid amount (${salePaid.toFixed(2)}) on invoice ${sale.invoice_number}. Use Customer Credit to settle unpaid invoice due.`
+        );
+      }
+    }
+
     const refundAmount = input.settlementType === 'CUSTOMER_CREDIT' ? new Decimal(0) : totalRefundValue;
     const creditAmount = input.settlementType === 'CUSTOMER_CREDIT' ? totalRefundValue : new Decimal(0);
+
+    let dueSettled = new Decimal(0);
+    let advanceCreated = new Decimal(0);
+    if (input.settlementType === 'CUSTOMER_CREDIT') {
+      dueSettled = Decimal.min(creditAmount, saleDue);
+      advanceCreated = roundMoney(creditAmount.sub(dueSettled));
+    }
 
     tx.prepare(
       `INSERT INTO sales_returns (
         id, return_number, sale_id, customer_id, return_date, total_refund_value,
-        settlement_type, refund_amount, credit_amount, total_cogs_reversed, reason, created_by, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        settlement_type, refund_amount, credit_amount, due_settled, advance_created,
+        total_cogs_reversed, reason, created_by, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       returnId,
       returnNumber,
@@ -498,6 +661,8 @@ export function createSalesReturn(
       input.settlementType,
       refundAmount.toFixed(2),
       creditAmount.toFixed(2),
+      dueSettled.toFixed(2),
+      advanceCreated.toFixed(2),
       totalCogsReversed.toFixed(2),
       input.reason.trim(),
       user.id,
@@ -642,31 +807,63 @@ export function createSalesReturn(
       }
     }
 
-    if (input.settlementType === 'CASH_REFUND') {
-      const cashSessionId = getActiveCashSessionId(tx);
-      if (!cashSessionId) throw new Error('Cannot issue CASH refund without an OPEN cash session');
-      tx.prepare(
-        `INSERT INTO cash_movements (
-          id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at
-        ) VALUES (?, ?, 'CASH_REFUND', ?, 'SALES_RETURN', ?, ?, ?, ?)`
-      ).run(
-        uuid(),
-        cashSessionId,
-        refundAmount.neg().toFixed(2),
-        returnId,
-        `Cash refund for ${returnNumber} (${sale.invoice_number})`,
-        user.id,
-        ts
+    if (input.settlementType === 'CASH_REFUND' || input.settlementType === 'MFS_REFUND') {
+      tx.prepare('UPDATE sales SET paid_amount = ? WHERE id = ?').run(
+        roundMoney(salePaid.sub(refundAmount)).toFixed(2),
+        sale.id
       );
+      if (input.settlementType === 'CASH_REFUND') {
+        const cashSessionId = getActiveCashSessionId(tx);
+        if (!cashSessionId) throw new Error('Cannot issue CASH refund without an OPEN cash session');
+        tx.prepare(
+          `INSERT INTO cash_movements (
+            id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at
+          ) VALUES (?, ?, 'CASH_REFUND', ?, 'SALES_RETURN', ?, ?, ?, ?)`
+        ).run(
+          uuid(),
+          cashSessionId,
+          refundAmount.neg().toFixed(2),
+          returnId,
+          `Cash refund for ${returnNumber} (${sale.invoice_number})`,
+          user.id,
+          ts
+        );
+      }
     } else if (input.settlementType === 'CUSTOMER_CREDIT' && sale.customer_id) {
-      const cust = tx.prepare('SELECT current_balance FROM customers WHERE id = ?').get(sale.customer_id) as {
-        current_balance: string;
-      };
-      tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-        roundMoney(d(cust.current_balance).sub(creditAmount)).toFixed(2),
+      const nextSaleDue = roundMoney(saleDue.sub(dueSettled));
+      tx.prepare('UPDATE sales SET due_amount = ? WHERE id = ?').run(nextSaleDue.toFixed(2), sale.id);
+
+      const cust = tx
+        .prepare('SELECT current_balance, advance_balance FROM customers WHERE id = ?')
+        .get(sale.customer_id) as { current_balance: string; advance_balance: string };
+
+      const curBal = money(cust.current_balance);
+      const nextBal = dueSettled.gt(0)
+        ? roundMoney(Decimal.max(new Decimal(0), curBal.sub(dueSettled)))
+        : curBal;
+      const nextAdv = roundMoney(money(cust.advance_balance || '0.00').add(advanceCreated));
+
+      tx.prepare('UPDATE customers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
+        nextBal.toFixed(2),
+        nextAdv.toFixed(2),
         ts,
         sale.customer_id
       );
+
+      if (advanceCreated.gt(0)) {
+        tx.prepare(
+          `INSERT INTO party_advance_ledger (id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at)
+           VALUES (?, 'CUSTOMER', ?, 'RETURN_CREDIT', 'SALES_RETURN', ?, ?, ?, ?, ?)`
+        ).run(
+          uuid(),
+          sale.customer_id,
+          returnId,
+          advanceCreated.toFixed(2),
+          `Return credit excess from ${returnNumber} (${sale.invoice_number})`,
+          user.id,
+          ts
+        );
+      }
     }
 
     recordAudit(tx, {
@@ -680,6 +877,8 @@ export function createSalesReturn(
       afterState: {
         saleInvoice: sale.invoice_number,
         totalRefundValue: totalRefundValue.toFixed(2),
+        dueSettled: dueSettled.toFixed(2),
+        advanceCreated: advanceCreated.toFixed(2),
         totalCogsReversed: totalCogsReversed.toFixed(2),
         settlementType: input.settlementType,
       },
@@ -690,6 +889,8 @@ export function createSalesReturn(
       returnId,
       returnNumber,
       totalRefundValue: totalRefundValue.toFixed(2),
+      dueSettled: dueSettled.toFixed(2),
+      advanceCreated: advanceCreated.toFixed(2),
       totalCogsReversed: totalCogsReversed.toFixed(2),
     };
   });
@@ -699,7 +900,7 @@ export function reverseSale(user: AuthUser, saleId: string, reason: string) {
   if (!reason?.trim()) throw new Error('Mandatory reason is required to reverse a sale');
   return withTransaction((tx) => {
     const sale = tx.prepare('SELECT * FROM sales WHERE id = ?').get(saleId) as
-      | { id: string; invoice_number: string; customer_id: string | null; status: string; due_amount: string }
+      | { id: string; invoice_number: string; customer_id: string | null; status: string; due_amount: string; advance_applied: string }
       | undefined;
     if (!sale) throw new Error('Sale not found');
     if (sale.status !== 'COMPLETED') throw new Error('Only COMPLETED sales can be reversed');
@@ -737,13 +938,26 @@ export function reverseSale(user: AuthUser, saleId: string, reason: string) {
       }
     }
 
-    if (sale.customer_id && money(sale.due_amount).gt(0)) {
-      const cust = tx.prepare('SELECT current_balance FROM customers WHERE id = ?').get(sale.customer_id) as { current_balance: string };
-      tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-        roundMoney(d(cust.current_balance).sub(d(sale.due_amount))).toFixed(2),
+    const advApplied = money(sale.advance_applied || '0.00');
+    if (sale.customer_id && (money(sale.due_amount).gt(0) || advApplied.gt(0))) {
+      const cust = tx.prepare('SELECT current_balance, advance_balance FROM customers WHERE id = ?').get(sale.customer_id) as {
+        current_balance: string;
+        advance_balance: string;
+      };
+      const nextDueBal = roundMoney(d(cust.current_balance).sub(d(sale.due_amount)));
+      const nextAdvBal = roundMoney(money(cust.advance_balance || '0.00').add(advApplied));
+      tx.prepare('UPDATE customers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
+        nextDueBal.toFixed(2),
+        nextAdvBal.toFixed(2),
         ts,
         sale.customer_id
       );
+      if (advApplied.gt(0)) {
+        tx.prepare(
+          `INSERT INTO party_advance_ledger (id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at)
+           VALUES (?, 'CUSTOMER', ?, 'REVERSAL', 'SALE_REVERSAL', ?, ?, ?, ?, ?)`
+        ).run(uuid(), sale.customer_id, saleId, advApplied.toFixed(2), `Restored advance on reversal of ${sale.invoice_number}`, user.id, ts);
+      }
     }
 
     const paidAllocs = tx

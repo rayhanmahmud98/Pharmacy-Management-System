@@ -84,60 +84,175 @@ export async function createVerifiedBackup(
     } catch {
       // ignore cleanup error
     }
-    db.prepare(
-      `INSERT INTO backup_records (id, filename, file_path, size_bytes, sha256, integrity_check_result, backup_type, status, error_message, created_by, created_at)
-       VALUES (?, ?, ?, 0, '', 'FAILED', ?, 'FAILED', ?, ?, ?)`
-    ).run(id, filename, targetPath, backupType, msg, user?.id || null, ts);
+    try {
+      withTransaction((tx) => {
+        tx.prepare(
+          `INSERT INTO backup_records (id, filename, file_path, size_bytes, sha256, integrity_check_result, backup_type, status, error_message, created_by, created_at)
+           VALUES (?, ?, ?, 0, '', 'FAILED', ?, 'FAILED', ?, ?, ?)`
+        ).run(id, filename, targetPath, backupType, msg, user?.id || null, ts);
+
+        recordAudit(tx, {
+          userId: user?.id || null,
+          username: user?.username || 'system',
+          action: 'CREATE_VERIFIED_BACKUP',
+          module: 'backup',
+          targetType: 'BACKUP',
+          targetId: id,
+          transactionRef: filename,
+          status: 'FAILURE',
+          reason: msg,
+        });
+      });
+    } catch {
+      // If DB itself is unreachable during error recording, preserve original error
+    }
     throw err;
+  }
+}
+
+function recordRestoreFailureAudit(user: AuthUser, backupId: string, filename: string, reason: string) {
+  try {
+    withTransaction((tx) => {
+      recordAudit(tx, {
+        userId: user.id,
+        username: user.username,
+        action: 'RESTORE_BACKUP',
+        module: 'backup',
+        targetType: 'BACKUP',
+        targetId: backupId,
+        transactionRef: filename,
+        status: 'FAILURE',
+        reason,
+      });
+    });
+  } catch {
+    // Do not mask original restore error if audit logging fails
   }
 }
 
 export async function restoreFromBackup(user: AuthUser, backupId: string) {
   const db = getDb();
-  const rec = db.prepare('SELECT * FROM backup_records WHERE id = ?').get(backupId) as
-    | { id: string; filename: string; file_path: string; status: string }
+  const rec = db
+    .prepare('SELECT id, filename, file_path, sha256, status FROM backup_records WHERE id = ?')
+    .get(backupId) as
+    | { id: string; filename: string; file_path: string; sha256: string; status: string }
     | undefined;
-  if (!rec || rec.status !== 'VERIFIED') throw new Error('Selected backup record is missing or unverified');
-  if (!fs.existsSync(rec.file_path)) throw new Error('Backup file does not exist on disk');
 
-  const checkDb = new DatabaseSync(rec.file_path, { readOnly: true });
+  if (!rec || rec.status !== 'VERIFIED') {
+    const msg = 'Selected backup record is missing or unverified';
+    recordRestoreFailureAudit(user, backupId, rec?.filename || backupId, msg);
+    throw new Error(msg);
+  }
+  if (!rec.sha256 || !/^[a-f0-9]{64}$/i.test(rec.sha256)) {
+    const msg = 'Selected backup record is missing a valid expected SHA-256 checksum';
+    recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
+    throw new Error(msg);
+  }
+  if (!fs.existsSync(rec.file_path)) {
+    const msg = 'Backup file does not exist on disk';
+    recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
+    throw new Error(msg);
+  }
+
+  const actualSha256 = crypto.createHash('sha256').update(fs.readFileSync(rec.file_path)).digest('hex');
+  const expectedBuf = Buffer.from(rec.sha256.toLowerCase(), 'utf8');
+  const actualBuf = Buffer.from(actualSha256.toLowerCase(), 'utf8');
+  if (expectedBuf.length !== actualBuf.length || !crypto.timingSafeEqual(expectedBuf, actualBuf)) {
+    const msg = `Backup SHA-256 checksum mismatch for ${rec.filename}. Restore aborted to prevent corrupted or tampered recovery.`;
+    recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
+    throw new Error(msg);
+  }
+
+  let checkDb: DatabaseSync | null = null;
   try {
+    checkDb = new DatabaseSync(rec.file_path, { readOnly: true });
     const res = checkDb.prepare('PRAGMA integrity_check;').get() as { integrity_check: string };
     if (res?.integrity_check?.toLowerCase() !== 'ok') {
       throw new Error(`Backup file failed integrity check: ${res?.integrity_check}`);
     }
+  } catch (err) {
+    const msg = (err as Error).message || 'Backup file failed SQLite integrity verification';
+    recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
+    throw new Error(msg);
   } finally {
-    checkDb.close();
+    try {
+      checkDb?.close();
+    } catch {
+      // ignore close failure
+    }
   }
 
-  await createVerifiedBackup(user, 'PRE_RESTORE');
+  let preRestore: Awaited<ReturnType<typeof createVerifiedBackup>>;
+  try {
+    preRestore = await createVerifiedBackup(user, 'PRE_RESTORE');
+  } catch (err) {
+    const msg = `Pre-restore safety backup failed: ${(err as Error).message}`;
+    recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
+    throw new Error(msg);
+  }
+
+  const preRestorePath = path.join(BACKUP_DIR, preRestore.filename);
 
   closeDb();
-  fs.copyFileSync(rec.file_path, DB_PATH);
-  for (const suffix of ['-wal', '-shm']) {
-    if (fs.existsSync(DB_PATH + suffix)) fs.unlinkSync(DB_PATH + suffix);
-  }
+  try {
+    fs.copyFileSync(rec.file_path, DB_PATH);
+    for (const suffix of ['-wal', '-shm']) {
+      if (fs.existsSync(DB_PATH + suffix)) fs.unlinkSync(DB_PATH + suffix);
+    }
 
-  const restored = getDb();
-  const postCheck = restored.prepare('PRAGMA integrity_check;').get() as { integrity_check: string };
-  if (postCheck?.integrity_check?.toLowerCase() !== 'ok') {
-    throw new Error('Post-restore integrity verification failed');
-  }
+    const restored = getDb();
+    const postCheck = restored.prepare('PRAGMA integrity_check;').get() as { integrity_check: string };
+    if (postCheck?.integrity_check?.toLowerCase() !== 'ok') {
+      throw new Error(`Post-restore integrity verification failed: ${postCheck?.integrity_check}`);
+    }
 
-  withTransaction((tx) => {
-    recordAudit(tx, {
-      userId: user.id,
-      username: user.username,
-      action: 'RESTORE_BACKUP',
-      module: 'backup',
-      targetType: 'BACKUP',
-      targetId: rec.id,
-      transactionRef: rec.filename,
-      reason: `Restored database from verified backup ${rec.filename}`,
+    withTransaction((tx) => {
+      recordAudit(tx, {
+        userId: user.id,
+        username: user.username,
+        action: 'RESTORE_BACKUP',
+        module: 'backup',
+        targetType: 'BACKUP',
+        targetId: rec.id,
+        transactionRef: rec.filename,
+        afterState: {
+          restoredFrom: rec.filename,
+          sha256Verified: actualSha256,
+          preRestoreBackup: preRestore.filename,
+          integrity: postCheck.integrity_check,
+        },
+        reason: `Restored database from SHA-256 verified backup ${rec.filename}`,
+      });
     });
-  });
 
-  return { restoredFrom: rec.filename, integrity: postCheck.integrity_check };
+    return {
+      restoredFrom: rec.filename,
+      sha256: actualSha256,
+      preRestoreBackup: preRestore.filename,
+      integrity: postCheck.integrity_check,
+    };
+  } catch (restoreErr) {
+    const msg = (restoreErr as Error).message;
+    try {
+      closeDb();
+      if (fs.existsSync(preRestorePath)) {
+        fs.copyFileSync(preRestorePath, DB_PATH);
+        for (const suffix of ['-wal', '-shm']) {
+          if (fs.existsSync(DB_PATH + suffix)) fs.unlinkSync(DB_PATH + suffix);
+        }
+        getDb();
+        recordRestoreFailureAudit(
+          user,
+          rec.id,
+          rec.filename,
+          `Restore failed and rolled back to ${preRestore.filename}: ${msg}`
+        );
+      }
+    } catch {
+      // Preserve primary restore failure error
+    }
+    throw restoreErr;
+  }
 }
 
 export function buildMedicineImportTemplateBuffer(): Buffer {

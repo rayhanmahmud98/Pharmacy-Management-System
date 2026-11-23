@@ -262,10 +262,15 @@ export function recordPartyPayment(
     const payId = uuid();
     const payNo = generateDocNumber(tx, 'PAY', 'payments', 'payment_number');
     const direction = input.partyType === 'CUSTOMER' ? 'IN' : 'OUT';
+    let allocatedToDocs = new Decimal(0);
+    let openingApplied = new Decimal(0);
+    let advanceAdded = new Decimal(0);
 
     if (input.partyType === 'CUSTOMER') {
-      const cust = tx.prepare('SELECT id, name, current_balance FROM customers WHERE id = ?').get(input.partyId) as
-        | { id: string; name: string; current_balance: string }
+      const cust = tx
+        .prepare('SELECT id, name, current_balance, advance_balance FROM customers WHERE id = ?')
+        .get(input.partyId) as
+        | { id: string; name: string; current_balance: string; advance_balance: string }
         | undefined;
       if (!cust) throw new Error('Customer not found');
 
@@ -296,12 +301,53 @@ export function recordPartyPayment(
           roundMoney(due.sub(apply)).toFixed(2),
           s.id
         );
+        allocatedToDocs = roundMoney(allocatedToDocs.add(apply));
         remainingToAlloc = roundMoney(remainingToAlloc.sub(apply));
       }
 
-      const nextBal = roundMoney(d(cust.current_balance).sub(amt));
-      tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
+      if (remainingToAlloc.gt(0)) {
+        const otherOpenRow = tx
+          .prepare("SELECT due_amount FROM sales WHERE customer_id = ? AND status = 'COMPLETED'")
+          .all(cust.id) as Array<{ due_amount: string }>;
+        let remainingOpenInvoiceDue = new Decimal(0);
+        for (const r of otherOpenRow) {
+          remainingOpenInvoiceDue = remainingOpenInvoiceDue.add(money(r.due_amount));
+        }
+        remainingOpenInvoiceDue = roundMoney(remainingOpenInvoiceDue);
+
+        const balAfterInvoiceAllocs = Decimal.max(0, roundMoney(d(cust.current_balance).sub(allocatedToDocs)));
+        const uninvoicedDue = Decimal.max(0, roundMoney(balAfterInvoiceAllocs.sub(remainingOpenInvoiceDue)));
+        if (uninvoicedDue.gt(0)) {
+          openingApplied = Decimal.min(uninvoicedDue, remainingToAlloc);
+          tx.prepare(
+            `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES (?, ?, 'CUSTOMER_OPENING', ?, ?)`
+          ).run(uuid(), payId, cust.id, openingApplied.toFixed(2));
+          remainingToAlloc = roundMoney(remainingToAlloc.sub(openingApplied));
+        }
+      }
+
+      if (remainingToAlloc.gt(0)) {
+        advanceAdded = remainingToAlloc;
+        tx.prepare(
+          `INSERT INTO party_advance_ledger (
+            id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at
+          ) VALUES (?, 'CUSTOMER', ?, 'ADVANCE_RECEIPT', 'PAYMENT', ?, ?, ?, ?, ?)`
+        ).run(
+          uuid(),
+          cust.id,
+          payId,
+          advanceAdded.toFixed(2),
+          `Advance credit from payment ${payNo}`,
+          user.id,
+          ts
+        );
+      }
+
+      const nextBal = roundMoney(d(cust.current_balance).sub(allocatedToDocs).sub(openingApplied));
+      const nextAdv = roundMoney(d(cust.advance_balance || '0.00').add(advanceAdded));
+      tx.prepare('UPDATE customers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
         nextBal.toFixed(2),
+        nextAdv.toFixed(2),
         ts,
         cust.id
       );
@@ -323,11 +369,22 @@ export function recordPartyPayment(
         targetType: 'PAYMENT',
         targetId: payId,
         transactionRef: payNo,
-        afterState: { customer: cust.name, method: input.method, amount: amt.toFixed(2), newBalance: nextBal.toFixed(2) },
+        afterState: {
+          customer: cust.name,
+          method: input.method,
+          amount: amt.toFixed(2),
+          allocatedToInvoices: allocatedToDocs.toFixed(2),
+          openingApplied: openingApplied.toFixed(2),
+          advanceAdded: advanceAdded.toFixed(2),
+          newBalance: nextBal.toFixed(2),
+          newAdvanceBalance: nextAdv.toFixed(2),
+        },
       });
     } else {
-      const sup = tx.prepare('SELECT id, name, current_balance FROM suppliers WHERE id = ?').get(input.partyId) as
-        | { id: string; name: string; current_balance: string }
+      const sup = tx
+        .prepare('SELECT id, name, current_balance, advance_balance FROM suppliers WHERE id = ?')
+        .get(input.partyId) as
+        | { id: string; name: string; current_balance: string; advance_balance: string }
         | undefined;
       if (!sup) throw new Error('Supplier not found');
 
@@ -359,12 +416,53 @@ export function recordPartyPayment(
           ts,
           p.id
         );
+        allocatedToDocs = roundMoney(allocatedToDocs.add(apply));
         remainingToAlloc = roundMoney(remainingToAlloc.sub(apply));
       }
 
-      const nextBal = roundMoney(d(sup.current_balance).sub(amt));
-      tx.prepare('UPDATE suppliers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
+      if (remainingToAlloc.gt(0)) {
+        const otherOpenRow = tx
+          .prepare("SELECT due_amount FROM purchases WHERE supplier_id = ? AND status = 'RECEIVED'")
+          .all(sup.id) as Array<{ due_amount: string }>;
+        let remainingOpenPurDue = new Decimal(0);
+        for (const r of otherOpenRow) {
+          remainingOpenPurDue = remainingOpenPurDue.add(money(r.due_amount));
+        }
+        remainingOpenPurDue = roundMoney(remainingOpenPurDue);
+
+        const balAfterPurAllocs = Decimal.max(0, roundMoney(d(sup.current_balance).sub(allocatedToDocs)));
+        const uninvoicedDue = Decimal.max(0, roundMoney(balAfterPurAllocs.sub(remainingOpenPurDue)));
+        if (uninvoicedDue.gt(0)) {
+          openingApplied = Decimal.min(uninvoicedDue, remainingToAlloc);
+          tx.prepare(
+            `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES (?, ?, 'SUPPLIER_OPENING', ?, ?)`
+          ).run(uuid(), payId, sup.id, openingApplied.toFixed(2));
+          remainingToAlloc = roundMoney(remainingToAlloc.sub(openingApplied));
+        }
+      }
+
+      if (remainingToAlloc.gt(0)) {
+        advanceAdded = remainingToAlloc;
+        tx.prepare(
+          `INSERT INTO party_advance_ledger (
+            id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at
+          ) VALUES (?, 'SUPPLIER', ?, 'ADVANCE_RECEIPT', 'PAYMENT', ?, ?, ?, ?, ?)`
+        ).run(
+          uuid(),
+          sup.id,
+          payId,
+          advanceAdded.toFixed(2),
+          `Supplier advance credit from payment ${payNo}`,
+          user.id,
+          ts
+        );
+      }
+
+      const nextBal = roundMoney(d(sup.current_balance).sub(allocatedToDocs).sub(openingApplied));
+      const nextAdv = roundMoney(d(sup.advance_balance || '0.00').add(advanceAdded));
+      tx.prepare('UPDATE suppliers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
         nextBal.toFixed(2),
+        nextAdv.toFixed(2),
         ts,
         sup.id
       );
@@ -386,11 +484,27 @@ export function recordPartyPayment(
         targetType: 'PAYMENT',
         targetId: payId,
         transactionRef: payNo,
-        afterState: { supplier: sup.name, method: input.method, amount: amt.toFixed(2), newBalance: nextBal.toFixed(2) },
+        afterState: {
+          supplier: sup.name,
+          method: input.method,
+          amount: amt.toFixed(2),
+          allocatedToPurchases: allocatedToDocs.toFixed(2),
+          openingApplied: openingApplied.toFixed(2),
+          advanceAdded: advanceAdded.toFixed(2),
+          newBalance: nextBal.toFixed(2),
+          newAdvanceBalance: nextAdv.toFixed(2),
+        },
       });
     }
 
-    return { paymentId: payId, paymentNumber: payNo, direction };
+    return {
+      paymentId: payId,
+      paymentNumber: payNo,
+      direction,
+      allocatedToDocs: allocatedToDocs.toFixed(2),
+      openingApplied: openingApplied.toFixed(2),
+      advanceAdded: advanceAdded.toFixed(2),
+    };
   });
 }
 
@@ -405,6 +519,74 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
 
     const ts = nowIso();
     const amt = money(pay.amount);
+
+    const advRows = tx
+      .prepare(
+        "SELECT amount_signed FROM party_advance_ledger WHERE source_type = 'PAYMENT' AND source_id = ? AND entry_type = 'ADVANCE_RECEIPT'"
+      )
+      .all(pay.id) as Array<{ amount_signed: string }>;
+    let advanceAdded = new Decimal(0);
+    for (const ar of advRows) {
+      advanceAdded = advanceAdded.add(money(ar.amount_signed));
+    }
+    advanceAdded = roundMoney(advanceAdded);
+
+    const restoredDueDelta = roundMoney(amt.sub(advanceAdded));
+
+    if (pay.party_type === 'CUSTOMER' && pay.party_id) {
+      const cust = tx.prepare('SELECT current_balance, advance_balance FROM customers WHERE id = ?').get(pay.party_id) as
+        | { current_balance: string; advance_balance: string }
+        | undefined;
+      if (cust) {
+        const curAdv = money(cust.advance_balance || '0.00');
+        if (curAdv.lt(advanceAdded)) {
+          throw new Error(
+            `Cannot reverse payment ${pay.payment_number}: advance credit (${advanceAdded.toFixed(2)}) created by this payment has already been consumed on subsequent transactions`
+          );
+        }
+        tx.prepare('UPDATE customers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
+          roundMoney(d(cust.current_balance).add(restoredDueDelta)).toFixed(2),
+          roundMoney(curAdv.sub(advanceAdded)).toFixed(2),
+          ts,
+          pay.party_id
+        );
+      }
+    } else if (pay.party_type === 'SUPPLIER' && pay.party_id) {
+      const sup = tx.prepare('SELECT current_balance, advance_balance FROM suppliers WHERE id = ?').get(pay.party_id) as
+        | { current_balance: string; advance_balance: string }
+        | undefined;
+      if (sup) {
+        const curAdv = money(sup.advance_balance || '0.00');
+        if (curAdv.lt(advanceAdded)) {
+          throw new Error(
+            `Cannot reverse payment ${pay.payment_number}: supplier advance credit (${advanceAdded.toFixed(2)}) created by this payment has already been consumed on subsequent purchases`
+          );
+        }
+        tx.prepare('UPDATE suppliers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
+          roundMoney(d(sup.current_balance).add(restoredDueDelta)).toFixed(2),
+          roundMoney(curAdv.sub(advanceAdded)).toFixed(2),
+          ts,
+          pay.party_id
+        );
+      }
+    }
+
+    if (advanceAdded.gt(0) && (pay.party_type === 'CUSTOMER' || pay.party_type === 'SUPPLIER') && pay.party_id) {
+      tx.prepare(
+        `INSERT INTO party_advance_ledger (
+          id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at
+        ) VALUES (?, ?, ?, 'REVERSAL', 'PAYMENT_REVERSAL', ?, ?, ?, ?, ?)`
+      ).run(
+        uuid(),
+        pay.party_type,
+        pay.party_id,
+        pay.id,
+        advanceAdded.neg().toFixed(2),
+        `Advance reversed from payment ${pay.payment_number}: ${reason.trim()}`,
+        user.id,
+        ts
+      );
+    }
 
     const allocs = tx.prepare('SELECT * FROM payment_allocations WHERE payment_id = ?').all(pay.id) as Array<{
       target_type: string;
@@ -440,30 +622,6 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
       }
     }
 
-    if (pay.party_type === 'CUSTOMER' && pay.party_id) {
-      const cust = tx.prepare('SELECT current_balance FROM customers WHERE id = ?').get(pay.party_id) as
-        | { current_balance: string }
-        | undefined;
-      if (cust) {
-        tx.prepare('UPDATE customers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-          roundMoney(d(cust.current_balance).add(amt)).toFixed(2),
-          ts,
-          pay.party_id
-        );
-      }
-    } else if (pay.party_type === 'SUPPLIER' && pay.party_id) {
-      const sup = tx.prepare('SELECT current_balance FROM suppliers WHERE id = ?').get(pay.party_id) as
-        | { current_balance: string }
-        | undefined;
-      if (sup) {
-        tx.prepare('UPDATE suppliers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
-          roundMoney(d(sup.current_balance).add(amt)).toFixed(2),
-          ts,
-          pay.party_id
-        );
-      }
-    }
-
     if (pay.method === 'CASH') {
       const cashSessionId = getActiveCashSessionId(tx);
       if (!cashSessionId) throw new Error('Open cash session required to reverse a CASH payment');
@@ -485,7 +643,11 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
       targetId: pay.id,
       transactionRef: pay.payment_number,
       beforeState: { status: 'POSTED', amount: pay.amount },
-      afterState: { status: 'REVERSED' },
+      afterState: {
+        status: 'REVERSED',
+        restoredDueDelta: restoredDueDelta.toFixed(2),
+        reversedAdvance: advanceAdded.toFixed(2),
+      },
       reason: reason.trim(),
     });
   });

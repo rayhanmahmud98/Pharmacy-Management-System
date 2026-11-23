@@ -100,20 +100,39 @@ export function generateDocNumber(db: DatabaseSync, prefix: string, table: strin
   return `${seqKey}-${seq}`;
 }
 
+let txDepth = 0;
+
 export function withTransaction<T>(fn: (db: DatabaseSync) => T): T {
   const db = getDb();
-  db.exec('BEGIN IMMEDIATE;');
+  const depth = txDepth;
+  if (depth === 0) {
+    db.exec('BEGIN IMMEDIATE;');
+  } else {
+    db.exec(`SAVEPOINT sp_${depth};`);
+  }
+  txDepth++;
   try {
     const result = fn(db);
-    db.exec('COMMIT;');
+    if (depth === 0) {
+      db.exec('COMMIT;');
+    } else {
+      db.exec(`RELEASE SAVEPOINT sp_${depth};`);
+    }
     return result;
   } catch (err) {
     try {
-      db.exec('ROLLBACK;');
+      if (depth === 0) {
+        db.exec('ROLLBACK;');
+      } else {
+        db.exec(`ROLLBACK TO SAVEPOINT sp_${depth};`);
+        db.exec(`RELEASE SAVEPOINT sp_${depth};`);
+      }
     } catch {
       // ignore rollback errors if already rolled back
     }
     throw err;
+  } finally {
+    txDepth--;
   }
 }
 
@@ -632,6 +651,19 @@ function initSchema(db: DatabaseSync): void {
       created_by TEXT,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS party_advance_ledger (
+      id TEXT PRIMARY KEY,
+      party_type TEXT NOT NULL CHECK (party_type IN ('CUSTOMER', 'SUPPLIER')),
+      party_id TEXT NOT NULL,
+      entry_type TEXT NOT NULL CHECK (entry_type IN ('ADVANCE_RECEIPT', 'RETURN_CREDIT', 'APPLIED_TO_INVOICE', 'REVERSAL')),
+      source_type TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      amount_signed TEXT NOT NULL,
+      notes TEXT NOT NULL DEFAULT '',
+      created_by TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL
+    );
   `);
 
   // Additive migrations for pre-existing databases
@@ -654,6 +686,16 @@ function initSchema(db: DatabaseSync): void {
   addColumnIfMissing(db, 'audit_logs', 'status', "TEXT NOT NULL DEFAULT 'SUCCESS'");
   addColumnIfMissing(db, 'audit_logs', 'metadata_json', "TEXT NOT NULL DEFAULT '{}'");
 
+  addColumnIfMissing(db, 'sale_lines', 'effective_line_total', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, 'sales', 'advance_applied', "TEXT NOT NULL DEFAULT '0.00'");
+  addColumnIfMissing(db, 'sales_returns', 'due_settled', "TEXT NOT NULL DEFAULT '0.00'");
+  addColumnIfMissing(db, 'sales_returns', 'advance_created', "TEXT NOT NULL DEFAULT '0.00'");
+  addColumnIfMissing(db, 'purchases', 'advance_applied', "TEXT NOT NULL DEFAULT '0.00'");
+  addColumnIfMissing(db, 'purchase_returns', 'due_settled', "TEXT NOT NULL DEFAULT '0.00'");
+  addColumnIfMissing(db, 'purchase_returns', 'advance_created', "TEXT NOT NULL DEFAULT '0.00'");
+  addColumnIfMissing(db, 'customers', 'advance_balance', "TEXT NOT NULL DEFAULT '0.00'");
+  addColumnIfMissing(db, 'suppliers', 'advance_balance', "TEXT NOT NULL DEFAULT '0.00'");
+
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_medicines_brand ON medicines(brand_name);
     CREATE INDEX IF NOT EXISTS idx_medicines_generic ON medicines(generic_name);
@@ -667,6 +709,7 @@ function initSchema(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
     CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action, module);
     CREATE INDEX IF NOT EXISTS idx_cash_movements_session ON cash_movements(cash_session_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_advance_ledger_party ON party_advance_ledger(party_type, party_id, created_at);
   `);
 
   // One-time safe upgrade of untouched legacy template defaults in pre-existing local DBs

@@ -1,10 +1,6 @@
-import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
-import { DATA_DIR, LICENSE_PATH, getDb, nowIso, todayDate, uuid, withTransaction } from './db.ts';
+import { getDb, nowIso, todayDate, uuid, withTransaction } from './db.ts';
 import { hashPassword } from './auth.ts';
 import { recordAudit } from './audit.ts';
-import { canonicalLicensePayload, type LicensePayload } from './licensing.ts';
 
 const PERMISSIONS: Array<{ code: string; module: string; label: string }> = [
   { code: 'pos.sell', module: 'POS & Sales', label: 'Complete POS Sales' },
@@ -53,7 +49,6 @@ export function seedDatabaseIfEmpty(): void {
   const db = getDb();
   const existingUser = db.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number };
   if (existingUser.cnt > 0) {
-    ensureSeedLicense();
     return;
   }
 
@@ -136,18 +131,18 @@ export function seedDatabaseIfEmpty(): void {
     const cashierId = uuid();
 
     tx.prepare(
-      `INSERT INTO users (id, username, full_name, phone, email, password_hash, role_id, is_super_admin, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO users (id, username, full_name, phone, email, password_hash, role_id, is_super_admin, is_active, must_change_password, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
     ).run(adminId, 'admin', 'Tariqul Islam', '+1 (555) 010-0111', 'admin@medinest.local', hashPassword('Admin@123'), adminRoleId, 1, 1, ts, ts);
 
     tx.prepare(
-      `INSERT INTO users (id, username, full_name, phone, email, password_hash, role_id, is_super_admin, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO users (id, username, full_name, phone, email, password_hash, role_id, is_super_admin, is_active, must_change_password, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
     ).run(managerId, 'manager', 'Farhana Yasmin', '+1 (555) 010-0222', 'manager@medinest.local', hashPassword('Manager@123'), managerRoleId, 0, 1, ts, ts);
 
     tx.prepare(
-      `INSERT INTO users (id, username, full_name, phone, email, password_hash, role_id, is_super_admin, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO users (id, username, full_name, phone, email, password_hash, role_id, is_super_admin, is_active, must_change_password, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
     ).run(cashierId, 'cashier', 'Rakibul Hasan', '+1 (555) 010-0333', 'cashier@medinest.local', hashPassword('Cashier@123'), cashierRoleId, 0, 1, ts, ts);
 
     tx.prepare(
@@ -526,36 +521,4 @@ export function seedDatabaseIfEmpty(): void {
       reason: 'Initial pharmacy setup & seed',
     });
   });
-
-  ensureSeedLicense();
-}
-
-function ensureSeedLicense(): void {
-  const pubPath = path.join(DATA_DIR, 'license_public.pem');
-  if (fs.existsSync(LICENSE_PATH) && fs.existsSync(pubPath)) return;
-
-  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519', {
-    publicKeyEncoding: { type: 'spki', format: 'pem' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-  });
-
-  fs.writeFileSync(pubPath, publicKey, 'utf8');
-
-  const today = todayDate();
-  const nextYear = addDays(today, 365);
-  const payload: LicensePayload = {
-    licenseId: 'LIC-MN-2026-0001',
-    customerId: 'PHARM-MN-0001',
-    pharmacyName: 'MediNest',
-    licenseType: 'TIME_LIMITED',
-    issueDate: today,
-    expiryDate: nextYear,
-    deviceFingerprint: '*',
-  };
-  const signature = crypto.sign(null, Buffer.from(canonicalLicensePayload(payload), 'utf8'), privateKey);
-  fs.writeFileSync(
-    LICENSE_PATH,
-    JSON.stringify({ payload, signatureBase64: signature.toString('base64') }, null, 2),
-    'utf8'
-  );
 }

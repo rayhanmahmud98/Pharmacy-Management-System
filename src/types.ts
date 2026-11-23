@@ -156,6 +156,7 @@ export interface SaleRecord {
   net_total: string;
   paid_amount: string;
   due_amount: string;
+  advance_applied?: string;
   total_cogs: string;
   notes: string;
   cashier_name: string;

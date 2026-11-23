@@ -432,3 +432,71 @@ export function resolvePermission(ctx: PermissionContext): boolean {
   if (ctx.userOverride === 'DENY') return false;
   return ctx.roleAllows;
 }
+
+/**
+ * Proportionally distributes an invoice-level discount across line net totals
+ * using exact Decimal arithmetic, assigning any rounding penny remainder to the last
+ * positive line so SUM(effectiveLineTotals) === roundMoney(SUM(lineTotals) - invoiceDiscount).
+ */
+export function allocateInvoiceDiscountAcrossLines(
+  lineTotals: DecimalInput[],
+  invoiceDiscount: DecimalInput
+): Decimal[] {
+  const lines = lineTotals.map((lt) => validateCurrencyInput(lt, 'Line net total', { allowZero: true }));
+  const invDisc = validateCurrencyInput(invoiceDiscount ?? '0', 'Invoice discount', { allowZero: true });
+  const subtotal = roundMoney(lines.reduce((s, v) => s.add(v), new Decimal(0)));
+
+  if (invDisc.gt(subtotal)) {
+    throw new Error('Invoice discount cannot exceed line net subtotal');
+  }
+  if (lines.length === 0 || invDisc.eq(0) || subtotal.eq(0)) {
+    return lines.map((l) => roundMoney(l));
+  }
+
+  const targetNetTotal = roundMoney(subtotal.sub(invDisc));
+  const lastPositiveIdx = lines.reduce((acc, v, idx) => (v.gt(0) ? idx : acc), -1);
+  if (lastPositiveIdx === -1) {
+    return lines.map((l) => roundMoney(l));
+  }
+
+  const result: Decimal[] = new Array(lines.length).fill(new Decimal(0));
+  let allocatedNet = new Decimal(0);
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].eq(0)) {
+      result[i] = new Decimal(0);
+      continue;
+    }
+    if (i === lastPositiveIdx) {
+      result[i] = roundMoney(targetNetTotal.sub(allocatedNet));
+    } else {
+      const share = roundMoney(lines[i].mul(targetNetTotal).div(subtotal));
+      result[i] = share;
+      allocatedNet = allocatedNet.add(share);
+    }
+  }
+  return result;
+}
+
+/**
+ * Computes weighted-average per-base-unit cost (6 decimal places) when replenishing
+ * an existing batch with stock at a different purchase cost.
+ */
+export function computeWeightedAverageCost(
+  existingQtyBase: DecimalInput,
+  existingCostPerBase: DecimalInput,
+  addedQtyBase: DecimalInput,
+  addedCostPerBase: DecimalInput
+): Decimal {
+  const qOld = qty(existingQtyBase, 'Existing batch quantity');
+  const cOld = cost6(existingCostPerBase, 'Existing batch cost');
+  const qNew = validateQuantityInput(addedQtyBase, 'Added batch quantity', { allowZero: false });
+  const cNew = cost6(addedCostPerBase, 'New batch cost');
+
+  if (qOld.lte(0)) {
+    return roundCost6(cNew);
+  }
+  const totalQty = qOld.add(qNew);
+  const totalValue = qOld.mul(cOld).add(qNew.mul(cNew));
+  return roundCost6(totalValue.div(totalQty));
+}
