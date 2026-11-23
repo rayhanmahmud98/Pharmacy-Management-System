@@ -1,0 +1,1959 @@
+# PHARMACY MANAGEMENT SOFTWARE
+## Master Project Specification & Development Instructions
+
+Act as a senior software architect, senior Django developer, database architect, pharmacy inventory systems specialist, financial systems engineer, Windows desktop application engineer, and QA engineer.
+
+Your task is to build a **commercial-grade, offline-first Pharmacy Management Software for independent pharmacies in Bangladesh**.
+
+This is a real commercial software product intended to be installed, licensed, and used by pharmacies that generally operate on a single Windows computer.
+
+Do not treat this as a demo, academic project, CRUD exercise, or simple inventory application. Prioritize data integrity, stock accuracy, financial accuracy, usability, reliability, recoverability, security, and long-term maintainability.
+
+---
+
+# 1. PRODUCT OBJECTIVE
+
+Build a complete pharmacy management system that allows a pharmacy to manage:
+
+- Medicines
+- Medicine categories
+- Manufacturers
+- Suppliers
+- Customers
+- Medicine units
+- Manually configured unit conversions
+- Batch-wise inventory
+- Purchase transactions
+- Purchase returns
+- Sales
+- Sales returns
+- Discounts
+- Customer dues
+- Supplier dues
+- Payments
+- Cash expenses
+- Cash management
+- Stock adjustments
+- Expiry management
+- Profit calculations
+- Reports
+- User accounts
+- User permissions
+- Individual user rules
+- System settings
+- Backups
+- License management
+
+The software must work without an internet connection during normal operation.
+
+---
+
+# 2. BUSINESS AND DEPLOYMENT MODEL
+
+## Commercial distribution
+
+The software will be sold to multiple independent pharmacies.
+
+Each pharmacy will receive its own installation.
+
+### Rules
+
+- One master codebase.
+- Separate installation for each pharmacy.
+- Separate local database for each pharmacy.
+- No shared database between customers.
+- No multi-branch functionality.
+- No cloud dependency for normal operations.
+- Pharmacy-specific configuration.
+- Pharmacy-specific logo and business information.
+- Pharmacy-specific users and permissions.
+- Pharmacy-specific license.
+
+The software must be designed so that future software updates can be distributed from the developer without overwriting customer data.
+
+---
+
+# 3. NON-NEGOTIABLE PRODUCT RULES
+
+These rules must never be violated:
+
+1. Never silently delete completed transactions.
+2. Never silently modify posted sales, purchases, payments, or financial records.
+3. Never change stock without a traceable stock movement.
+4. Never permit negative inventory unless explicitly approved as a future configurable feature. For the initial version, negative stock is prohibited.
+5. Never sell expired stock through the normal sales workflow.
+6. Never use current medicine cost to calculate the profit of historical sales.
+7. Never assume medicine packaging quantities.
+8. Never assume every strip contains the same number of tablets.
+9. Never assume every box contains the same number of strips.
+10. Never assume all medicines use the same unit conversion rules.
+11. Never hardcode Box → Strip → Tablet conversion.
+12. Never retroactively change historical stock or transactions when unit conversions are edited.
+13. Never automatically return customer-returned medicine to sellable stock without inspection and an explicit disposition.
+14. Never allow completed financial transactions to be deleted.
+15. Never overwrite the customer's database during software updates.
+16. Never treat an unverified backup as a successful backup.
+17. Never place the licensing private key inside the customer software.
+18. Never make customer data inaccessible because a license expires.
+19. Never enforce permissions only through frontend/UI hiding.
+20. Never perform critical transaction operations outside atomic database transactions.
+
+---
+
+# 4. TECHNOLOGY STACK
+
+Use the following stack unless a genuine technical limitation is demonstrated and approved.
+
+### Backend
+
+- Python 3.12+
+- Django 5.x
+- SQLite
+- Django ORM
+- Waitress WSGI server
+
+### Frontend
+
+- Django Templates
+- HTMX
+- Alpine.js
+- Tailwind CSS
+
+### Data processing
+
+- Decimal-based financial calculations
+- openpyxl for Excel import/export
+- PDF generation through a tested solution
+
+### Windows deployment
+
+- Windows 10/11
+- Windows installer
+- Inno Setup
+- Application launcher
+- Localhost-based application
+
+### Architecture
+
+Use a modular Django monolith.
+
+Do not introduce unnecessary:
+
+- Microservices
+- Redis
+- Celery
+- Cloud services
+- External APIs
+- Complex distributed systems
+
+The software is designed for a single local Windows computer and offline use.
+
+---
+
+# 5. APPLICATION ARCHITECTURE
+
+Organize the project into clean, maintainable Django applications.
+
+Suggested modules:
+
+- core
+- accounts
+- permissions
+- medicines
+- inventory
+- suppliers
+- purchases
+- sales
+- customers
+- finance
+- expenses
+- reports
+- settings
+- licensing
+- backup
+- audit
+
+Use clear separation between:
+
+- Models
+- Business logic
+- Services
+- Views
+- Forms
+- Selectors/query logic
+- Templates
+- Utilities
+- Validation
+- Reports
+
+Critical business operations must not be implemented directly inside complex views.
+
+Use dedicated service functions for operations such as:
+
+- Completing a sale
+- Receiving a purchase
+- Returning a sale
+- Returning a purchase
+- Recording payments
+- Reversing transactions
+- Adjusting inventory
+- Closing cash sessions
+- Generating backup files
+
+---
+
+# 6. MEDICINE MANAGEMENT
+
+Medicine records should support:
+
+- Medicine name
+- Generic name
+- Brand name
+- Strength
+- Dosage form
+- Manufacturer
+- Category
+- Medicine description
+- Base stock unit
+- Minimum stock level
+- Prescription-required flag
+- Active/inactive status
+- Notes
+- Created timestamp
+- Updated timestamp
+
+Medicine search should support:
+
+- Brand name
+- Generic name
+- Strength
+- Manufacturer
+- Category
+- Alternative names
+- Bangla names where entered
+
+The medicine master must not be used as a substitute for batch-level inventory.
+
+A medicine may have multiple batches with different:
+
+- Batch numbers
+- Expiry dates
+- Purchase costs
+- Selling prices
+- Suppliers
+- Received dates
+- Quantities
+
+---
+
+# 7. MANUAL UNIT & CONVERSION SYSTEM — CRITICAL REQUIREMENT
+
+## Do not make packaging assumptions.
+
+The pharmacy user must manually configure the units and conversion quantities for each medicine.
+
+The system must not assume:
+
+- Every tablet strip contains 10 tablets.
+- Every tablet strip contains 12 tablets.
+- Every box contains 10 strips.
+- Every box contains 20 strips.
+- Every bottle contains a fixed quantity.
+- Every medicine follows the same packaging structure.
+
+These values can vary by medicine, manufacturer, supplier, and product packaging.
+
+## 7.1 Manual unit creation
+
+Authorized users must be able to manually configure units for individual medicines.
+
+Examples of units:
+
+- Tablet
+- Capsule
+- Strip
+- Box
+- Bottle
+- Vial
+- Ampoule
+- Tube
+- Piece
+- Pack
+- Sachet
+- Millilitre
+- Gram
+
+The system must not assume that every medicine uses these units. Users must be able to add their required unit names.
+
+## 7.2 Medicine-specific conversion configuration
+
+Each medicine must have its own conversion configuration.
+
+Example A:
+
+Medicine A:
+
+- Base Unit: Tablet
+- 1 Strip = 10 Tablets
+- 1 Box = 100 Tablets
+
+Example B:
+
+Medicine B:
+
+- Base Unit: Tablet
+- 1 Strip = 12 Tablets
+- 1 Box = 60 Tablets
+
+Example C:
+
+Medicine C:
+
+- Base Unit: Capsule
+- 1 Strip = 6 Capsules
+- 1 Box = 48 Capsules
+
+These are examples only.
+
+The system must never hardcode these values.
+
+The authorized user manually enters the actual values during medicine setup or unit configuration.
+
+## 7.3 Conversion storage
+
+All inventory must be stored internally using a consistent base unit for each medicine.
+
+Every configured unit must have a manually defined conversion quantity to the base unit.
+
+Example:
+
+Medicine A:
+
+| Unit | Conversion to Base Unit |
+|---|---:|
+| Tablet | 1 |
+| Strip | 10 |
+| Box | 100 |
+
+Medicine B:
+
+| Unit | Conversion to Base Unit |
+|---|---:|
+| Tablet | 1 |
+| Strip | 12 |
+| Box | 60 |
+
+The system should store direct conversion values to the base unit instead of relying on a fragile conversion chain.
+
+For example:
+
+Do not depend on:
+
+Box → Strip → Tablet
+
+Instead, store:
+
+- Tablet = 1 base unit
+- Strip = 10 base units
+- Box = 100 base units
+
+The actual values must be entered manually by the user.
+
+## 7.4 Unit configuration interface
+
+The medicine setup interface must allow authorized users to:
+
+- Create a unit.
+- Rename a unit.
+- Define its conversion ratio.
+- Select the base unit.
+- Enable it for purchases.
+- Enable it for sales.
+- Disable an unused unit.
+- Configure multiple purchasing units.
+- Configure multiple selling units.
+- View conversion relationships clearly.
+
+Example UI:
+
+Medicine: Product A
+
+| Unit | Conversion | Purchase | Sale |
+|---|---:|---|---|
+| Tablet | 1 | No | Yes |
+| Strip | 10 | Yes | Yes |
+| Box | 100 | Yes | Yes |
+
+The user must be able to add, remove, edit, and configure units according to their permissions.
+
+## 7.5 Conversion validation
+
+Reject:
+
+- Zero conversion ratio
+- Negative conversion ratio
+- Invalid numeric values
+- Invalid unit relationships
+- Duplicate unit names for the same medicine where prohibited
+- Unsafe precision
+- Conversion configurations that could produce invalid stock calculations
+
+Use Decimal-based calculations.
+
+Do not use floating-point numbers for financial calculations or critical inventory conversion calculations.
+
+## 7.6 Historical conversion snapshots
+
+Whenever a purchase or sale is recorded, store the conversion ratio used at that time.
+
+For example:
+
+At the time of a purchase:
+
+1 Box = 100 Tablets
+
+Later, the pharmacy modifies the configuration:
+
+1 Box = 120 Tablets
+
+The previous purchase must still retain its original conversion value.
+
+Changing a conversion configuration must never silently modify:
+
+- Historical purchases
+- Historical sales
+- Historical stock movements
+- Previously calculated inventory quantities
+- Historical profit
+- Previously generated invoices
+
+Conversion changes must be controlled and audited.
+
+---
+
+# 8. INVENTORY MANAGEMENT
+
+## Batch-based inventory
+
+Inventory must be batch-based.
+
+Each batch must contain:
+
+- Medicine
+- Batch number
+- Expiry date
+- Supplier
+- Purchase reference
+- Received date
+- Purchase cost
+- Selling price
+- Initial stock
+- Current stock
+- Base unit
+- Status
+
+Batch statuses may include:
+
+- Active
+- Quarantined
+- Expired
+- Written Off
+- Inactive
+
+## Stock ledger
+
+Create an immutable StockMovement ledger.
+
+Movement types should include:
+
+- Opening Stock
+- Purchase Received
+- Sale
+- Sale Return
+- Purchase Return
+- Stock Adjustment In
+- Stock Adjustment Out
+- Damage Write-off
+- Expiry Write-off
+- Sale Reversal
+- Purchase Reversal
+
+Each stock movement should contain:
+
+- Medicine
+- Batch
+- Quantity change in base units
+- Movement type
+- Reference transaction
+- Reference transaction line
+- Cost snapshot
+- Reason
+- User
+- Timestamp
+
+The ledger is the authoritative source of inventory history.
+
+## Cached stock balance
+
+For performance, a batch may also maintain a cached current quantity.
+
+However:
+
+- Ledger remains authoritative.
+- Cache must be updated transactionally with movements.
+- Cache and ledger must be reconciled.
+- Reconciliation errors must be detectable.
+
+Never allow stock movements and cached quantities to diverge silently.
+
+## FEFO
+
+Implement:
+
+**First Expiry, First Out (FEFO).**
+
+When selling stock automatically:
+
+1. Select eligible batches.
+2. Exclude expired batches.
+3. Exclude quarantined batches.
+4. Exclude written-off batches.
+5. Sort by earliest expiry date.
+6. Allocate stock according to FEFO.
+7. Use subsequent batches only when required.
+
+Allow authorized manual batch override with a mandatory reason and audit log.
+
+---
+
+# 9. PURCHASE MANAGEMENT
+
+The purchase module must support:
+
+- Supplier selection
+- Purchase number
+- Supplier invoice number
+- Purchase date
+- Medicine selection
+- Batch number
+- Expiry date
+- Manually configured purchase unit
+- Purchase quantity
+- Conversion snapshot
+- Quantity in base units
+- Purchase cost
+- Discount
+- Line total
+- Overall total
+- Paid amount
+- Due amount
+- Payment method
+- Notes
+- Created by
+- Received by
+
+## Purchase workflow
+
+Initial workflow:
+
+Draft → Received
+
+Draft → Cancelled
+
+A received purchase must atomically:
+
+- Create purchase records
+- Create purchase lines
+- Create batches
+- Create stock movements
+- Update batch balances
+- Update supplier payable
+- Record payment
+- Update cash ledger when payment is cash
+- Create audit entries
+
+Do not partially execute a purchase transaction if a critical operation fails.
+
+Purchase receiving must be carefully validated before completion.
+
+---
+
+# 10. PURCHASE RETURNS
+
+Support purchase returns.
+
+A purchase return must:
+
+- Reference the original purchase or batch.
+- Identify the medicine and batch.
+- Validate the return quantity.
+- Prevent returning more than eligible stock.
+- Record the return reason.
+- Record supplier credit or refund.
+- Create stock movements.
+- Update supplier balances.
+- Record cash movements if a refund occurs.
+- Preserve original transactions.
+- Generate audit records.
+
+Supplier return eligibility must be configurable.
+
+Do not hardcode a universal supplier return period.
+
+---
+
+# 11. SALES / POS
+
+Create a fast, pharmacy-friendly Point of Sale interface.
+
+The interface should prioritize:
+
+- Fast medicine search
+- Keyboard navigation
+- Minimal unnecessary clicks
+- Large readable text
+- Clear stock availability
+- Batch and expiry visibility
+- Price visibility
+- Unit selection
+- Quantity entry
+- Discounts
+- Customer selection
+- Payment entry
+- Due calculation
+- Receipt generation
+
+## Sales workflow
+
+Draft → Completed
+
+Draft → Cancelled
+
+Completed sales must not be deleted.
+
+Corrections must use authorized reversals or returns.
+
+## Sales calculation
+
+For every sale:
+
+- Gross subtotal
+- Line discount
+- Invoice discount
+- Net sale
+- Paid amount
+- Due amount
+
+Calculate using Decimal.
+
+## Batch allocation
+
+Each SaleLine may be fulfilled by multiple batches.
+
+Create SaleBatchAllocation records.
+
+Each allocation must preserve:
+
+- Batch
+- Quantity
+- Cost per base unit at sale
+- Total COGS
+
+## Cost of goods sold
+
+Calculate COGS from the actual batch cost used for the sale.
+
+Do not calculate historical profit using the current medicine purchase cost.
+
+---
+
+# 12. SALES RETURNS
+
+Support:
+
+- Full returns
+- Partial returns
+- Multiple return transactions
+- Returns linked to original sales
+- Return quantity validation
+- Original batch tracking
+- Original cost preservation
+- Refunds
+- Customer credit
+- Stock disposition
+- Return reason
+- Audit trail
+
+Returned medicines must be inspected before stock disposition.
+
+Possible disposition:
+
+- Restock as sellable
+- Quarantine
+- Damaged
+- Write-off
+- Not restockable
+
+The system must never automatically treat every customer-returned medicine as sellable.
+
+Returned goods must preserve the original sale cost for correct COGS reversal.
+
+---
+
+# 13. CUSTOMER MANAGEMENT
+
+Customer information may include:
+
+- Customer name
+- Phone
+- Address
+- Customer ID
+- Opening balance
+- Credit limit
+- Notes
+- Active/inactive status
+
+Support:
+
+- Customer purchase history
+- Customer due
+- Partial payments
+- Multiple payments
+- Customer payment history
+- Customer balance
+- Credit adjustment
+- Customer statement
+
+Customer balances must not be edited directly without a traceable adjustment.
+
+---
+
+# 14. SUPPLIER MANAGEMENT
+
+Supplier information may include:
+
+- Supplier name
+- Contact person
+- Phone
+- Address
+- Opening balance
+- Return policy
+- Notes
+- Active/inactive status
+
+Support:
+
+- Supplier purchase history
+- Supplier due
+- Supplier payment history
+- Supplier returns
+- Supplier credit
+- Supplier statement
+
+Supplier balances must be transaction-based.
+
+---
+
+# 15. PAYMENT MANAGEMENT
+
+Payments must be manually entered by authorized users.
+
+The software must not depend on:
+
+- Online payment gateways
+- Automatic banking integrations
+- Automatic MFS APIs
+- Internet connectivity
+
+Payment methods may include:
+
+- Cash
+- bKash
+- Nagad
+- Rocket
+- Bank
+- Card
+- Other
+
+The payment method is selected and recorded manually.
+
+Support:
+
+- Full payment
+- Partial payment
+- Multiple payments
+- Payment allocation
+- Customer payment
+- Supplier payment
+- Payment reference
+- Transaction number
+- Notes
+- Payment reversal
+
+Payment allocations must be validated.
+
+Payments must not be silently deleted or edited after posting.
+
+Corrections must use reversal and replacement entries.
+
+---
+
+# 16. FINANCE & CASH MANAGEMENT
+
+The initial version does not require a complex enterprise accounting system.
+
+Implement a reliable transaction-based financial system.
+
+Track:
+
+- Sales
+- Sales returns
+- Purchases
+- Purchase returns
+- Customer payments
+- Supplier payments
+- Customer dues
+- Supplier dues
+- Expenses
+- Cash movements
+- Cash opening
+- Cash closing
+- Cash adjustments
+
+## Cash ledger
+
+Maintain a traceable cash ledger.
+
+Cash movements may include:
+
+- Opening cash
+- Cash sale
+- Customer cash collection
+- Supplier cash payment
+- Cash expense
+- Cash refund
+- Cash adjustment
+- Cash variance
+
+Only actual cash movements should affect physical cash balance.
+
+Example:
+
+A customer pays:
+
+- Cash: ৳500
+- bKash: ৳500
+
+Total payment = ৳1,000
+
+Physical cash increases by only ৳500.
+
+MFS, bank, and card payments must not incorrectly increase the physical cash drawer.
+
+---
+
+# 17. CASH SESSION MANAGEMENT
+
+Support manual cash opening and closing.
+
+Cash session:
+
+Open → Closed
+
+Fields:
+
+- Session ID
+- Opening date/time
+- Opening user
+- Opening cash
+- Closing date/time
+- Closing user
+- Expected cash
+- Actual cash
+- Cash variance
+- Notes
+- Status
+
+## Expected cash calculation
+
+Expected cash:
+
+Opening Cash  
++ Cash Received  
+− Cash Paid  
++/- Cash Adjustments
+
+## Closing
+
+Actual cash must be physically counted and manually entered.
+
+Variance:
+
+Actual Cash − Expected Cash
+
+When variance exists:
+
+- Record variance.
+- Require reason.
+- Generate a cash adjustment movement.
+- Preserve the original expected balance.
+- Preserve the actual counted amount.
+- Preserve the user and timestamp.
+
+Do not silently correct the cash ledger.
+
+Forgotten sessions must not be overwritten.
+
+Admin may force-close a session with a mandatory reason and audit trail.
+
+---
+
+# 18. EXPENSE MANAGEMENT
+
+Support:
+
+- Expense categories
+- Expense name
+- Amount
+- Date
+- Payment method
+- Reference
+- Notes
+- Created by
+- Status
+
+Cash expenses affect physical cash.
+
+Non-cash expenses do not affect physical cash.
+
+Completed expenses must be corrected through reversal, not silent deletion.
+
+---
+
+# 19. STOCK ADJUSTMENT
+
+Support:
+
+- Stock count
+- Expected quantity
+- Actual quantity
+- Variance
+- Adjustment reason
+- User
+- Date
+- Approval when required
+
+Adjustment types:
+
+- Stock increase
+- Stock decrease
+- Damage
+- Missing stock
+- Expiry
+- Incorrect opening stock
+- Reconciliation correction
+
+All adjustments must create stock movements.
+
+Never directly edit a batch quantity without a ledger movement.
+
+---
+
+# 20. EXPIRY MANAGEMENT
+
+Implement:
+
+- Expired stock report
+- Near-expiry stock report
+- Configurable expiry warning periods
+- Batch-wise expiry monitoring
+- Quarantine
+- Write-off
+- Expiry adjustment
+- Expiry notification
+
+Expired medicines must not be available for normal sales.
+
+Expired stock must remain visible in reports and inventory history.
+
+---
+
+# 21. USER MANAGEMENT & PERMISSIONS
+
+The software must support multiple users within one pharmacy.
+
+Admin can:
+
+- Add users
+- Edit users
+- Deactivate users
+- Reactivate users
+- Assign roles
+- Create roles
+- Edit roles
+- Configure permissions
+- Create global permission rules
+- Edit global rules
+- Configure individual permission overrides
+- Reset passwords
+- Review user activity
+
+Users can edit their own profile.
+
+## User profile editing
+
+Users may edit:
+
+- Name
+- Profile photo, if enabled
+- Phone
+- Email
+- Password
+- Personal preferences
+
+Users cannot modify their own:
+
+- Role
+- Permissions
+- Account status
+- Administrative access
+- Security restrictions
+
+## Global permission rules
+
+Admin can configure default permissions for users or roles.
+
+## Individual overrides
+
+Admin can override specific permissions for an individual user.
+
+Permission precedence must be deterministic and documented.
+
+Suggested logic:
+
+1. Inactive account → Deny
+2. Super Admin → Full authorized administrative access
+3. Explicit individual permission override → Apply override
+4. Otherwise → Apply global/role permission
+
+Permission changes should take effect without requiring application restart.
+
+Backend enforcement is mandatory.
+
+---
+
+# 22. AUDIT LOG
+
+Maintain audit logs for critical operations.
+
+Record:
+
+- User
+- Action
+- Module
+- Target record
+- Record ID
+- Timestamp
+- Before state
+- After state
+- Reason
+- Transaction reference
+
+Audit:
+
+- Sales
+- Purchases
+- Returns
+- Payments
+- Stock movements
+- Stock adjustments
+- Expenses
+- User changes
+- Permission changes
+- Settings changes
+- License events
+- Backup events
+- Cash closing
+- Transaction reversals
+
+Audit records must not be editable or deletable through normal application functionality.
+
+Consider hash-chain integrity verification, but do not falsely claim that a local database hash chain provides complete tamper-proof protection.
+
+---
+
+# 23. REPORTS
+
+Create a report module with filters.
+
+## Sales reports
+
+- Daily sales
+- Monthly sales
+- Sales by medicine
+- Sales by category
+- Sales by user
+- Sales by customer
+- Discount reports
+- Sales return reports
+
+## Purchase reports
+
+- Daily purchases
+- Monthly purchases
+- Supplier-wise purchases
+- Medicine-wise purchases
+- Purchase return reports
+
+## Inventory reports
+
+- Current stock
+- Batch-wise stock
+- Stock movement
+- Stock adjustment
+- Low stock
+- Expired stock
+- Near-expiry stock
+- Stock valuation
+- Fast-moving medicines
+- Slow-moving medicines
+- Dead stock
+
+## Financial reports
+
+- Daily collection
+- Monthly collection
+- Cash collection
+- MFS collection
+- Bank collection
+- Customer due
+- Supplier due
+- Expense report
+- Cash ledger
+- Cash closing
+- Cash variance
+
+## Profit reports
+
+- Gross sales
+- Discount
+- Net sales
+- COGS
+- Sales return COGS reversal
+- Gross profit
+
+Historical profit must use historical batch cost.
+
+## Customer reports
+
+- Customer statement
+- Customer purchases
+- Customer payment
+- Customer due
+
+## Supplier reports
+
+- Supplier statement
+- Supplier purchases
+- Supplier payments
+- Supplier returns
+- Supplier due
+
+Support:
+
+- Date filters
+- Medicine filters
+- Category filters
+- Supplier filters
+- Customer filters
+- User filters
+- PDF export
+- Excel export
+
+---
+
+# 24. TRANSACTION DATA INTEGRITY
+
+Critical operations must use atomic database transactions.
+
+Examples:
+
+## Completing a sale
+
+One atomic operation must:
+
+- Validate sale
+- Validate stock
+- Validate batch expiry
+- Validate permissions
+- Allocate batches
+- Create Sale
+- Create SaleLines
+- Create batch allocations
+- Create stock movements
+- Update cached batch balances
+- Record payment
+- Record payment allocation
+- Update customer due
+- Update cash ledger when applicable
+- Calculate COGS
+- Record audit log
+
+If any critical operation fails, rollback the entire operation.
+
+## Receiving a purchase
+
+One atomic operation must:
+
+- Validate purchase
+- Create purchase
+- Create purchase lines
+- Create batches
+- Create stock movements
+- Update stock cache
+- Record supplier payable
+- Record payment
+- Update cash ledger when applicable
+- Record audit log
+
+---
+
+# 25. TRANSACTION REVERSAL
+
+Completed transactions must not be deleted.
+
+Implement controlled reversal workflows.
+
+Reversal must:
+
+- Reference original transaction
+- Preserve original transaction
+- Require authorization
+- Require reason
+- Create compensating records
+- Reverse stock effects appropriately
+- Reverse financial effects appropriately
+- Preserve historical COGS
+- Update cash or customer/supplier balance correctly
+- Record audit trail
+
+Do not treat reversal as deleting the original transaction.
+
+---
+
+# 26. DATABASE DESIGN
+
+Use UUID primary keys for internal entities where appropriate.
+
+Use human-readable unique transaction numbers for:
+
+- Sales invoices
+- Purchases
+- Returns
+- Payments
+- Stock adjustments
+- Cash sessions
+
+Use appropriate:
+
+- Foreign keys
+- Unique constraints
+- Database indexes
+- Validation
+- Check constraints where supported
+- Protected relationships
+- Transaction atomicity
+
+Recommended data types:
+
+- Money: Decimal
+- Inventory quantity: Decimal
+- Unit conversion: Decimal
+- Percentage: Decimal
+
+Do not use floating-point values for money.
+
+SQLite does not enforce Decimal precision and scale in the same manner as PostgreSQL. Therefore, implement strict service-level validation and database safeguards where possible.
+
+---
+
+# 27. BACKUP & RESTORE
+
+Backup is a critical feature.
+
+Support:
+
+- Automatic daily backups
+- Manual backups
+- Pre-update backups
+- Backup history
+- Backup status
+- Backup location configuration
+- Retention policy
+- Integrity verification
+- Restore procedure
+
+Use a SQLite-safe backup strategy.
+
+Do not simply copy an actively used database file when WAL mode is enabled.
+
+Use a safe SQLite backup API or a properly coordinated backup method.
+
+Every backup should be verified.
+
+Support integrity verification through SQLite integrity checks.
+
+The system must provide clear backup failure warnings.
+
+Backup data must be stored outside the application installation directory.
+
+The uninstall process must not automatically delete pharmacy data.
+
+---
+
+# 28. DATABASE RECOVERY
+
+The system must provide a recovery strategy for:
+
+- Application crashes
+- Windows shutdown
+- Power failure
+- Database corruption
+- Failed software updates
+- Failed migrations
+
+Before major updates:
+
+1. Create a verified backup.
+2. Apply migration.
+3. Verify database integrity.
+4. Verify critical data.
+5. Report success or failure.
+
+If update fails:
+
+- Preserve original customer data.
+- Do not overwrite the database with an empty database.
+- Provide a documented recovery procedure.
+
+Restoration should be restricted to authorized technical personnel.
+
+---
+
+# 29. WINDOWS APPLICATION EXPERIENCE
+
+The pharmacy staff must not need:
+
+- Python
+- Command Prompt
+- PowerShell
+- Django commands
+- Database administration
+- Programming knowledge
+
+The installation must provide:
+
+- Installer
+- Application shortcut
+- Application launcher
+- Local application startup
+- Browser or desktop window
+- Application shutdown
+- Update process
+
+The application should run only on:
+
+127.0.0.1
+
+Do not expose the application to the local network by default.
+
+Test the packaging approach in a real Windows environment.
+
+Compare:
+
+- PyInstaller-based application
+- Local browser launcher
+- PyWebView wrapper
+
+Choose the approach that demonstrates reliable:
+
+- Installation
+- Startup
+- Shutdown
+- Printing
+- Updates
+- Database preservation
+- Recovery
+
+Do not select packaging technology based on theoretical preference alone.
+
+---
+
+# 30. DATA DIRECTORY
+
+Customer data must be separate from application files.
+
+Possible structure:
+
+Application:
+
+Program Files or protected application directory
+
+Customer data:
+
+- Database
+- Backups
+- Logs
+- Pharmacy logo
+- License
+- Configuration
+- Imported files
+- Export files
+
+Software updates must never overwrite customer data.
+
+Uninstallation should preserve customer data by default.
+
+---
+
+# 31. LICENSING SYSTEM
+
+Implement offline licensing.
+
+The developer will use a separate License Manager utility to generate license files.
+
+The customer application must not contain the private signing key.
+
+Use asymmetric digital signatures, such as Ed25519.
+
+License information may contain:
+
+- License ID
+- Customer ID
+- Pharmacy name
+- License type
+- Issue date
+- Expiry date
+- Device binding information
+- License status
+
+License types may include:
+
+- Trial
+- Lifetime
+- Time-limited
+
+License validation must work offline.
+
+License expiration must not make customer data inaccessible.
+
+Restricted mode should preserve:
+
+- Historical records
+- Read-only data access
+- Data export
+- Invoice reprinting
+
+Offline licensing is a deterrence mechanism, not an unbreakable DRM system.
+
+Provide an understandable license recovery procedure.
+
+Do not lock customers out of their own data.
+
+---
+
+# 32. SETUP WIZARD
+
+Create a first-run setup wizard.
+
+Suggested steps:
+
+1. Pharmacy Information
+2. Pharmacy Logo
+3. Admin Account
+4. System Preferences
+5. Medicine Units
+6. Opening Cash
+7. Medicine Import
+8. Opening Stock
+9. Opening Customer Balances
+10. Opening Supplier Balances
+11. Staff Accounts
+12. Printer Configuration
+13. Backup Configuration
+14. Finish Setup
+
+Opening balances must be handled through controlled opening transactions.
+
+After initial setup, opening balances should be protected from silent modification.
+
+Corrections must use controlled adjustments.
+
+---
+
+# 33. EXCEL IMPORT
+
+Support medicine and stock import.
+
+Import process:
+
+1. Download sample template.
+2. Upload Excel file.
+3. Validate rows.
+4. Show preview.
+5. Detect duplicate medicines.
+6. Detect invalid unit conversions.
+7. Detect invalid quantities.
+8. Detect invalid batches.
+9. Show errors.
+10. Allow user to correct data.
+11. Confirm import.
+12. Execute transaction safely.
+
+Never silently overwrite existing medicine or stock data.
+
+Duplicate handling options:
+
+- Skip
+- Use existing medicine
+- Create new medicine
+
+Do not silently merge medicines.
+
+---
+
+# 34. PDF & PRINTING
+
+Support:
+
+- A4 invoices
+- Thermal receipts
+- Standard printers
+- Pharmacy logo
+- Pharmacy details
+- Medicine details
+- Batch information where appropriate
+- Quantity and unit
+- Price
+- Discount
+- Total
+- Paid
+- Due
+- Date/time
+- Invoice number
+
+Bangla and English rendering must be tested.
+
+Do not assume Bangla fonts will render correctly in PDF.
+
+Test:
+
+- Bangla text
+- English text
+- Unicode
+- Thermal printer
+- A4 printer
+- Long medicine names
+- Large invoices
+- Receipt reprinting
+
+If necessary, test alternative PDF rendering strategies, including bitmap rendering for reliable Bangla thermal printing.
+
+---
+
+# 35. SECURITY
+
+Implement:
+
+- Authentication
+- Secure password storage
+- Password reset by authorized admin
+- CSRF protection
+- Permission validation
+- Backend permission enforcement
+- Input validation
+- File upload validation
+- Secure file handling
+- Localhost-only binding
+- Session security
+- Audit logging
+- Protection against unauthorized transaction modification
+
+Do not rely on UI restrictions alone.
+
+Do not expose sensitive database or system paths unnecessarily.
+
+---
+
+# 36. PERFORMANCE
+
+The software must remain responsive on ordinary pharmacy computers.
+
+Optimize:
+
+- Medicine search
+- POS
+- Stock queries
+- Reports
+- Batch allocation
+- Database indexes
+
+Do not load the entire inventory unnecessarily.
+
+Use pagination where appropriate.
+
+Use efficient query patterns and avoid unnecessary N+1 queries.
+
+---
+
+# 37. TESTING REQUIREMENTS
+
+Write automated tests for all critical business logic.
+
+At minimum, test:
+
+### Sales
+
+- Cash sale
+- MFS sale
+- Split payment
+- Credit sale
+- Partial payment
+- Discount
+- Multiple batches
+- FEFO
+- Manual batch override
+- Insufficient stock
+- Expired stock
+- Quarantined stock
+- Duplicate sale submission
+- Failed transaction rollback
+
+### Units and conversion
+
+- Manual unit creation
+- Medicine-specific conversion
+- Different strip quantities
+- Different box quantities
+- Conversion change
+- Historical conversion preservation
+- Purchase conversion
+- Sale conversion
+- Invalid conversion
+- Fractional quantity handling
+- Precision validation
+
+### Purchases
+
+- Purchase receiving
+- Paid purchase
+- Partial payment
+- Unpaid purchase
+- Supplier due
+- Purchase return
+- Purchase reversal
+
+### Sales returns
+
+- Partial return
+- Full return
+- Multiple returns
+- Return quantity validation
+- Sellable return
+- Quarantine return
+- Damaged return
+- COGS reversal
+- Refund
+- Customer credit
+
+### Cash
+
+- Opening cash
+- Cash sale
+- Cash payment
+- MFS payment
+- Expense
+- Supplier payment
+- Closing cash
+- Variance
+- Force closing
+- Forgotten session
+
+### Inventory
+
+- Stock movement
+- Stock adjustment
+- Expiry
+- Damage
+- Write-off
+- Reconciliation
+- Negative stock prevention
+- Cache and ledger reconciliation
+
+### System
+
+- Backup
+- Backup verification
+- Restore
+- Database integrity
+- Update
+- Failed migration recovery
+- License validation
+- License expiry
+- Data export
+
+---
+
+# 38. DEVELOPMENT WORKFLOW
+
+Do not immediately start coding the entire application in one uncontrolled process.
+
+Follow a disciplined development workflow.
+
+## Phase 0 — Specification
+
+Finalize:
+
+- Database schema
+- Model relationships
+- Unit and conversion architecture
+- Transaction workflows
+- Stock ledger
+- Financial architecture
+- Permissions
+- Audit log
+- Cash management
+- Backup architecture
+- License architecture
+
+Do not silently alter approved requirements.
+
+If a requirement is technically unsafe or contradictory:
+
+1. Identify the problem.
+2. Explain the consequences.
+3. Propose a better approach.
+4. Wait for approval when the change materially alters business behavior.
+
+## Phase 1 — Project foundation
+
+Build:
+
+- Django project
+- App structure
+- Settings
+- Database
+- Authentication
+- Base layout
+- Navigation
+- Logging
+- Error handling
+- Local application startup
+
+## Phase 2 — Core medicine and inventory
+
+Build:
+
+- Medicine master
+- Categories
+- Manufacturers
+- Manual units
+- Medicine-specific conversion
+- Suppliers
+- Batches
+- Stock movement ledger
+- Stock balance cache
+- Stock reconciliation
+
+## Phase 3 — Purchasing
+
+Build:
+
+- Purchase draft
+- Purchase receiving
+- Batch creation
+- Purchase payments
+- Supplier dues
+- Purchase returns
+
+## Phase 4 — POS & sales
+
+Build:
+
+- Medicine search
+- POS
+- Unit selection
+- Quantity conversion
+- Batch allocation
+- FEFO
+- Payment
+- Cash ledger
+- Customer dues
+- Invoice
+
+## Phase 5 — Returns & finance
+
+Build:
+
+- Sales returns
+- Purchase returns
+- Payment allocation
+- Reversals
+- Expenses
+- Cash sessions
+- Cash closing
+
+## Phase 6 — Reports
+
+Build:
+
+- Sales
+- Purchases
+- Inventory
+- Expiry
+- Profit
+- Cash
+- Customer
+- Supplier
+
+## Phase 7 — Administration
+
+Build:
+
+- Users
+- Roles
+- Permissions
+- Individual overrides
+- Settings
+- Audit logs
+- Backup
+- Restore
+- License management integration
+
+## Phase 8 — Windows packaging
+
+Build:
+
+- Application launcher
+- Windows installer
+- Application startup
+- Application shutdown
+- Update system
+- Data preservation
+- Backup-before-update
+- Recovery procedure
+
+## Phase 9 — Testing
+
+Test the application using realistic pharmacy workflows.
+
+Do not release the application based solely on successful page rendering.
+
+Test data integrity, transaction atomicity, stock accuracy, financial accuracy, recovery, printing, and Windows installation.
+
+---
+
+# 39. DEVELOPMENT RULES FOR AI CODING AGENTS
+
+You must follow these instructions:
+
+- Read and understand the existing project before modifying it.
+- Do not overwrite existing code without inspection.
+- Do not create unnecessary duplicate models.
+- Do not generate placeholder business logic for critical modules.
+- Do not leave critical features as TODOs.
+- Do not use mock transactions in the production implementation.
+- Do not skip validation.
+- Do not bypass Django authentication.
+- Do not implement permission checks only in the frontend.
+- Do not hardcode medicine packaging.
+- Do not hardcode conversion quantities.
+- Do not assume every medicine is sold in tablets.
+- Do not assume every box contains the same number of units.
+- Do not assume every strip contains the same number of units.
+- Do not use float for money.
+- Do not silently alter historical transactions.
+- Do not directly modify stock balances without stock movements.
+- Do not ignore failed database transactions.
+- Do not hide errors that could affect data integrity.
+
+Write clean, maintainable, documented code.
+
+Use reusable services.
+
+Add appropriate tests.
+
+Use migrations correctly.
+
+Make business rules explicit.
+
+---
+
+# 40. IMPLEMENTATION RESPONSE FORMAT
+
+For each development phase, provide:
+
+1. Objective
+2. Architecture decisions
+3. Files to create
+4. Files to modify
+5. Database changes
+6. Implementation
+7. Validation rules
+8. Security considerations
+9. Tests
+10. Test results
+11. Known limitations
+12. Next phase
+
+Do not claim that a feature works unless it has actually been implemented and tested.
+
+Do not claim a test passed unless it was executed.
+
+If something cannot be tested in the current environment, state that clearly.
+
+---
+
+# 41. FINAL PRODUCT QUALITY STANDARD
+
+The final product must be:
+
+- Offline-first
+- Windows-friendly
+- Easy to install
+- Easy to use
+- Fast
+- Secure
+- Financially accurate
+- Inventory accurate
+- Batch-aware
+- Expiry-aware
+- Conversion-aware
+- Auditable
+- Recoverable
+- Maintainable
+- Commercially deployable
+
+The highest priority is not adding the largest number of features.
+
+The highest priority is:
+
+**Correct transactions + accurate stock + accurate cash + accurate profit + safe data + reliable recovery.**
+
+---
+
+# FINAL INSTRUCTION
+
+Treat this document as the master project specification.
+
+Before implementation, inspect the existing project and identify its current state.
+
+Do not repeatedly redesign the architecture without evidence.
+
+Do not change the approved scope silently.
+
+If you discover a serious flaw, explain it objectively and propose a technically sound correction.
+
+Start by preparing the Phase 0 implementation documents and then proceed systematically through the development phases.
+
+Build this as a serious, commercially usable pharmacy management product—not a prototype.
