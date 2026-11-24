@@ -17,6 +17,3 @@ data/
 backups/
 *.backup
 *.bak
-license_private.pem
-private_key.pem
-tools/.dev_keys/

@@ -41,10 +41,9 @@ interface PaymentEntry {
 interface Props {
   user: AuthUser;
   settings: PharmacySettings;
-  writable: boolean;
 }
 
-export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
+export const PosPage: React.FC<Props> = ({ user, settings }) => {
   const [search, setSearch] = useState('');
   const [medicines, setMedicines] = useState<Medicine[]>([]);
   const [customers, setCustomers] = useState<CustomerOption[]>([]);
@@ -211,10 +210,6 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
 
   async function handleCheckout(e: React.FormEvent) {
     e.preventDefault();
-    if (!writable) {
-      setError('License is in Read-Only mode. Sales cannot be posted.');
-      return;
-    }
 
     // Strict client-side decimal checks before posting
     for (const l of cart) {
@@ -714,7 +709,7 @@ export const PosPage: React.FC<Props> = ({ user, settings, writable }) => {
             </button>
             <button
               type="submit"
-              disabled={submitting || cart.length === 0 || !writable}
+              disabled={submitting || cart.length === 0}
               className="px-6 py-2.5 text-sm font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
             >
               {submitting ? 'Processing Atomic Sale...' : 'Complete Sale & Print'}

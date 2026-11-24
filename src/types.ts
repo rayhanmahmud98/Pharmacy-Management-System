@@ -31,23 +31,7 @@ export interface PharmacySettings {
   expiry_warning_days: number;
   backup_retention_count: number;
   printer_type: 'A5' | 'THERMAL_80MM' | 'A4';
-  setup_completed: number;
-}
-
-export interface LicenseStatus {
-  status: 'ACTIVE' | 'EXPIRED_READONLY' | 'INVALID_READONLY' | 'UNLICENSED_READONLY';
-  writable: boolean;
-  message: string;
-  deviceFingerprint: string;
-  payload: {
-    licenseId: string;
-    customerId: string;
-    pharmacyName: string;
-    licenseType: 'TRIAL' | 'TIME_LIMITED' | 'LIFETIME';
-    issueDate: string;
-    expiryDate: string | null;
-    deviceFingerprint: string;
-  } | null;
+  setup_completed: boolean | number;
 }
 
 export interface MedicineUnit {
@@ -55,10 +39,10 @@ export interface MedicineUnit {
   medicine_id: string;
   unit_name: string;
   conversion_to_base: string;
-  is_base: number;
-  allow_purchase: number;
-  allow_sale: number;
-  is_active: number;
+  is_base: boolean | number;
+  allow_purchase: boolean | number;
+  allow_sale: boolean | number;
+  is_active: boolean | number;
 }
 
 export interface Batch {
@@ -101,8 +85,8 @@ export interface Medicine {
   description: string;
   base_unit_name: string;
   min_stock_level: string;
-  rx_required: number;
-  is_active: number;
+  rx_required: boolean | number;
+  is_active: boolean | number;
   notes: string;
   sellable_stock_base: number;
   total_physical_base: number;
@@ -137,7 +121,7 @@ export interface SaleLineDetail {
     qty_base: string;
     cost_per_base_snapshot: string;
     cogs_total: string;
-    is_manual_override: number;
+    is_manual_override: boolean | number;
     override_reason: string;
   }>;
 }

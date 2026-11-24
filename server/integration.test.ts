@@ -6,36 +6,69 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
 import cookieParser from 'cookie-parser';
+import pg from 'pg';
 import * as XLSX from 'xlsx';
 
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'medinest-test-'));
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'medinest-pg-test-'));
 process.env.PHARMACY_DATA_DIR = tmpDir;
 process.env.NODE_ENV = 'test';
 
-const testLicenseKeys = crypto.generateKeyPairSync('ed25519');
-const testPubPem = testLicenseKeys.publicKey.export({ type: 'spki', format: 'pem' }).toString();
-process.env.MEDINEST_TEST_LICENSE_PUBKEY_PEM = testPubPem;
+// Create an isolated ephemeral PostgreSQL database for this test suite
+delete process.env.DATABASE_URL;
+const basePgHost = process.env.PGHOST || '127.0.0.1';
+const basePgPort = Number(process.env.PGPORT || 5432);
+const basePgUser = process.env.PGUSER || 'postgres';
+const basePgPassword = process.env.PGPASSWORD ?? '';
+const testDbName = `medinest_test_${process.pid}_${Date.now()}`;
+const migTestDbName = `medinest_mig_${process.pid}_${Date.now()}`;
 
-const { getDb, closeDb, generateDocNumber, withTransaction } = await import('./db.ts');
+async function withAdminPgClient<T>(fn: (client: pg.Client) => Promise<T>): Promise<T> {
+  const client = new pg.Client({
+    host: basePgHost,
+    port: basePgPort,
+    database: 'postgres',
+    user: basePgUser,
+    password: basePgPassword,
+  });
+  await client.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.end();
+  }
+}
+
+await withAdminPgClient(async (client) => {
+  await client.query(`DROP DATABASE IF EXISTS "${testDbName}" WITH (FORCE)`);
+  await client.query(`CREATE DATABASE "${testDbName}"`);
+});
+
+process.env.PGDATABASE = testDbName;
+
+const {
+  getDb,
+  closeDb,
+  generateDocNumber,
+  withTransaction,
+} = await import('./db.ts');
 const { seedDatabaseIfEmpty } = await import('./seed.ts');
 const {
   resolveSessionMiddleware,
   checkLoginRateLimit,
   clearLoginAttempts,
   getUserEffectivePermissions,
+  hashPassword,
   loadAuthUserById,
   recordFailedLoginAttempt,
 } = await import('./auth.ts');
 const { verifyAuditChain } = await import('./audit.ts');
 const {
-  getCurrentLicenseStatus,
-  installLicenseFile,
-  verifySignedLicense,
-  canonicalLicensePayload,
-} = await import('./licensing.ts');
-const { listMedicines, upsertMedicineUnit, changeBatchStatus, reconcileInventoryLedger } = await import(
-  './services/inventoryService.ts'
-);
+  listMedicines,
+  createMedicine,
+  upsertMedicineUnit,
+  changeBatchStatus,
+  reconcileInventoryLedger,
+} = await import('./services/inventoryService.ts');
 const {
   createPurchase,
   createPurchaseReturn,
@@ -47,6 +80,7 @@ const {
   createExpense,
   getActiveCashSessionId,
   getCashSessionSummary,
+  openCashSession,
   recordPartyPayment,
   reversePayment,
 } = await import('./services/financeService.ts');
@@ -58,113 +92,57 @@ const {
 } = await import('./services/backupService.ts');
 const { getComprehensiveReport } = await import('./services/reportService.ts');
 const { buildApiRouter } = await import('./routes.ts');
+const { migrateSqliteToPostgres } = await import('../tools/migrate_sqlite_to_pg.ts');
 
-function signTestLicense(payload: {
-  licenseId: string;
-  customerId: string;
-  pharmacyName: string;
-  licenseType: 'TRIAL' | 'TIME_LIMITED' | 'LIFETIME';
-  issueDate: string;
-  expiryDate: string | null;
-  deviceFingerprint: string;
-}) {
-  const signatureBase64 = crypto
-    .sign(null, Buffer.from(canonicalLicensePayload(payload), 'utf8'), testLicenseKeys.privateKey)
-    .toString('base64');
-  return { payload, signatureBase64 };
-}
-
-test.after(() => {
-  closeDb();
+test.after(async () => {
+  await closeDb();
+  await withAdminPgClient(async (client) => {
+    await client.query(`DROP DATABASE IF EXISTS "${testDbName}" WITH (FORCE)`);
+    await client.query(`DROP DATABASE IF EXISTS "${migTestDbName}" WITH (FORCE)`);
+  });
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test('licensing starts UNLICENSED_READONLY on clean seed, rejects invalid/expired installs, and activates only on valid Ed25519 signature', () => {
-  const db = getDb();
-  seedDatabaseIfEmpty();
+test('clean PostgreSQL seed boots license-free, excludes license_state/admin.license, preserves drug_license_no, and keeps must_change_password', async () => {
+  const db = await getDb();
+  await seedDatabaseIfEmpty();
 
-  // Issue 3: seed must NOT create license.json or license_public.pem
   assert.equal(fs.existsSync(path.join(tmpDir, 'license.json')), false);
   assert.equal(fs.existsSync(path.join(tmpDir, 'license_public.pem')), false);
+  assert.equal(fs.existsSync(path.join(tmpDir, '.license_clock_state.json')), false);
+  assert.equal(fs.existsSync(path.join(tmpDir, '.device_installation_id')), false);
 
-  const initial = getCurrentLicenseStatus();
-  assert.equal(initial.status, 'UNLICENSED_READONLY');
-  assert.equal(initial.writable, false);
+  const licTable = await db.queryOne("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'license_state'");
+  assert.equal(licTable, undefined);
 
-  // Tampered signature must fail
-  const validPayload = {
-    licenseId: 'LIC-TEST-ACTIVE',
-    customerId: 'CUST-TEST',
-    pharmacyName: 'MediNest Test Pharmacy',
-    licenseType: 'LIFETIME' as const,
-    issueDate: '2026-01-01',
-    expiryDate: null,
-    deviceFingerprint: '*',
-  };
-  const validSigned = signTestLicense(validPayload);
-  assert.throws(
-    () =>
-      installLicenseFile({
-        payload: { ...validPayload, pharmacyName: 'Tampered Pharmacy' },
-        signatureBase64: validSigned.signatureBase64,
-      }),
-    /Invalid license|signature/i
+  const licPerm = await db.queryOne("SELECT code FROM permissions WHERE code = 'admin.license'");
+  assert.equal(licPerm, undefined);
+
+  const settings = await db.queryOne<{ pharmacy_name: string; drug_license_no: string }>(
+    'SELECT pharmacy_name, drug_license_no FROM pharmacy_settings WHERE id = 1'
   );
+  assert.ok(settings && settings.pharmacy_name.length > 0);
+  assert.ok(settings && settings.drug_license_no.length > 0);
 
-  // Expired license must NOT be persisted as writable
-  const expiredSigned = signTestLicense({
-    ...validPayload,
-    licenseId: 'LIC-TEST-EXP',
-    licenseType: 'TIME_LIMITED',
-    issueDate: '2020-01-01',
-    expiryDate: '2021-01-01',
-  });
-  assert.throws(() => installLicenseFile(expiredSigned), /expired/i);
-  assert.equal(getCurrentLicenseStatus().writable, false);
-
-  // Even an arbitrary public key placed on disk must be ignored
-  const rogueKeys = crypto.generateKeyPairSync('ed25519');
-  fs.writeFileSync(
-    path.join(tmpDir, 'license_public.pem'),
-    rogueKeys.publicKey.export({ type: 'spki', format: 'pem' }).toString(),
-    'utf8'
+  const adminFlag = await db.queryOne<{ must_change_password: boolean }>(
+    "SELECT must_change_password FROM users WHERE username = 'admin'"
   );
-  const rogueSig = crypto
-    .sign(null, Buffer.from(canonicalLicensePayload(validPayload), 'utf8'), rogueKeys.privateKey)
-    .toString('base64');
-  assert.throws(
-    () => installLicenseFile({ payload: validPayload, signatureBase64: rogueSig }),
-    /signature verification failed/i
-  );
-  fs.unlinkSync(path.join(tmpDir, 'license_public.pem'));
-
-  // Valid vendor-signed license activates write operations
-  const activated = installLicenseFile(validSigned);
-  assert.equal(activated.status, 'ACTIVE');
-  assert.equal(activated.writable, true);
-
-  // Seeded accounts start with must_change_password = 1 (Issue 2)
-  const adminFlag = db.prepare("SELECT must_change_password FROM users WHERE username = 'admin'").get() as {
-    must_change_password: number;
-  };
-  assert.equal(adminFlag.must_change_password, 1);
+  assert.equal(adminFlag?.must_change_password, true);
 });
 
-test('full pharmacy end-to-end transaction integrity, FEFO, intra-invoice batch deduction, returns, and backup', async () => {
-  const db = getDb();
+test('full pharmacy end-to-end transaction integrity, FEFO, intra-invoice batch deduction, returns, and PostgreSQL backup', async () => {
+  const db = await getDb();
 
-  const adminRow = db.prepare("SELECT id FROM users WHERE username = 'admin'").get() as { id: string };
-  const admin = loadAuthUserById(adminRow.id)!;
+  const adminRow = (await db.queryOne<{ id: string }>("SELECT id FROM users WHERE username = 'admin'"))!;
+  const admin = (await loadAuthUserById(adminRow.id))!;
   assert.ok(admin);
 
-  const cashierRow = db.prepare("SELECT id FROM users WHERE username = 'cashier'").get() as { id: string };
-  const cashierPerms = getUserEffectivePermissions(cashierRow.id);
-  // Cashier has individual ALLOW override for sales.return but no sales.reverse
+  const cashierRow = (await db.queryOne<{ id: string }>("SELECT id FROM users WHERE username = 'cashier'"))!;
+  const cashierPerms = await getUserEffectivePermissions(cashierRow.id);
   assert.equal(cashierPerms['sales.return'], true);
   assert.equal(cashierPerms['sales.reverse'], false);
 
-  // 1. Verify Napa Extend has manual 12-tablet Strip and 120-tablet Box, and two batches (near-expiry NEX-26A=144 and NEX-26B=360)
-  const meds = listMedicines('Napa Extend');
+  const meds = await listMedicines('Napa Extend');
   assert.equal(meds.length, 1);
   const napa = meds[0] as Record<string, unknown>;
   const units = napa.units as Array<{ id: string; unit_name: string; conversion_to_base: string }>;
@@ -173,14 +151,10 @@ test('full pharmacy end-to-end transaction integrity, FEFO, intra-invoice batch 
   assert.equal(Number(stripUnit.conversion_to_base), 12);
   assert.equal(Number(boxUnit.conversion_to_base), 120);
 
-  // 2. Multi-line same-medicine sale tests intra-invoice FEFO batch deduction tracking without double-allocation!
-  // Line 1: 11 Strips (132 tabs) -> takes 132 from NEX-26A (leaves 12 in NEX-26A)
-  // Line 2: 2 Strips (24 tabs) -> takes remaining 12 from NEX-26A + 12 from NEX-26B
-  // Split payment: Cash 200.00 + bKash 112.00 = 312.00
-  const beforeCashId = getActiveCashSessionId()!;
-  const beforeCash = Number(getCashSessionSummary(beforeCashId)!.totals.expectedCash);
+  const beforeCashId = (await getActiveCashSessionId())!;
+  const beforeCash = Number((await getCashSessionSummary(beforeCashId))!.totals.expectedCash);
 
-  const saleRes = completeSale(admin, {
+  const saleRes = await completeSale(admin, {
     payments: [
       { method: 'CASH', amount: '200.00' },
       { method: 'BKASH', amount: '112.00', referenceNo: 'TXN998811' },
@@ -201,15 +175,13 @@ test('full pharmacy end-to-end transaction integrity, FEFO, intra-invoice batch 
     ],
   });
   assert.equal(saleRes.netTotal, '312.00');
-  // COGS = 144 * 1.45 (208.80) + 12 * 1.50 (18.00) = 226.80
   assert.equal(saleRes.totalCogs, '226.80');
 
-  // Cash drawer must increase ONLY by 200.00 (not 312.00 bKash!)
-  const afterCash = Number(getCashSessionSummary(beforeCashId)!.totals.expectedCash);
+  const afterCash = Number((await getCashSessionSummary(beforeCashId))!.totals.expectedCash);
   assert.equal((afterCash - beforeCash).toFixed(2), '200.00');
 
-  // 3. Edit Napa Extend Strip conversion from 12 to 15 -> historical sale line snapshot MUST stay 12!
-  upsertMedicineUnit(admin, String(napa.id), {
+  // Edit unit conversion -> historical sale line snapshot MUST stay 12!
+  await upsertMedicineUnit(admin, String(napa.id), {
     unitId: stripUnit.id,
     unitName: 'Strip',
     conversionToBase: '15',
@@ -217,17 +189,20 @@ test('full pharmacy end-to-end transaction integrity, FEFO, intra-invoice batch 
     allowSale: true,
     isActive: true,
   });
-  const histLines = db.prepare('SELECT conversion_ratio_snapshot, qty_base FROM sale_lines WHERE sale_id = ?').all(saleRes.saleId) as Array<{
-    conversion_ratio_snapshot: string;
-    qty_base: string;
-  }>;
+  const histLines = await db.query<{ conversion_ratio_snapshot: string; qty_base: string }>(
+    'SELECT conversion_ratio_snapshot, qty_base FROM sale_lines WHERE sale_id = $1',
+    [saleRes.saleId]
+  );
   assert.equal(histLines.length, 2);
   assert.equal(Number(histLines[0].conversion_ratio_snapshot), 12);
   assert.equal(Number(histLines[0].qty_base) + Number(histLines[1].qty_base), 156);
 
-  // 4. Sales Return with QUARANTINE disposition: must NOT return to sellable stock!
-  const slRow = db.prepare('SELECT id FROM sale_lines WHERE sale_id = ? ORDER BY gross_total DESC LIMIT 1').get(saleRes.saleId) as { id: string };
-  const retRes = createSalesReturn(admin, {
+  // Sales Return with QUARANTINE disposition (pick the 2-strip / 24-base-unit line)
+  const slRow = (await db.queryOne<{ id: string }>(
+    'SELECT id FROM sale_lines WHERE sale_id = $1 ORDER BY gross_total ASC LIMIT 1',
+    [saleRes.saleId]
+  ))!;
+  const retRes = await createSalesReturn(admin, {
     saleId: saleRes.saleId,
     settlementType: 'CASH_REFUND',
     reason: 'Customer opened blister pack; quarantined for inspection',
@@ -235,8 +210,8 @@ test('full pharmacy end-to-end transaction integrity, FEFO, intra-invoice batch 
   });
   assert.equal(retRes.totalRefundValue, '24.00');
 
-  // Issue 4: Duplicate saleLineId entries in one return totaling > remaining (12) must be rejected
-  assert.throws(
+  // Duplicate saleLineId entries exceeding remaining returnable must reject
+  await assert.rejects(
     () =>
       createSalesReturn(admin, {
         saleId: saleRes.saleId,
@@ -250,14 +225,13 @@ test('full pharmacy end-to-end transaction integrity, FEFO, intra-invoice batch 
     /exceeds remaining returnable/i
   );
 
-  // Verify ledger reconciliation is 100% healthy
-  const recon = reconcileInventoryLedger();
+  const recon = await reconcileInventoryLedger();
   assert.equal(recon.healthy, true);
   assert.equal(recon.discrepancyCount, 0);
 
-  // 5. Purchase receiving + purchase return + duplicate line / over-return / reversal-after-return guards
-  const sup = db.prepare("SELECT id FROM suppliers WHERE code = 'SUP-001'").get() as { id: string };
-  const purRes = createPurchase(admin, {
+  // Purchase receiving + purchase return + guards
+  const sup = (await db.queryOne<{ id: string }>("SELECT id FROM suppliers WHERE code = 'SUP-001'"))!;
+  const purRes = await createPurchase(admin, {
     supplierId: sup.id,
     supplierInvoiceNo: 'SUP-INV-771',
     status: 'RECEIVED',
@@ -275,10 +249,11 @@ test('full pharmacy end-to-end transaction integrity, FEFO, intra-invoice batch 
       },
     ],
   });
-  const purLine = db.prepare('SELECT id FROM purchase_lines WHERE purchase_id = ?').get(purRes.purchaseId) as { id: string };
+  const purLine = (await db.queryOne<{ id: string }>('SELECT id FROM purchase_lines WHERE purchase_id = $1', [
+    purRes.purchaseId,
+  ]))!;
 
-  // Issue 5: Duplicate purchaseLineId entries totaling > purchased quantity must be rejected
-  assert.throws(
+  await assert.rejects(
     () =>
       createPurchaseReturn(admin, {
         purchaseId: purRes.purchaseId,
@@ -292,15 +267,14 @@ test('full pharmacy end-to-end transaction integrity, FEFO, intra-invoice batch 
     /exceeds remaining returnable/i
   );
 
-  createPurchaseReturn(admin, {
+  await createPurchaseReturn(admin, {
     purchaseId: purRes.purchaseId,
     settlementType: 'SUPPLIER_CREDIT',
     reason: 'Damaged outer carton',
     lines: [{ purchaseLineId: purLine.id, qtyBase: '12' }],
   });
 
-  // Guard 1: Over-return beyond remaining 108 base units must fail
-  assert.throws(
+  await assert.rejects(
     () =>
       createPurchaseReturn(admin, {
         purchaseId: purRes.purchaseId,
@@ -311,70 +285,66 @@ test('full pharmacy end-to-end transaction integrity, FEFO, intra-invoice batch 
     /exceeds remaining returnable purchased quantity/
   );
 
-  // Guard 2: Cannot reverse purchase after purchase returns exist
-  assert.throws(
+  await assert.rejects(
     () => reversePurchase(admin, purRes.purchaseId, 'Attempt reverse after return'),
     /already has partial\/full purchase returns/
   );
 
-  // 6. Cash expense & Net Profit report verification
-  const expCat = db.prepare('SELECT id FROM expense_categories LIMIT 1').get() as { id: string };
-  createExpense(admin, {
+  // Cash expense & Net Profit report verification
+  const expCat = (await db.queryOne<{ id: string }>('SELECT id FROM expense_categories LIMIT 1'))!;
+  await createExpense(admin, {
     categoryId: expCat.id,
     name: 'Generator Fuel',
     amount: '100.00',
     paymentMethod: 'CASH',
   });
-  const rep = getComprehensiveReport({});
+  const rep = await getComprehensiveReport({});
   assert.equal(rep.profitSummary.totalExpenses, '100.00');
   assert.equal(
     (Number(rep.profitSummary.grossProfit) - Number(rep.profitSummary.totalExpenses)).toFixed(2),
     rep.profitSummary.netProfit
   );
 
-  const summaryNow = getCashSessionSummary(beforeCashId)!;
+  const summaryNow = (await getCashSessionSummary(beforeCashId))!;
   const expCash = Number(summaryNow.totals.expectedCash);
-  const closeRes = closeCashSession(admin, beforeCashId, {
+  const closeRes = await closeCashSession(admin, beforeCashId, {
     actualCash: (expCash - 10).toFixed(2),
     varianceReason: 'Coin rounding difference',
   });
   assert.equal(closeRes.variance, '-10.00');
 
-  // Reopen cash session for subsequent return/payment tests
-  const { openCashSession } = await import('./services/financeService.ts');
-  openCashSession(admin, '500.00', 'Reopened for return and payment tests');
+  await openCashSession(admin, '500.00', 'Reopened for return and payment tests');
 
-  // 7. Verify Audit Log hash chain & WAL-safe SQLite backup
-  const chain = verifyAuditChain(db);
+  // Verify Audit Log hash chain & pg_dump verified backup
+  const chain = await verifyAuditChain(db);
   assert.equal(chain.valid, true);
   assert.ok(chain.totalEntries >= 5);
 
   const bkp = await createVerifiedBackup(admin, 'MANUAL');
-  assert.equal(bkp.integrityCheck, 'ok');
+  assert.match(bkp.integrityCheck, /pg_restore TOC verified/i);
   assert.ok(bkp.sizeBytes > 0);
 });
 
-test('Issues 6 & 7: Invoice-level discount return valuation, cash refund cap, and customer credit due reconciliation', () => {
-  const db = getDb();
-  const adminRow = db.prepare("SELECT id FROM users WHERE username = 'admin'").get() as { id: string };
-  const admin = loadAuthUserById(adminRow.id)!;
+test('Invoice-level discount return valuation, cash refund cap, and customer credit due reconciliation', async () => {
+  const db = await getDb();
+  const adminRow = (await db.queryOne<{ id: string }>("SELECT id FROM users WHERE username = 'admin'"))!;
+  const admin = (await loadAuthUserById(adminRow.id))!;
 
-  const med = listMedicines('Napa Extend')[0] as unknown as {
+  const med = (await listMedicines('Napa Extend'))[0] as unknown as {
     id: string;
-    units: Array<{ id: string; is_base: number; allow_sale: number }>;
+    units: Array<{ id: string; is_base: boolean; allow_sale: boolean }>;
   };
-  const baseUnit = med.units.find((u) => u.is_base === 1)!;
+  const baseUnit = med.units.find((u) => Boolean(u.is_base))!;
 
-  // Create customer for credit due reconciliation tests
   const custId = crypto.randomUUID();
   const ts = new Date().toISOString();
-  db.prepare(
+  await db.execute(
     `INSERT INTO customers (id, code, name, phone, address, opening_balance, current_balance, advance_balance, credit_limit, notes, is_active, created_at, updated_at)
-     VALUES (?, 'CUST-TEST67', 'Discount Return Customer', '01700000001', '', '0.00', '0.00', '0.00', '10000.00', '', 1, ?, ?)`
-  ).run(custId, ts, ts);
+     VALUES ($1, 'CUST-TEST67', 'Discount Return Customer', '01700000001', '', '0.00', '0.00', '0.00', '10000.00', '', TRUE, $2, $3)`,
+    [custId, ts, ts]
+  );
 
-  // Sale with 2 lines @ 100.00 each, invoiceDiscount = 20.00 -> netTotal = 180.00, paid = 50.00 CASH, due = 130.00
-  const sale = completeSale(admin, {
+  const sale = await completeSale(admin, {
     customerId: custId,
     invoiceDiscount: '20.00',
     payments: [{ method: 'CASH', amount: '50.00' }],
@@ -386,14 +356,14 @@ test('Issues 6 & 7: Invoice-level discount return valuation, cash refund cap, an
   assert.equal(sale.netTotal, '180.00');
   assert.equal(sale.dueAmount, '130.00');
 
-  const lines = db
-    .prepare('SELECT id, effective_line_total FROM sale_lines WHERE sale_id = ? ORDER BY id ASC')
-    .all(sale.saleId) as Array<{ id: string; effective_line_total: string }>;
+  const lines = await db.query<{ id: string; effective_line_total: string }>(
+    'SELECT id, effective_line_total FROM sale_lines WHERE sale_id = $1 ORDER BY id ASC',
+    [sale.saleId]
+  );
   assert.equal(lines[0].effective_line_total, '90.00');
   assert.equal(lines[1].effective_line_total, '90.00');
 
-  // Cash refund exceeding sale.paid_amount (50.00) MUST fail!
-  assert.throws(
+  await assert.rejects(
     () =>
       createSalesReturn(admin, {
         saleId: sale.saleId,
@@ -404,8 +374,7 @@ test('Issues 6 & 7: Invoice-level discount return valuation, cash refund cap, an
     /exceeds remaining paid amount/i
   );
 
-  // Customer credit return of Line 1 (90.00 effective) reduces sale.due_amount from 130.00 to 40.00 and cust.current_balance from 130.00 to 40.00
-  const ret1 = createSalesReturn(admin, {
+  const ret1 = await createSalesReturn(admin, {
     saleId: sale.saleId,
     settlementType: 'CUSTOMER_CREDIT',
     reason: 'Returned half invoice on credit',
@@ -415,17 +384,18 @@ test('Issues 6 & 7: Invoice-level discount return valuation, cash refund cap, an
   assert.equal(ret1.dueSettled, '90.00');
   assert.equal(ret1.advanceCreated, '0.00');
 
-  const saleAfter1 = db.prepare('SELECT due_amount FROM sales WHERE id = ?').get(sale.saleId) as { due_amount: string };
-  const custAfter1 = db.prepare('SELECT current_balance, advance_balance FROM customers WHERE id = ?').get(custId) as {
-    current_balance: string;
-    advance_balance: string;
-  };
+  const saleAfter1 = (await db.queryOne<{ due_amount: string }>('SELECT due_amount FROM sales WHERE id = $1', [
+    sale.saleId,
+  ]))!;
+  const custAfter1 = (await db.queryOne<{ current_balance: string; advance_balance: string }>(
+    'SELECT current_balance, advance_balance FROM customers WHERE id = $1',
+    [custId]
+  ))!;
   assert.equal(saleAfter1.due_amount, '40.00');
   assert.equal(custAfter1.current_balance, '40.00');
   assert.equal(custAfter1.advance_balance, '0.00');
 
-  // Second customer credit return of Line 2 (90.00 effective) settles remaining 40.00 due and places 50.00 into customer advance_balance!
-  const ret2 = createSalesReturn(admin, {
+  const ret2 = await createSalesReturn(admin, {
     saleId: sale.saleId,
     settlementType: 'CUSTOMER_CREDIT',
     reason: 'Returned second half invoice on credit',
@@ -435,36 +405,38 @@ test('Issues 6 & 7: Invoice-level discount return valuation, cash refund cap, an
   assert.equal(ret2.dueSettled, '40.00');
   assert.equal(ret2.advanceCreated, '50.00');
 
-  const saleAfter2 = db.prepare('SELECT due_amount FROM sales WHERE id = ?').get(sale.saleId) as { due_amount: string };
-  const custAfter2 = db.prepare('SELECT current_balance, advance_balance FROM customers WHERE id = ?').get(custId) as {
-    current_balance: string;
-    advance_balance: string;
-  };
+  const saleAfter2 = (await db.queryOne<{ due_amount: string }>('SELECT due_amount FROM sales WHERE id = $1', [
+    sale.saleId,
+  ]))!;
+  const custAfter2 = (await db.queryOne<{ current_balance: string; advance_balance: string }>(
+    'SELECT current_balance, advance_balance FROM customers WHERE id = $1',
+    [custId]
+  ))!;
   assert.equal(saleAfter2.due_amount, '0.00');
   assert.equal(custAfter2.current_balance, '0.00');
   assert.equal(custAfter2.advance_balance, '50.00');
 });
 
-test('Issues 8 & 9: Supplier return due reconciliation and weighted-average cost on shared batch receiving', () => {
-  const db = getDb();
-  const adminRow = db.prepare("SELECT id FROM users WHERE username = 'admin'").get() as { id: string };
-  const admin = loadAuthUserById(adminRow.id)!;
+test('Supplier return due reconciliation and weighted-average cost on shared batch receiving', async () => {
+  const db = await getDb();
+  const adminRow = (await db.queryOne<{ id: string }>("SELECT id FROM users WHERE username = 'admin'"))!;
+  const admin = (await loadAuthUserById(adminRow.id))!;
 
-  const med = listMedicines('Napa Extend')[0] as unknown as {
+  const med = (await listMedicines('Napa Extend'))[0] as unknown as {
     id: string;
-    units: Array<{ id: string; unit_name: string; is_base: number }>;
+    units: Array<{ id: string; unit_name: string; is_base: boolean }>;
   };
-  const boxUnit = med.units.find((u) => u.unit_name === 'Box')!; // 120 base units per Box
+  const boxUnit = med.units.find((u) => u.unit_name === 'Box')!;
 
   const supId = crypto.randomUUID();
   const ts = new Date().toISOString();
-  db.prepare(
+  await db.execute(
     `INSERT INTO suppliers (id, code, name, contact_person, phone, address, return_policy_days, return_policy_notes, opening_balance, current_balance, advance_balance, notes, is_active, created_at, updated_at)
-     VALUES (?, 'SUP-TEST89', 'WAC & Credit Supplier', 'Manager', '01800000001', '', 30, '', '0.00', '0.00', '0.00', '', 1, ?, ?)`
-  ).run(supId, ts, ts);
+     VALUES ($1, 'SUP-TEST89', 'WAC & Credit Supplier', 'Manager', '01800000001', '', 30, '', '0.00', '0.00', '0.00', '', TRUE, $2, $3)`,
+    [supId, ts, ts]
+  );
 
-  // Receive 1 Box (120 base units) @ 240.00 = 2.00/base into WAC-BATCH-1 (paid 50.00, due 190.00)
-  const p1 = createPurchase(admin, {
+  const p1 = await createPurchase(admin, {
     supplierId: supId,
     supplierInvoiceNo: 'WAC-INV-1',
     status: 'RECEIVED',
@@ -483,9 +455,7 @@ test('Issues 8 & 9: Supplier return due reconciliation and weighted-average cost
     ],
   });
 
-  // Receive another 1 Box (120 base units) into the SAME (medicine, batch, expiry) @ 480.00 = 4.00/base
-  // Expected Weighted Average Cost: (120*2.00 + 120*4.00) / 240 = 3.000000
-  const p2 = createPurchase(admin, {
+  const p2 = await createPurchase(admin, {
     supplierId: supId,
     supplierInvoiceNo: 'WAC-INV-2',
     status: 'RECEIVED',
@@ -504,14 +474,14 @@ test('Issues 8 & 9: Supplier return due reconciliation and weighted-average cost
     ],
   });
 
-  const batch = db
-    .prepare("SELECT id, current_qty_base, purchase_cost_per_base FROM batches WHERE medicine_id = ? AND batch_number = 'WAC-BATCH-1'")
-    .get(med.id) as { id: string; current_qty_base: string; purchase_cost_per_base: string };
+  const batch = (await db.queryOne<{ id: string; current_qty_base: string; purchase_cost_per_base: string }>(
+    "SELECT id, current_qty_base, purchase_cost_per_base FROM batches WHERE medicine_id = $1 AND batch_number = 'WAC-BATCH-1'",
+    [med.id]
+  ))!;
   assert.equal(batch.current_qty_base, '240.000000');
   assert.equal(batch.purchase_cost_per_base, '3.000000');
 
-  // Cannot receive into a QUARANTINED batch
-  const qPur = createPurchase(admin, {
+  const qPur = await createPurchase(admin, {
     supplierId: supId,
     status: 'RECEIVED',
     paidAmount: '0.00',
@@ -527,11 +497,12 @@ test('Issues 8 & 9: Supplier return due reconciliation and weighted-average cost
       },
     ],
   });
-  const qBatch = db
-    .prepare("SELECT id FROM batches WHERE medicine_id = ? AND batch_number = 'Q-BATCH-LOCK'")
-    .get(med.id) as { id: string };
-  changeBatchStatus(admin, qBatch.id, 'QUARANTINED', 'Hold for QA');
-  assert.throws(
+  const qBatch = (await db.queryOne<{ id: string }>(
+    "SELECT id FROM batches WHERE medicine_id = $1 AND batch_number = 'Q-BATCH-LOCK'",
+    [med.id]
+  ))!;
+  await changeBatchStatus(admin, qBatch.id, 'QUARANTINED', 'Hold for QA');
+  await assert.rejects(
     () =>
       createPurchase(admin, {
         supplierId: supId,
@@ -552,51 +523,52 @@ test('Issues 8 & 9: Supplier return due reconciliation and weighted-average cost
     /Cannot receive stock into batch/i
   );
 
-  // Issue 8: Purchase return with BANK_REFUND cannot exceed purchase.paid_amount (50.00 on p1)
-  const p1Line = db.prepare('SELECT id FROM purchase_lines WHERE purchase_id = ?').get(p1.purchaseId) as { id: string };
-  assert.throws(
+  const p1Line = (await db.queryOne<{ id: string }>('SELECT id FROM purchase_lines WHERE purchase_id = $1', [
+    p1.purchaseId,
+  ]))!;
+  await assert.rejects(
     () =>
       createPurchaseReturn(admin, {
         purchaseId: p1.purchaseId,
         settlementType: 'BANK_REFUND',
         reason: 'Over-refund attempt',
-        lines: [{ purchaseLineId: p1Line.id, qtyBase: '40' }], // 80.00 > paid 50.00
+        lines: [{ purchaseLineId: p1Line.id, qtyBase: '40' }],
       }),
     /exceeds remaining paid amount/i
   );
 
-  // SUPPLIER_CREDIT return on p2 (due 480.00) reduces p2.due_amount and supplier balance cleanly
-  const p2Line = db.prepare('SELECT id FROM purchase_lines WHERE purchase_id = ?').get(p2.purchaseId) as { id: string };
-  const pr = createPurchaseReturn(admin, {
+  const p2Line = (await db.queryOne<{ id: string }>('SELECT id FROM purchase_lines WHERE purchase_id = $1', [
+    p2.purchaseId,
+  ]))!;
+  const pr = await createPurchaseReturn(admin, {
     purchaseId: p2.purchaseId,
     settlementType: 'SUPPLIER_CREDIT',
     reason: 'Partial batch return',
-    lines: [{ purchaseLineId: p2Line.id, qtyBase: '25' }], // 100.00
+    lines: [{ purchaseLineId: p2Line.id, qtyBase: '25' }],
   });
   assert.equal(pr.dueSettled, '100.00');
   assert.equal(pr.advanceCreated, '0.00');
-  const p2Row = db.prepare('SELECT due_amount FROM purchases WHERE id = ?').get(p2.purchaseId) as { due_amount: string };
+  const p2Row = (await db.queryOne<{ due_amount: string }>('SELECT due_amount FROM purchases WHERE id = $1', [
+    p2.purchaseId,
+  ]))!;
   assert.equal(p2Row.due_amount, '380.00');
-
-  // Consume qPur just to silence unused variable lint if needed
   assert.ok(qPur.purchaseId);
 });
 
-test('Issue 10: Customer & supplier advance payments, FIFO invoice allocation, invoice advance application, and reversal guard', () => {
-  const db = getDb();
-  const adminRow = db.prepare("SELECT id FROM users WHERE username = 'admin'").get() as { id: string };
-  const admin = loadAuthUserById(adminRow.id)!;
+test('Customer & supplier advance payments, FIFO invoice allocation, invoice advance application, and reversal guard', async () => {
+  const db = await getDb();
+  const adminRow = (await db.queryOne<{ id: string }>("SELECT id FROM users WHERE username = 'admin'"))!;
+  const admin = (await loadAuthUserById(adminRow.id))!;
 
-  const med = listMedicines('Napa Extend')[0] as unknown as {
+  const med = (await listMedicines('Napa Extend'))[0] as unknown as {
     id: string;
-    units: Array<{ id: string; unit_name: string; is_base: number }>;
+    units: Array<{ id: string; unit_name: string; is_base: boolean }>;
   };
-  const baseUnit = med.units.find((u) => u.is_base === 1)!;
+  const baseUnit = med.units.find((u) => Boolean(u.is_base))!;
   const boxUnit = med.units.find((u) => u.unit_name === 'Box')!;
 
-  // Ensure plenty of sellable stock exists for the 3 sales in this test
-  const sup = db.prepare("SELECT id FROM suppliers WHERE code = 'SUP-001'").get() as { id: string };
-  createPurchase(admin, {
+  const sup = (await db.queryOne<{ id: string }>("SELECT id FROM suppliers WHERE code = 'SUP-001'"))!;
+  await createPurchase(admin, {
     supplierId: sup.id,
     status: 'RECEIVED',
     paidAmount: '0.00',
@@ -615,25 +587,24 @@ test('Issue 10: Customer & supplier advance payments, FIFO invoice allocation, i
 
   const custId = crypto.randomUUID();
   const ts = new Date().toISOString();
-  db.prepare(
+  await db.execute(
     `INSERT INTO customers (id, code, name, phone, address, opening_balance, current_balance, advance_balance, credit_limit, notes, is_active, created_at, updated_at)
-     VALUES (?, 'CUST-TEST10', 'Advance Credit Customer', '01700000010', '', '0.00', '0.00', '0.00', '5000.00', '', 1, ?, ?)`
-  ).run(custId, ts, ts);
+     VALUES ($1, 'CUST-TEST10', 'Advance Credit Customer', '01700000010', '', '0.00', '0.00', '0.00', '5000.00', '', TRUE, $2, $3)`,
+    [custId, ts, ts]
+  );
 
-  // Create two credit invoices: 300.00 and 200.00 (total due = 500.00)
-  const s1 = completeSale(admin, {
+  const s1 = await completeSale(admin, {
     customerId: custId,
     payments: [],
     lines: [{ medicineId: med.id, unitId: baseUnit.id, quantityInput: '150', unitPrice: '2.00' }],
   });
-  const s2 = completeSale(admin, {
+  const s2 = await completeSale(admin, {
     customerId: custId,
     payments: [],
     lines: [{ medicineId: med.id, unitId: baseUnit.id, quantityInput: '100', unitPrice: '2.00' }],
   });
 
-  // Payment of 700.00 accounts for 300.00 + 200.00 + 200.00 advance credit!
-  const payRes = recordPartyPayment(admin, {
+  const payRes = await recordPartyPayment(admin, {
     partyType: 'CUSTOMER',
     partyId: custId,
     method: 'BANK',
@@ -643,19 +614,22 @@ test('Issue 10: Customer & supplier advance payments, FIFO invoice allocation, i
   assert.equal(payRes.allocatedToDocs, '500.00');
   assert.equal(payRes.advanceAdded, '200.00');
 
-  const custMid = db.prepare('SELECT current_balance, advance_balance FROM customers WHERE id = ?').get(custId) as {
-    current_balance: string;
-    advance_balance: string;
-  };
+  const custMid = (await db.queryOne<{ current_balance: string; advance_balance: string }>(
+    'SELECT current_balance, advance_balance FROM customers WHERE id = $1',
+    [custId]
+  ))!;
   assert.equal(custMid.current_balance, '0.00');
   assert.equal(custMid.advance_balance, '200.00');
-  const s1After = db.prepare('SELECT due_amount FROM sales WHERE id = ?').get(s1.saleId) as { due_amount: string };
-  const s2After = db.prepare('SELECT due_amount FROM sales WHERE id = ?').get(s2.saleId) as { due_amount: string };
+  const s1After = (await db.queryOne<{ due_amount: string }>('SELECT due_amount FROM sales WHERE id = $1', [
+    s1.saleId,
+  ]))!;
+  const s2After = (await db.queryOne<{ due_amount: string }>('SELECT due_amount FROM sales WHERE id = $1', [
+    s2.saleId,
+  ]))!;
   assert.equal(s1After.due_amount, '0.00');
   assert.equal(s2After.due_amount, '0.00');
 
-  // New sale of 250.00 on credit automatically consumes 200.00 advance credit -> net due 50.00!
-  const s3 = completeSale(admin, {
+  const s3 = await completeSale(admin, {
     customerId: custId,
     payments: [],
     lines: [{ medicineId: med.id, unitId: baseUnit.id, quantityInput: '125', unitPrice: '2.00' }],
@@ -663,45 +637,117 @@ test('Issue 10: Customer & supplier advance payments, FIFO invoice allocation, i
   assert.equal(s3.advanceApplied, '200.00');
   assert.equal(s3.dueAmount, '50.00');
 
-  // Reversing PAY-700 must be blocked because its 200.00 advance was already consumed on s3!
-  assert.throws(
+  await assert.rejects(
     () => reversePayment(admin, payRes.paymentId, 'Should fail after advance consumed'),
     /advance credit.*already been consumed/i
   );
 
-  // Payment that hasn't had its advance consumed reverses cleanly (restoring both due and advance_balance)
-  const pay2 = recordPartyPayment(admin, {
+  const pay2 = await recordPartyPayment(admin, {
     partyType: 'CUSTOMER',
     partyId: custId,
     method: 'BANK',
-    amount: '150.00', // pays remaining 50.00 on s3 + 100.00 advance
+    amount: '150.00',
   });
   assert.equal(pay2.allocatedToDocs, '50.00');
   assert.equal(pay2.advanceAdded, '100.00');
-  reversePayment(admin, pay2.paymentId, 'Entered wrong bank ref');
-  const custFinal = db.prepare('SELECT current_balance, advance_balance FROM customers WHERE id = ?').get(custId) as {
-    current_balance: string;
-    advance_balance: string;
-  };
+  await reversePayment(admin, pay2.paymentId, 'Entered wrong bank ref');
+  const custFinal = (await db.queryOne<{ current_balance: string; advance_balance: string }>(
+    'SELECT current_balance, advance_balance FROM customers WHERE id = $1',
+    [custId]
+  ))!;
   assert.equal(custFinal.current_balance, '50.00');
   assert.equal(custFinal.advance_balance, '0.00');
 });
 
-test('atomic doc_sequences prevent collisions across sequential calls', () => {
-  const nums = new Set<string>();
-  withTransaction((tx) => {
-    for (let i = 0; i < 15; i++) {
-      nums.add(generateDocNumber(tx, 'INVTEST', 'sales', 'invoice_number'));
-    }
-  });
-  assert.equal(nums.size, 15);
+test('atomic PostgreSQL doc_sequences prevent collisions under parallel concurrent transactions', async () => {
+  const results = await Promise.all(
+    Array.from({ length: 12 }, () =>
+      withTransaction((tx) => generateDocNumber(tx, 'INVTEST', 'sales', 'invoice_number'))
+    )
+  );
+  const nums = new Set(results);
+  assert.equal(nums.size, 12);
   assert.equal(Array.from(nums).every((n) => n.startsWith('INVTEST-')), true);
 });
 
-test('6-decimal Excel import validation rejects excess precision and duplicate barcodes, persists valid rows', () => {
-  const db = getDb();
-  const adminRow = db.prepare("SELECT id FROM users WHERE username = 'admin'").get() as { id: string };
-  const admin = loadAuthUserById(adminRow.id)!;
+test('CONCURRENCY SAFETY: Multi-counter race on limited batch blocks overselling and preserves positive stock invariant', async () => {
+  const db = await getDb();
+  const adminRow = (await db.queryOne<{ id: string }>("SELECT id FROM users WHERE username = 'admin'"))!;
+  const admin = (await loadAuthUserById(adminRow.id))!;
+  const sup = (await db.queryOne<{ id: string }>("SELECT id FROM suppliers WHERE code = 'SUP-001'"))!;
+
+  // Create dedicated test medicine + single batch with exactly 5.000000 units
+  const medId = await createMedicine(admin, {
+    brandName: 'ConcurrencyTestMed',
+    genericName: 'Concurrency Molecule',
+    strength: '50mg',
+    dosageForm: 'Tablet',
+    baseUnitName: 'Tablet',
+    minStockLevel: '1',
+  });
+  const medObj = (await listMedicines('ConcurrencyTestMed'))[0] as unknown as {
+    id: string;
+    units: Array<{ id: string; is_base: boolean }>;
+  };
+  const baseUnit = medObj.units.find((u) => Boolean(u.is_base))!;
+
+  await createPurchase(admin, {
+    supplierId: sup.id,
+    status: 'RECEIVED',
+    paidAmount: '0.00',
+    lines: [
+      {
+        medicineId: medId,
+        unitId: baseUnit.id,
+        batchNumber: 'CONC-BATCH-1',
+        expiryDate: '2029-10-01',
+        quantityInput: '5',
+        unitCost: '10.00',
+        sellingPricePerBase: '5.00',
+      },
+    ],
+  });
+
+  // Launch 4 simultaneous checkout transactions each trying to buy 4 tablets out of 5 available
+  const settled = await Promise.allSettled(
+    Array.from({ length: 4 }, () =>
+      completeSale(admin, {
+        payments: [{ method: 'CASH', amount: '20.00' }],
+        lines: [{ medicineId: medId, unitId: baseUnit.id, quantityInput: '4', unitPrice: '5.00' }],
+      })
+    )
+  );
+
+  const successes = settled.filter((r) => r.status === 'fulfilled');
+  const failures = settled.filter((r) => r.status === 'rejected') as Array<PromiseRejectedResult>;
+  assert.equal(successes.length, 1, `Expected exactly 1 concurrent sale to succeed, got ${successes.length}`);
+  assert.equal(failures.length, 3);
+  for (const f of failures) {
+    assert.match(String((f.reason as Error)?.message || f.reason), /Insufficient.*stock/i);
+  }
+
+  const batchAfter = (await db.queryOne<{ id: string; current_qty_base: string }>(
+    "SELECT id, current_qty_base FROM batches WHERE medicine_id = $1 AND batch_number = 'CONC-BATCH-1'",
+    [medId]
+  ))!;
+  assert.equal(batchAfter.current_qty_base, '1.000000');
+
+  // Verify database CHECK (current_qty_base >= 0) directly blocks negative quantity even on raw SQL
+  await assert.rejects(
+    () => db.execute('UPDATE batches SET current_qty_base = -1 WHERE id = $1', [batchAfter.id]),
+    /chk_batches_non_negative_qty|check constraint/i
+  );
+
+  const recon = await reconcileInventoryLedger(db);
+  assert.equal(recon.healthy, true);
+  const chain = await verifyAuditChain(db);
+  assert.equal(chain.valid, true);
+});
+
+test('6-decimal Excel import validation rejects excess precision and duplicate barcodes, persists valid rows', async () => {
+  const db = await getDb();
+  const adminRow = (await db.queryOne<{ id: string }>("SELECT id FROM users WHERE username = 'admin'"))!;
+  const admin = (await loadAuthUserById(adminRow.id))!;
 
   const wb = XLSX.utils.book_new();
   const rows = [
@@ -728,7 +774,7 @@ test('6-decimal Excel import validation rejects excess precision and duplicate b
     },
     {
       medicine_code: 'MED-9002',
-      barcode: '9990001112223', // duplicate barcode + 7 decimals
+      barcode: '9990001112223',
       brand_name: 'BadPrec',
       generic_name: 'Test',
       strength: '1mg',
@@ -744,77 +790,45 @@ test('6-decimal Excel import validation rejects excess precision and duplicate b
   XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
 
-  const preview = parseAndValidateExcelImport(buf);
+  const preview = await parseAndValidateExcelImport(buf);
   assert.equal(preview.length, 2);
   assert.equal(preview[0].errors.length, 0);
   assert.ok(preview[1].errors.some((e) => e.includes('Duplicate barcode')));
   assert.ok(preview[1].errors.some((e) => e.includes('more than 6 decimal places')));
 
-  const result = executeExcelImport(admin, [preview[0]]);
+  const result = await executeExcelImport(admin, [preview[0]]);
   assert.equal(result.createdMeds, 1);
   assert.equal(result.addedBatches, 1);
 
-  const insertedMed = db
-    .prepare("SELECT medicine_code, barcode, storage_info, min_stock_level FROM medicines WHERE barcode = '9990001112223'")
-    .get() as { medicine_code: string; barcode: string; storage_info: string; min_stock_level: string };
+  const insertedMed = (await db.queryOne<{
+    medicine_code: string;
+    barcode: string;
+    storage_info: string;
+    min_stock_level: string;
+  }>("SELECT medicine_code, barcode, storage_info, min_stock_level FROM medicines WHERE barcode = '9990001112223'"))!;
   assert.equal(insertedMed.medicine_code, 'MED-9001');
   assert.equal(insertedMed.storage_info, 'Shelf E1');
   assert.equal(insertedMed.min_stock_level, '12.500000');
 });
 
-test('login rate limiting locks after 5 failures and resets on clear', () => {
+test('login rate limiting locks after 5 failures and resets on clear', async () => {
   const user = 'ratetest';
   const ip = '127.0.0.55';
-  clearLoginAttempts(user, ip);
+  await clearLoginAttempts(user, ip);
   for (let i = 0; i < 4; i++) {
-    const r = recordFailedLoginAttempt(user, ip);
+    const r = await recordFailedLoginAttempt(user, ip);
     assert.equal(r.locked, false);
   }
-  const fifth = recordFailedLoginAttempt(user, ip);
+  const fifth = await recordFailedLoginAttempt(user, ip);
   assert.equal(fifth.locked, true);
-  const check = checkLoginRateLimit(user, ip);
+  const check = await checkLoginRateLimit(user, ip);
   assert.equal(check.blocked, true);
-  clearLoginAttempts(user, ip);
-  assert.equal(checkLoginRateLimit(user, ip).blocked, false);
+  await clearLoginAttempts(user, ip);
+  assert.equal((await checkLoginRateLimit(user, ip)).blocked, false);
 });
 
-test('Ed25519 license detects UTC clock rollback across restarts', () => {
-  const db = getDb();
-  const status = getCurrentLicenseStatus();
-  assert.equal(status.status, 'ACTIVE');
-
-  // Generate ephemeral keypair and signed license, push license_state clock into future to simulate rollback
-  const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
-  const payload = {
-    licenseId: 'LIC-TEST-RB',
-    customerId: 'CUST-1',
-    pharmacyName: 'MediNest Test',
-    licenseType: 'LIFETIME' as const,
-    issueDate: '2026-01-01',
-    expiryDate: null,
-    deviceFingerprint: '*',
-  };
-  const sig = crypto
-    .sign(null, Buffer.from(canonicalLicensePayload(payload), 'utf8'), privateKey)
-    .toString('base64');
-  const pubPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
-
-  db.prepare(
-    `INSERT INTO license_state (id, last_verified_utc, updated_at) VALUES (1, '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z')
-     ON CONFLICT(id) DO UPDATE SET last_verified_utc = '2099-01-01T00:00:00.000Z'`
-  ).run();
-
-  const rollbackCheck = verifySignedLicense({ payload, signatureBase64: sig }, pubPem);
-  assert.equal(rollbackCheck.status, 'INVALID_READONLY');
-  assert.equal(rollbackCheck.writable, false);
-  assert.match(rollbackCheck.message, /clock rollback/i);
-
-  // Restore valid timestamp
-  db.prepare('DELETE FROM license_state WHERE id = 1').run();
-});
-
-test('Issues 2 & 11: Forced password change API gating, concurrent atomic HTTP idempotency, and retry after failure', async () => {
-  const db = getDb();
+test('Forced password change API gating, concurrent HTTP idempotency, concurrent HTTP POS race, and retry after failure', async () => {
+  const db = await getDb();
   const app = express();
   app.use(express.json());
   app.use(cookieParser());
@@ -826,7 +840,13 @@ test('Issues 2 & 11: Forced password change API gating, concurrent atomic HTTP i
   const baseUrl = `http://127.0.0.1:${addr.port}`;
 
   try {
-    // Sign in as admin (who still has must_change_password = 1)
+    // Health endpoint check
+    const healthRes = await fetch(`${baseUrl}/api/health`);
+    assert.equal(healthRes.status, 200);
+    const healthBody = (await healthRes.json()) as { ok: boolean; database: string };
+    assert.equal(healthBody.ok, true);
+    assert.equal(healthBody.database, testDbName);
+
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'MediNest' },
@@ -835,7 +855,6 @@ test('Issues 2 & 11: Forced password change API gating, concurrent atomic HTTP i
     assert.equal(loginRes.status, 200);
     const cookieHeader = loginRes.headers.get('set-cookie')?.split(';')[0] || '';
 
-    // Issue 2: Protected operational routes MUST return 403 until password is updated!
     const blockedGet = await fetch(`${baseUrl}/api/medicines`, {
       headers: { Cookie: cookieHeader },
     });
@@ -843,7 +862,6 @@ test('Issues 2 & 11: Forced password change API gating, concurrent atomic HTTP i
     const blockedBody = (await blockedGet.json()) as { code?: string };
     assert.equal(blockedBody.code, 'PASSWORD_CHANGE_REQUIRED');
 
-    // Reusing default password on forced change must be rejected
     const samePwRes = await fetch(`${baseUrl}/api/auth/change-password`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'MediNest', Cookie: cookieHeader },
@@ -851,7 +869,6 @@ test('Issues 2 & 11: Forced password change API gating, concurrent atomic HTTP i
     });
     assert.equal(samePwRes.status, 400);
 
-    // Changing to a strong new password unlocks access
     const changePwRes = await fetch(`${baseUrl}/api/auth/change-password`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'MediNest', Cookie: cookieHeader },
@@ -864,10 +881,9 @@ test('Issues 2 & 11: Forced password change API gating, concurrent atomic HTTP i
     });
     assert.equal(allowedGet.status, 200);
 
-    const expCat = db.prepare('SELECT id FROM expense_categories LIMIT 1').get() as { id: string };
+    const expCat = (await db.queryOne<{ id: string }>('SELECT id FROM expense_categories LIMIT 1'))!;
     const idempKey = `test-idemp-${Date.now()}`;
 
-    // Concurrent simultaneous duplicate submissions -> ONLY ONE expense row created!
     const payload = { categoryId: expCat.id, name: 'Idempotent Courier', amount: '25.00', paymentMethod: 'BANK' };
     const [r1, r2] = await Promise.all([
       fetch(`${baseUrl}/api/expenses`, {
@@ -888,7 +904,12 @@ test('Issues 2 & 11: Forced password change API gating, concurrent atomic HTTP i
           'Idempotency-Key': idempKey,
           Cookie: cookieHeader,
         },
-        body: JSON.stringify({ paymentMethod: 'BANK', amount: '25.00', name: 'Idempotent Courier', categoryId: expCat.id }), // reordered keys
+        body: JSON.stringify({
+          paymentMethod: 'BANK',
+          amount: '25.00',
+          name: 'Idempotent Courier',
+          categoryId: expCat.id,
+        }),
       }),
     ]);
     assert.equal(r1.status, 201);
@@ -897,7 +918,6 @@ test('Issues 2 & 11: Forced password change API gating, concurrent atomic HTTP i
     const body2 = (await r2.json()) as { expenseNumber: string };
     assert.equal(body1.expenseNumber, body2.expenseNumber);
 
-    // Different payload with same idempotency key -> 409 Conflict
     const r3 = await fetch(`${baseUrl}/api/expenses`, {
       method: 'POST',
       headers: {
@@ -910,7 +930,6 @@ test('Issues 2 & 11: Forced password change API gating, concurrent atomic HTTP i
     });
     assert.equal(r3.status, 409);
 
-    // Failed transaction with an idempotency key must NOT store key, allowing valid retry on same key
     const failKey = `test-fail-retry-${Date.now()}`;
     const rFail = await fetch(`${baseUrl}/api/expenses`, {
       method: 'POST',
@@ -934,69 +953,274 @@ test('Issues 2 & 11: Forced password change API gating, concurrent atomic HTTP i
       body: JSON.stringify({ categoryId: expCat.id, name: 'Fail Then Succeed', amount: '15.00', paymentMethod: 'BANK' }),
     });
     assert.equal(rRetry.status, 201);
+
+    // Concurrent HTTP POS checkout race on remaining 1 unit of ConcurrencyTestMed
+    const concMed = (await listMedicines('ConcurrencyTestMed'))[0] as unknown as {
+      id: string;
+      units: Array<{ id: string; is_base: boolean }>;
+    };
+    const concUnit = concMed.units.find((u) => Boolean(u.is_base))!;
+    const posResponses = await Promise.all(
+      [1, 2, 3].map((idx) =>
+        fetch(`${baseUrl}/api/sales`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'MediNest',
+            'Idempotency-Key': `http-pos-race-${Date.now()}-${idx}`,
+            Cookie: cookieHeader,
+          },
+          body: JSON.stringify({
+            payments: [{ method: 'CASH', amount: '5.00' }],
+            lines: [{ medicineId: concMed.id, unitId: concUnit.id, quantityInput: '1', unitPrice: '5.00' }],
+          }),
+        })
+      )
+    );
+    const statuses = posResponses.map((r) => r.status).sort();
+    assert.deepEqual(statuses, [201, 400, 400]);
+
+    // Check /api/admin/audit returns both logs and rows cleanly
+    const auditRes = await fetch(`${baseUrl}/api/admin/audit?limit=5`, {
+      headers: { Cookie: cookieHeader },
+    });
+    assert.equal(auditRes.status, 200);
+    const auditBody = (await auditRes.json()) as { logs: unknown[]; rows: unknown[]; total: number };
+    assert.equal(auditBody.logs.length, auditBody.rows.length);
   } finally {
     server.close();
   }
 });
 
-test('Issue 12: Backup restore verifies SHA-256 checksum, blocks tampered/missing backups, creates pre-restore snapshot, and audits outcomes', async () => {
-  const db = getDb();
-  const adminRow = db.prepare("SELECT id FROM users WHERE username = 'admin'").get() as { id: string };
-  const admin = loadAuthUserById(adminRow.id)!;
+test('PostgreSQL pg_dump backup & restore verifies SHA-256, blocks tampered archives, snapshots PRE_RESTORE, and audits outcomes', async () => {
+  const db = await getDb();
+  const adminRow = (await db.queryOne<{ id: string }>("SELECT id FROM users WHERE username = 'admin'"))!;
+  const admin = (await loadAuthUserById(adminRow.id))!;
 
   const cleanBkp = await createVerifiedBackup(admin, 'MANUAL');
-  const rec = db.prepare('SELECT id, file_path FROM backup_records WHERE id = ?').get(cleanBkp.id) as {
-    id: string;
-    file_path: string;
-  };
+  const rec = (await db.queryOne<{ id: string; file_path: string }>(
+    'SELECT id, file_path FROM backup_records WHERE id = $1',
+    [cleanBkp.id]
+  ))!;
 
-  // Copy clean backup to restore later, then tamper with the tracked backup file!
   const cleanCopyBytes = fs.readFileSync(rec.file_path);
   fs.writeFileSync(rec.file_path, Buffer.concat([cleanCopyBytes, Buffer.from('TAMPER')]));
 
   await assert.rejects(() => restoreFromBackup(admin, rec.id), /SHA-256 checksum mismatch/i);
-  const failAudit = db
-    .prepare("SELECT status, reason FROM audit_logs WHERE action = 'RESTORE_BACKUP' ORDER BY seq DESC LIMIT 1")
-    .get() as { status: string; reason: string };
+  const failAudit = (await db.queryOne<{ status: string; reason: string }>(
+    "SELECT status, reason FROM audit_logs WHERE action = 'RESTORE_BACKUP' ORDER BY seq DESC LIMIT 1"
+  ))!;
   assert.equal(failAudit.status, 'FAILURE');
   assert.match(failAudit.reason, /SHA-256/i);
 
-  // Restore original bytes so hash matches again, create a marker record after backup, then restore from backup
   fs.writeFileSync(rec.file_path, cleanCopyBytes);
   const markerCatId = crypto.randomUUID();
-  db.prepare('INSERT INTO expense_categories (id, name) VALUES (?, ?)').run(markerCatId, 'Post-Backup Temp Cat');
+  await db.execute('INSERT INTO expense_categories (id, name) VALUES ($1, $2)', [
+    markerCatId,
+    'Post-Backup Temp Cat',
+  ]);
 
   const restored = await restoreFromBackup(admin, rec.id);
   assert.equal(restored.integrity, 'ok');
   assert.equal(restored.sha256, cleanBkp.sha256);
   assert.ok(restored.preRestoreBackup.includes('pre_restore'));
 
-  // Database state reverted to before markerCatId was added, with PRE_RESTORE audit logged
-  const dbAfter = getDb();
-  const markerGone = dbAfter.prepare('SELECT id FROM expense_categories WHERE id = ?').get(markerCatId);
+  const dbAfter = await getDb();
+  const markerGone = await dbAfter.queryOne('SELECT id FROM expense_categories WHERE id = $1', [markerCatId]);
   assert.equal(markerGone, undefined);
-  const successAudit = dbAfter
-    .prepare("SELECT status FROM audit_logs WHERE action = 'RESTORE_BACKUP' ORDER BY seq DESC LIMIT 1")
-    .get() as { status: string };
+  const successAudit = (await dbAfter.queryOne<{ status: string }>(
+    "SELECT status FROM audit_logs WHERE action = 'RESTORE_BACKUP' ORDER BY seq DESC LIMIT 1"
+  ))!;
   assert.equal(successAudit.status, 'SUCCESS');
 });
 
-test('Audit hash chain detects post-write tampering', async () => {
-  const { DatabaseSync, backup } = await import('node:sqlite');
-  const db = getDb();
-  const validBefore = verifyAuditChain(db);
+test('Audit hash chain detects post-write tampering in PostgreSQL', async () => {
+  const db = await getDb();
+  const validBefore = await verifyAuditChain(db);
   assert.equal(validBefore.valid, true);
 
-  const clonePath = path.join(tmpDir, 'audit-tamper-clone.sqlite');
-  await backup(db, clonePath);
-  const cloneDb = new DatabaseSync(clonePath);
+  let detectedBrokenSeq: number | null = null;
+  let validInsideTamperedTx = true;
+
+  await assert.rejects(
+    () =>
+      withTransaction(async (tx) => {
+        const first = (await tx.queryOne<{ seq: number }>('SELECT seq FROM audit_logs ORDER BY seq ASC LIMIT 1'))!;
+        await tx.execute("UPDATE audit_logs SET reason = 'TAMPERED_IN_PG' WHERE seq = $1", [first.seq]);
+        const broken = await verifyAuditChain(tx);
+        validInsideTamperedTx = broken.valid;
+        detectedBrokenSeq = broken.brokenAtSeq;
+        throw new Error('ROLLBACK_TAMPER_CHECK');
+      }),
+    /ROLLBACK_TAMPER_CHECK/
+  );
+
+  assert.equal(validInsideTamperedTx, false);
+  assert.equal(detectedBrokenSeq, 1);
+
+  const validAfter = await verifyAuditChain(db);
+  assert.equal(validAfter.valid, true);
+});
+
+test('License-free HTTP API preserves RBAC, LAN overview, settings, and sales/purchase batched queries', async () => {
+  const db = await getDb();
+  const app = express();
+  app.use(express.json());
+  app.use(cookieParser());
+  app.use(resolveSessionMiddleware);
+  app.use('/api', buildApiRouter());
+
+  const server = app.listen(0);
+  const addr = server.address() as { port: number };
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
   try {
-    const first = cloneDb.prepare('SELECT seq FROM audit_logs ORDER BY seq ASC LIMIT 1').get() as { seq: number };
-    cloneDb.prepare("UPDATE audit_logs SET reason = 'TAMPERED' WHERE seq = ?").run(first.seq);
-    const broken = verifyAuditChain(cloneDb);
-    assert.equal(broken.valid, false);
-    assert.equal(broken.brokenAtSeq, first.seq);
+    const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'MediNest' },
+      body: JSON.stringify({ username: 'admin', password: 'Admin@NewStrong99!' }),
+    });
+    assert.equal(loginRes.status, 200);
+    const adminCookie = loginRes.headers.get('set-cookie')?.split(';')[0] || '';
+
+    const authMeRes = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: adminCookie } });
+    assert.equal(authMeRes.status, 200);
+    const authMeBody = (await authMeRes.json()) as {
+      license?: unknown;
+      settings: { drug_license_no: string; pharmacy_name: string };
+    };
+    assert.equal('license' in authMeBody, false);
+    assert.ok(authMeBody.settings.drug_license_no.length > 0);
+
+    const overviewRes = await fetch(`${baseUrl}/api/admin/overview`, { headers: { Cookie: adminCookie } });
+    assert.equal(overviewRes.status, 200);
+    const overviewBody = (await overviewRes.json()) as {
+      license?: unknown;
+      networkInfo: { port: number; urls: string[] };
+      permissions: Array<{ code: string }>;
+    };
+    assert.equal('license' in overviewBody, false);
+    assert.ok(Array.isArray(overviewBody.networkInfo.urls));
+    assert.equal(overviewBody.permissions.some((p) => p.code === 'admin.license'), false);
+
+    // Verify batched /api/sales and /api/purchases return full nested lines/allocations/payments cleanly
+    const [salesGet, purchasesGet] = await Promise.all([
+      fetch(`${baseUrl}/api/sales?limit=20`, { headers: { Cookie: adminCookie } }),
+      fetch(`${baseUrl}/api/purchases?limit=20`, { headers: { Cookie: adminCookie } }),
+    ]);
+    assert.equal(salesGet.status, 200);
+    assert.equal(purchasesGet.status, 200);
+    const salesJson = (await salesGet.json()) as { sales: Array<{ lines: Array<{ allocations: unknown[] }> }> };
+    const purchasesJson = (await purchasesGet.json()) as { purchases: Array<{ lines: unknown[] }> };
+    assert.ok(salesJson.sales.length >= 1);
+    assert.ok(salesJson.sales[0].lines.length >= 1);
+    assert.ok(purchasesJson.purchases.length >= 1);
+
+    const settingsRes = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'MediNest', Cookie: adminCookie },
+      body: JSON.stringify({
+        pharmacyName: authMeBody.settings.pharmacy_name,
+        drugLicenseNo: 'DGDA-PG-2026',
+        currency: 'BDT',
+        expiryWarningDays: 90,
+      }),
+    });
+    assert.equal(settingsRes.status, 200);
+
+    const updatedSettings = (await db.queryOne<{ drug_license_no: string }>(
+      'SELECT drug_license_no FROM pharmacy_settings WHERE id = 1'
+    ))!;
+    assert.equal(updatedSettings.drug_license_no, 'DGDA-PG-2026');
+
+    const cashierRole = (await db.queryOne<{ id: string }>("SELECT id FROM roles WHERE name = 'POS Cashier'"))!;
+    const testCashierId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    await db.execute(
+      `INSERT INTO users (id, username, password_hash, full_name, role_id, is_super_admin, is_active, must_change_password, created_at, updated_at)
+       VALUES ($1, 'rbac_cashier', $2, 'RBAC Cashier', $3, FALSE, TRUE, FALSE, $4, $5)`,
+      [testCashierId, hashPassword('Cashier@Strong99!'), cashierRole.id, now, now]
+    );
+
+    const cashierLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'MediNest' },
+      body: JSON.stringify({ username: 'rbac_cashier', password: 'Cashier@Strong99!' }),
+    });
+    assert.equal(cashierLogin.status, 200);
+    const cashierCookie = cashierLogin.headers.get('set-cookie')?.split(';')[0] || '';
+
+    const cashierOverview = await fetch(`${baseUrl}/api/admin/overview`, {
+      headers: { Cookie: cashierCookie },
+    });
+    assert.equal(cashierOverview.status, 200);
+    const cashierOverviewBody = (await cashierOverview.json()) as {
+      users: unknown[];
+      auditLogs: unknown[];
+      backups: unknown[];
+    };
+    assert.equal(cashierOverviewBody.users.length, 0);
+    assert.equal(cashierOverviewBody.auditLogs.length, 0);
+    assert.equal(cashierOverviewBody.backups.length, 0);
+
+    for (const [method, endpoint] of [
+      ['POST', '/api/admin/users'],
+      ['GET', '/api/admin/audit/export'],
+      ['POST', '/api/admin/backups'],
+      ['PUT', '/api/admin/settings'],
+    ] as const) {
+      const denied = await fetch(`${baseUrl}${endpoint}`, {
+        method,
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'MediNest', Cookie: cashierCookie },
+        ...(method === 'PUT' || method === 'POST' ? { body: JSON.stringify({ pharmacyName: 'Hack' }) } : {}),
+      });
+      assert.equal(denied.status, 403);
+    }
+
+    await db.execute('DELETE FROM sessions WHERE user_id = $1', [testCashierId]);
+    await db.execute('DELETE FROM users WHERE id = $1', [testCashierId]);
   } finally {
-    cloneDb.close();
+    server.close();
+  }
+});
+
+test('SQLite-to-PostgreSQL migration script preserves all real pharmacy.db data, financial sums, inventory ledger, and audit chain cleanly', async () => {
+  const realSqlitePath = path.resolve(process.cwd(), 'data/pharmacy.db');
+  if (!fs.existsSync(realSqlitePath)) {
+    return;
+  }
+
+  await closeDb();
+  await withAdminPgClient(async (client) => {
+    await client.query(`DROP DATABASE IF EXISTS "${migTestDbName}" WITH (FORCE)`);
+    await client.query(`CREATE DATABASE "${migTestDbName}"`);
+  });
+
+  process.env.PGDATABASE = migTestDbName;
+  try {
+    const summary = await migrateSqliteToPostgres({ sqlitePath: realSqlitePath, force: true });
+    assert.equal(summary.inventoryLedgerHealthy, true);
+    assert.equal(summary.auditChainValid, true);
+    assert.equal(
+      summary.financialTotals.salesNetTotal.sqlite,
+      summary.financialTotals.salesNetTotal.postgres
+    );
+    assert.equal(
+      summary.financialTotals.batchStockTotalBase.sqlite,
+      summary.financialTotals.batchStockTotalBase.postgres
+    );
+    assert.ok(summary.tableCounts.medicines.postgres >= 1);
+    assert.ok(summary.tableCounts.batches.postgres >= 1);
+    assert.ok(summary.tableCounts.users.postgres >= 1);
+
+    // Re-running without --force MUST abort cleanly without overwriting migrated data
+    await assert.rejects(() => migrateSqliteToPostgres({ sqlitePath: realSqlitePath, force: false }), /not empty/i);
+  } finally {
+    await closeDb();
+    await withAdminPgClient(async (client) => {
+      await client.query(`DROP DATABASE IF EXISTS "${migTestDbName}" WITH (FORCE)`);
+    });
+    process.env.PGDATABASE = testDbName;
+    await getDb();
   }
 });

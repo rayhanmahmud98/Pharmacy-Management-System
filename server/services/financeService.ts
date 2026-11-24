@@ -1,6 +1,5 @@
 import Decimal from 'decimal.js';
-import type { DatabaseSync } from 'node:sqlite';
-import { generateDocNumber, getDb, nowIso, todayDate, uuid, withTransaction } from '../db.ts';
+import { generateDocNumber, getDb, nowIso, todayDate, uuid, withTransaction, type DbExecutor } from '../db.ts';
 import { recordAudit } from '../audit.ts';
 import type { AuthUser } from '../auth.ts';
 import {
@@ -12,36 +11,27 @@ import {
   validateCurrencyInput,
 } from '../../src/shared/decimalMath.ts';
 
-export function getActiveCashSessionId(tx?: DatabaseSync): string | null {
-  const db = tx || getDb();
-  const row = db
-    .prepare("SELECT id FROM cash_sessions WHERE status = 'OPEN' ORDER BY opened_at DESC LIMIT 1")
-    .get() as { id: string } | undefined;
+export async function getActiveCashSessionId(tx?: DbExecutor): Promise<string | null> {
+  const db = tx || (await getDb());
+  const row = await db.queryOne<{ id: string }>(
+    "SELECT id FROM cash_sessions WHERE status = 'OPEN' ORDER BY opened_at DESC LIMIT 1"
+  );
   return row?.id ?? null;
 }
 
-export function getCashSessionSummary(sessionId: string) {
-  const db = getDb();
-  const session = db
-    .prepare(
-      `SELECT cs.*, u1.full_name as opened_by_name, u2.full_name as closed_by_name
-       FROM cash_sessions cs
-       JOIN users u1 ON u1.id = cs.opened_by
-       LEFT JOIN users u2 ON u2.id = cs.closed_by
-       WHERE cs.id = ?`
-    )
-    .get(sessionId) as Record<string, unknown> | undefined;
+export async function getCashSessionSummary(sessionId: string, tx?: DbExecutor) {
+  const db = tx || (await getDb());
+  const session = await db.queryOne<Record<string, unknown>>(
+    `SELECT cs.*, u1.full_name AS opened_by_name, u2.full_name AS closed_by_name
+     FROM cash_sessions cs
+     JOIN users u1 ON u1.id = cs.opened_by
+     LEFT JOIN users u2 ON u2.id = cs.closed_by
+     WHERE cs.id = $1`,
+    [sessionId]
+  );
   if (!session) return null;
 
-  const movements = db
-    .prepare(
-      `SELECT cm.*, u.username
-       FROM cash_movements cm
-       JOIN users u ON u.id = cm.created_by
-       WHERE cm.cash_session_id = ?
-       ORDER BY cm.created_at DESC`
-    )
-    .all(sessionId) as Array<{
+  const movements = await db.query<{
     id: string;
     movement_type: string;
     amount_signed: string;
@@ -50,7 +40,14 @@ export function getCashSessionSummary(sessionId: string) {
     notes: string;
     username: string;
     created_at: string;
-  }>;
+  }>(
+    `SELECT cm.*, u.username
+     FROM cash_movements cm
+     JOIN users u ON u.id = cm.created_by
+     WHERE cm.cash_session_id = $1
+     ORDER BY cm.created_at DESC`,
+    [sessionId]
+  );
 
   let cashReceived = new Decimal(0);
   let cashPaid = new Decimal(0);
@@ -88,32 +85,39 @@ export function getCashSessionSummary(sessionId: string) {
   };
 }
 
-export function openCashSession(user: AuthUser, openingCashStr: string, notes = '') {
+export async function openCashSession(
+  user: AuthUser,
+  openingCashStr: string,
+  notes = '',
+  existingTx?: DbExecutor
+) {
   const openingCash = validateCurrencyInput(openingCashStr, 'Opening cash', { allowZero: true });
 
-  return withTransaction((tx) => {
-    const existing = tx.prepare("SELECT session_number FROM cash_sessions WHERE status = 'OPEN'").get() as
-      | { session_number: string }
-      | undefined;
+  return withTransaction(async (tx) => {
+    const existing = await tx.queryOne<{ session_number: string }>(
+      "SELECT session_number FROM cash_sessions WHERE status = 'OPEN' FOR UPDATE"
+    );
     if (existing) {
       throw new Error(`Cash session ${existing.session_number} is already OPEN. Close it before opening a new one.`);
     }
 
     const id = uuid();
-    const num = generateDocNumber(tx, 'CSH', 'cash_sessions', 'session_number');
+    const num = await generateDocNumber(tx, 'CSH', 'cash_sessions', 'session_number');
     const ts = nowIso();
 
-    tx.prepare(
+    await tx.execute(
       `INSERT INTO cash_sessions (id, session_number, status, opened_by, opened_at, opening_cash, notes)
-       VALUES (?, ?, 'OPEN', ?, ?, ?, ?)`
-    ).run(id, num, user.id, ts, openingCash.toFixed(2), notes.trim());
+       VALUES ($1, $2, 'OPEN', $3, $4, $5, $6)`,
+      [id, num, user.id, ts, openingCash.toFixed(2), notes.trim()]
+    );
 
-    tx.prepare(
+    await tx.execute(
       `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
-       VALUES (?, ?, 'OPENING_CASH', ?, 'CASH_SESSION', ?, ?, ?, ?)`
-    ).run(uuid(), id, openingCash.toFixed(2), id, notes.trim() || 'Opening cash float', user.id, ts);
+       VALUES ($1, $2, 'OPENING_CASH', $3, 'CASH_SESSION', $4, $5, $6, $7)`,
+      [uuid(), id, openingCash.toFixed(2), id, notes.trim() || 'Opening cash float', user.id, ts]
+    );
 
-    recordAudit(tx, {
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: 'OPEN_CASH_SESSION',
@@ -125,10 +129,10 @@ export function openCashSession(user: AuthUser, openingCashStr: string, notes = 
     });
 
     return { id, sessionNumber: num };
-  });
+  }, existingTx);
 }
 
-export function closeCashSession(
+export async function closeCashSession(
   user: AuthUser,
   sessionId: string,
   input: {
@@ -136,14 +140,18 @@ export function closeCashSession(
     varianceReason?: string;
     notes?: string;
     forceClose?: boolean;
-  }
+  },
+  existingTx?: DbExecutor
 ) {
   const actualCash = validateCurrencyInput(input.actualCash, 'Actual counted cash', { allowZero: true });
 
-  return withTransaction((tx) => {
-    const session = tx.prepare('SELECT * FROM cash_sessions WHERE id = ?').get(sessionId) as
-      | { id: string; session_number: string; status: string; opening_cash: string }
-      | undefined;
+  return withTransaction(async (tx) => {
+    const session = await tx.queryOne<{
+      id: string;
+      session_number: string;
+      status: string;
+      opening_cash: string;
+    }>('SELECT id, session_number, status, opening_cash FROM cash_sessions WHERE id = $1 FOR UPDATE', [sessionId]);
     if (!session) throw new Error('Cash session not found');
     if (session.status !== 'OPEN') throw new Error('Cash session is already closed');
 
@@ -151,9 +159,10 @@ export function closeCashSession(
       throw new Error('Permission denied: force-closing a cash session requires cash.force_close');
     }
 
-    const mvs = tx
-      .prepare('SELECT movement_type, amount_signed FROM cash_movements WHERE cash_session_id = ?')
-      .all(sessionId) as Array<{ movement_type: string; amount_signed: string }>;
+    const mvs = await tx.query<{ movement_type: string; amount_signed: string }>(
+      'SELECT movement_type, amount_signed FROM cash_movements WHERE cash_session_id = $1',
+      [sessionId]
+    );
 
     let cashReceived = new Decimal(0);
     let cashPaid = new Decimal(0);
@@ -189,39 +198,41 @@ export function closeCashSession(
     const nextStatus = input.forceClose ? 'FORCE_CLOSED' : 'CLOSED';
 
     if (!variance.eq(0)) {
-      tx.prepare(
+      await tx.execute(
         `INSERT INTO cash_movements (
           id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at
-        ) VALUES (?, ?, 'CASH_VARIANCE', ?, 'CASH_SESSION', ?, ?, ?, ?)`
-      ).run(
-        uuid(),
-        sessionId,
-        variance.toFixed(2),
-        sessionId,
-        `Closing variance adjustment: ${input.varianceReason?.trim()}`,
-        user.id,
-        ts
+        ) VALUES ($1, $2, 'CASH_VARIANCE', $3, 'CASH_SESSION', $4, $5, $6, $7)`,
+        [
+          uuid(),
+          sessionId,
+          variance.toFixed(2),
+          sessionId,
+          `Closing variance adjustment: ${input.varianceReason?.trim()}`,
+          user.id,
+          ts,
+        ]
       );
     }
 
-    tx.prepare(
+    await tx.execute(
       `UPDATE cash_sessions SET
-        status = ?, closed_by = ?, closed_at = ?, expected_cash = ?, actual_cash = ?,
-        variance = ?, variance_reason = ?, notes = COALESCE(NULLIF(?, ''), notes)
-       WHERE id = ?`
-    ).run(
-      nextStatus,
-      user.id,
-      ts,
-      expectedCash.toFixed(2),
-      actualCash.toFixed(2),
-      variance.toFixed(2),
-      (input.varianceReason || '').trim(),
-      (input.notes || '').trim(),
-      sessionId
+        status = $1, closed_by = $2, closed_at = $3, expected_cash = $4, actual_cash = $5,
+        variance = $6, variance_reason = $7, notes = COALESCE(NULLIF($8, ''), notes)
+       WHERE id = $9`,
+      [
+        nextStatus,
+        user.id,
+        ts,
+        expectedCash.toFixed(2),
+        actualCash.toFixed(2),
+        variance.toFixed(2),
+        (input.varianceReason || '').trim(),
+        (input.notes || '').trim(),
+        sessionId,
+      ]
     );
 
-    recordAudit(tx, {
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: input.forceClose ? 'FORCE_CLOSE_CASH_SESSION' : 'CLOSE_CASH_SESSION',
@@ -240,10 +251,10 @@ export function closeCashSession(
       actualCash: actualCash.toFixed(2),
       variance: variance.toFixed(2),
     };
-  });
+  }, existingTx);
 }
 
-export function recordPartyPayment(
+export async function recordPartyPayment(
   user: AuthUser,
   input: {
     partyType: 'CUSTOMER' | 'SUPPLIER';
@@ -253,62 +264,79 @@ export function recordPartyPayment(
     referenceNo?: string;
     notes?: string;
     targetDocId?: string | null;
-  }
+  },
+  existingTx?: DbExecutor
 ) {
   const amt = validateCurrencyInput(input.amount, 'Payment amount', { allowZero: false });
 
-  return withTransaction((tx) => {
+  return withTransaction(async (tx) => {
     const ts = nowIso();
     const payId = uuid();
-    const payNo = generateDocNumber(tx, 'PAY', 'payments', 'payment_number');
+    const payNo = await generateDocNumber(tx, 'PAY', 'payments', 'payment_number');
     const direction = input.partyType === 'CUSTOMER' ? 'IN' : 'OUT';
     let allocatedToDocs = new Decimal(0);
     let openingApplied = new Decimal(0);
     let advanceAdded = new Decimal(0);
 
     if (input.partyType === 'CUSTOMER') {
-      const cust = tx
-        .prepare('SELECT id, name, current_balance, advance_balance FROM customers WHERE id = ?')
-        .get(input.partyId) as
-        | { id: string; name: string; current_balance: string; advance_balance: string }
-        | undefined;
+      const cust = await tx.queryOne<{
+        id: string;
+        name: string;
+        current_balance: string;
+        advance_balance: string;
+      }>('SELECT id, name, current_balance, advance_balance FROM customers WHERE id = $1 FOR UPDATE', [input.partyId]);
       if (!cust) throw new Error('Customer not found');
 
-      tx.prepare(
+      await tx.execute(
         `INSERT INTO payments (id, payment_number, party_type, party_id, direction, method, amount, reference_no, notes, status, created_by, created_at)
-         VALUES (?, ?, 'CUSTOMER', ?, 'IN', ?, ?, ?, ?, 'POSTED', ?, ?)`
-      ).run(payId, payNo, cust.id, input.method, amt.toFixed(2), (input.referenceNo || '').trim(), (input.notes || '').trim(), user.id, ts);
+         VALUES ($1, $2, 'CUSTOMER', $3, 'IN', $4, $5, $6, $7, 'POSTED', $8, $9)`,
+        [
+          payId,
+          payNo,
+          cust.id,
+          input.method,
+          amt.toFixed(2),
+          (input.referenceNo || '').trim(),
+          (input.notes || '').trim(),
+          user.id,
+          ts,
+        ]
+      );
 
       let remainingToAlloc = amt;
       const candidateSales = input.targetDocId
-        ? (tx
-            .prepare("SELECT id, paid_amount, due_amount FROM sales WHERE id = ? AND customer_id = ? AND status = 'COMPLETED'")
-            .all(input.targetDocId, cust.id) as Array<{ id: string; paid_amount: string; due_amount: string }>)
-        : (tx
-            .prepare("SELECT id, paid_amount, due_amount FROM sales WHERE customer_id = ? AND status = 'COMPLETED' ORDER BY sale_date ASC, created_at ASC")
-            .all(cust.id) as Array<{ id: string; paid_amount: string; due_amount: string }>);
+        ? await tx.query<{ id: string; paid_amount: string; due_amount: string }>(
+            "SELECT id, paid_amount, due_amount FROM sales WHERE id = $1 AND customer_id = $2 AND status = 'COMPLETED' FOR UPDATE",
+            [input.targetDocId, cust.id]
+          )
+        : await tx.query<{ id: string; paid_amount: string; due_amount: string }>(
+            "SELECT id, paid_amount, due_amount FROM sales WHERE customer_id = $1 AND status = 'COMPLETED' ORDER BY sale_date ASC, created_at ASC FOR UPDATE",
+            [cust.id]
+          );
 
       for (const s of candidateSales) {
         if (remainingToAlloc.lte(0)) break;
         const due = money(s.due_amount);
         if (due.lte(0)) continue;
         const apply = Decimal.min(due, remainingToAlloc);
-        tx.prepare(
-          `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES (?, ?, 'SALE', ?, ?)`
-        ).run(uuid(), payId, s.id, apply.toFixed(2));
-        tx.prepare('UPDATE sales SET paid_amount = ?, due_amount = ? WHERE id = ?').run(
+        await tx.execute(
+          `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES ($1, $2, 'SALE', $3, $4)`,
+          [uuid(), payId, s.id, apply.toFixed(2)]
+        );
+        await tx.execute('UPDATE sales SET paid_amount = $1, due_amount = $2 WHERE id = $3', [
           roundMoney(d(s.paid_amount).add(apply)).toFixed(2),
           roundMoney(due.sub(apply)).toFixed(2),
-          s.id
-        );
+          s.id,
+        ]);
         allocatedToDocs = roundMoney(allocatedToDocs.add(apply));
         remainingToAlloc = roundMoney(remainingToAlloc.sub(apply));
       }
 
       if (remainingToAlloc.gt(0)) {
-        const otherOpenRow = tx
-          .prepare("SELECT due_amount FROM sales WHERE customer_id = ? AND status = 'COMPLETED'")
-          .all(cust.id) as Array<{ due_amount: string }>;
+        const otherOpenRow = await tx.query<{ due_amount: string }>(
+          "SELECT due_amount FROM sales WHERE customer_id = $1 AND status = 'COMPLETED'",
+          [cust.id]
+        );
         let remainingOpenInvoiceDue = new Decimal(0);
         for (const r of otherOpenRow) {
           remainingOpenInvoiceDue = remainingOpenInvoiceDue.add(money(r.due_amount));
@@ -319,49 +347,52 @@ export function recordPartyPayment(
         const uninvoicedDue = Decimal.max(0, roundMoney(balAfterInvoiceAllocs.sub(remainingOpenInvoiceDue)));
         if (uninvoicedDue.gt(0)) {
           openingApplied = Decimal.min(uninvoicedDue, remainingToAlloc);
-          tx.prepare(
-            `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES (?, ?, 'CUSTOMER_OPENING', ?, ?)`
-          ).run(uuid(), payId, cust.id, openingApplied.toFixed(2));
+          await tx.execute(
+            `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES ($1, $2, 'CUSTOMER_OPENING', $3, $4)`,
+            [uuid(), payId, cust.id, openingApplied.toFixed(2)]
+          );
           remainingToAlloc = roundMoney(remainingToAlloc.sub(openingApplied));
         }
       }
 
       if (remainingToAlloc.gt(0)) {
         advanceAdded = remainingToAlloc;
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO party_advance_ledger (
             id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at
-          ) VALUES (?, 'CUSTOMER', ?, 'ADVANCE_RECEIPT', 'PAYMENT', ?, ?, ?, ?, ?)`
-        ).run(
-          uuid(),
-          cust.id,
-          payId,
-          advanceAdded.toFixed(2),
-          `Advance credit from payment ${payNo}`,
-          user.id,
-          ts
+          ) VALUES ($1, 'CUSTOMER', $2, 'ADVANCE_RECEIPT', 'PAYMENT', $3, $4, $5, $6, $7)`,
+          [
+            uuid(),
+            cust.id,
+            payId,
+            advanceAdded.toFixed(2),
+            `Advance credit from payment ${payNo}`,
+            user.id,
+            ts,
+          ]
         );
       }
 
       const nextBal = roundMoney(d(cust.current_balance).sub(allocatedToDocs).sub(openingApplied));
       const nextAdv = roundMoney(d(cust.advance_balance || '0.00').add(advanceAdded));
-      tx.prepare('UPDATE customers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
+      await tx.execute('UPDATE customers SET current_balance = $1, advance_balance = $2, updated_at = $3 WHERE id = $4', [
         nextBal.toFixed(2),
         nextAdv.toFixed(2),
         ts,
-        cust.id
-      );
+        cust.id,
+      ]);
 
       if (input.method === 'CASH') {
-        const cashSessionId = getActiveCashSessionId(tx);
+        const cashSessionId = await getActiveCashSessionId(tx);
         if (!cashSessionId) throw new Error('Cannot collect CASH payment without an OPEN cash session');
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
-           VALUES (?, ?, 'CUSTOMER_CASH_COLLECTION', ?, 'PAYMENT', ?, ?, ?, ?)`
-        ).run(uuid(), cashSessionId, amt.toFixed(2), payId, `Cash collected from ${cust.name} (${payNo})`, user.id, ts);
+           VALUES ($1, $2, 'CUSTOMER_CASH_COLLECTION', $3, 'PAYMENT', $4, $5, $6, $7)`,
+          [uuid(), cashSessionId, amt.toFixed(2), payId, `Cash collected from ${cust.name} (${payNo})`, user.id, ts]
+        );
       }
 
-      recordAudit(tx, {
+      await recordAudit(tx, {
         userId: user.id,
         username: user.username,
         action: 'CUSTOMER_PAYMENT',
@@ -381,49 +412,65 @@ export function recordPartyPayment(
         },
       });
     } else {
-      const sup = tx
-        .prepare('SELECT id, name, current_balance, advance_balance FROM suppliers WHERE id = ?')
-        .get(input.partyId) as
-        | { id: string; name: string; current_balance: string; advance_balance: string }
-        | undefined;
+      const sup = await tx.queryOne<{
+        id: string;
+        name: string;
+        current_balance: string;
+        advance_balance: string;
+      }>('SELECT id, name, current_balance, advance_balance FROM suppliers WHERE id = $1 FOR UPDATE', [input.partyId]);
       if (!sup) throw new Error('Supplier not found');
 
-      tx.prepare(
+      await tx.execute(
         `INSERT INTO payments (id, payment_number, party_type, party_id, direction, method, amount, reference_no, notes, status, created_by, created_at)
-         VALUES (?, ?, 'SUPPLIER', ?, 'OUT', ?, ?, ?, ?, 'POSTED', ?, ?)`
-      ).run(payId, payNo, sup.id, input.method, amt.toFixed(2), (input.referenceNo || '').trim(), (input.notes || '').trim(), user.id, ts);
+         VALUES ($1, $2, 'SUPPLIER', $3, 'OUT', $4, $5, $6, $7, 'POSTED', $8, $9)`,
+        [
+          payId,
+          payNo,
+          sup.id,
+          input.method,
+          amt.toFixed(2),
+          (input.referenceNo || '').trim(),
+          (input.notes || '').trim(),
+          user.id,
+          ts,
+        ]
+      );
 
       let remainingToAlloc = amt;
       const candidatePurchases = input.targetDocId
-        ? (tx
-            .prepare("SELECT id, paid_amount, due_amount FROM purchases WHERE id = ? AND supplier_id = ? AND status = 'RECEIVED'")
-            .all(input.targetDocId, sup.id) as Array<{ id: string; paid_amount: string; due_amount: string }>)
-        : (tx
-            .prepare("SELECT id, paid_amount, due_amount FROM purchases WHERE supplier_id = ? AND status = 'RECEIVED' ORDER BY purchase_date ASC, created_at ASC")
-            .all(sup.id) as Array<{ id: string; paid_amount: string; due_amount: string }>);
+        ? await tx.query<{ id: string; paid_amount: string; due_amount: string }>(
+            "SELECT id, paid_amount, due_amount FROM purchases WHERE id = $1 AND supplier_id = $2 AND status = 'RECEIVED' FOR UPDATE",
+            [input.targetDocId, sup.id]
+          )
+        : await tx.query<{ id: string; paid_amount: string; due_amount: string }>(
+            "SELECT id, paid_amount, due_amount FROM purchases WHERE supplier_id = $1 AND status = 'RECEIVED' ORDER BY purchase_date ASC, created_at ASC FOR UPDATE",
+            [sup.id]
+          );
 
       for (const p of candidatePurchases) {
         if (remainingToAlloc.lte(0)) break;
         const due = money(p.due_amount);
         if (due.lte(0)) continue;
         const apply = Decimal.min(due, remainingToAlloc);
-        tx.prepare(
-          `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES (?, ?, 'PURCHASE', ?, ?)`
-        ).run(uuid(), payId, p.id, apply.toFixed(2));
-        tx.prepare('UPDATE purchases SET paid_amount = ?, due_amount = ?, updated_at = ? WHERE id = ?').run(
+        await tx.execute(
+          `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES ($1, $2, 'PURCHASE', $3, $4)`,
+          [uuid(), payId, p.id, apply.toFixed(2)]
+        );
+        await tx.execute('UPDATE purchases SET paid_amount = $1, due_amount = $2, updated_at = $3 WHERE id = $4', [
           roundMoney(d(p.paid_amount).add(apply)).toFixed(2),
           roundMoney(due.sub(apply)).toFixed(2),
           ts,
-          p.id
-        );
+          p.id,
+        ]);
         allocatedToDocs = roundMoney(allocatedToDocs.add(apply));
         remainingToAlloc = roundMoney(remainingToAlloc.sub(apply));
       }
 
       if (remainingToAlloc.gt(0)) {
-        const otherOpenRow = tx
-          .prepare("SELECT due_amount FROM purchases WHERE supplier_id = ? AND status = 'RECEIVED'")
-          .all(sup.id) as Array<{ due_amount: string }>;
+        const otherOpenRow = await tx.query<{ due_amount: string }>(
+          "SELECT due_amount FROM purchases WHERE supplier_id = $1 AND status = 'RECEIVED'",
+          [sup.id]
+        );
         let remainingOpenPurDue = new Decimal(0);
         for (const r of otherOpenRow) {
           remainingOpenPurDue = remainingOpenPurDue.add(money(r.due_amount));
@@ -434,49 +481,52 @@ export function recordPartyPayment(
         const uninvoicedDue = Decimal.max(0, roundMoney(balAfterPurAllocs.sub(remainingOpenPurDue)));
         if (uninvoicedDue.gt(0)) {
           openingApplied = Decimal.min(uninvoicedDue, remainingToAlloc);
-          tx.prepare(
-            `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES (?, ?, 'SUPPLIER_OPENING', ?, ?)`
-          ).run(uuid(), payId, sup.id, openingApplied.toFixed(2));
+          await tx.execute(
+            `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES ($1, $2, 'SUPPLIER_OPENING', $3, $4)`,
+            [uuid(), payId, sup.id, openingApplied.toFixed(2)]
+          );
           remainingToAlloc = roundMoney(remainingToAlloc.sub(openingApplied));
         }
       }
 
       if (remainingToAlloc.gt(0)) {
         advanceAdded = remainingToAlloc;
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO party_advance_ledger (
             id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at
-          ) VALUES (?, 'SUPPLIER', ?, 'ADVANCE_RECEIPT', 'PAYMENT', ?, ?, ?, ?, ?)`
-        ).run(
-          uuid(),
-          sup.id,
-          payId,
-          advanceAdded.toFixed(2),
-          `Supplier advance credit from payment ${payNo}`,
-          user.id,
-          ts
+          ) VALUES ($1, 'SUPPLIER', $2, 'ADVANCE_RECEIPT', 'PAYMENT', $3, $4, $5, $6, $7)`,
+          [
+            uuid(),
+            sup.id,
+            payId,
+            advanceAdded.toFixed(2),
+            `Supplier advance credit from payment ${payNo}`,
+            user.id,
+            ts,
+          ]
         );
       }
 
       const nextBal = roundMoney(d(sup.current_balance).sub(allocatedToDocs).sub(openingApplied));
       const nextAdv = roundMoney(d(sup.advance_balance || '0.00').add(advanceAdded));
-      tx.prepare('UPDATE suppliers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
+      await tx.execute('UPDATE suppliers SET current_balance = $1, advance_balance = $2, updated_at = $3 WHERE id = $4', [
         nextBal.toFixed(2),
         nextAdv.toFixed(2),
         ts,
-        sup.id
-      );
+        sup.id,
+      ]);
 
       if (input.method === 'CASH') {
-        const cashSessionId = getActiveCashSessionId(tx);
+        const cashSessionId = await getActiveCashSessionId(tx);
         if (!cashSessionId) throw new Error('Cannot pay supplier in CASH without an OPEN cash session');
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
-           VALUES (?, ?, 'SUPPLIER_CASH_PAYMENT', ?, 'PAYMENT', ?, ?, ?, ?)`
-        ).run(uuid(), cashSessionId, amt.neg().toFixed(2), payId, `Cash paid to ${sup.name} (${payNo})`, user.id, ts);
+           VALUES ($1, $2, 'SUPPLIER_CASH_PAYMENT', $3, 'PAYMENT', $4, $5, $6, $7)`,
+          [uuid(), cashSessionId, amt.neg().toFixed(2), payId, `Cash paid to ${sup.name} (${payNo})`, user.id, ts]
+        );
       }
 
-      recordAudit(tx, {
+      await recordAudit(tx, {
         userId: user.id,
         username: user.username,
         action: 'SUPPLIER_PAYMENT',
@@ -505,26 +555,37 @@ export function recordPartyPayment(
       openingApplied: openingApplied.toFixed(2),
       advanceAdded: advanceAdded.toFixed(2),
     };
-  });
+  }, existingTx);
 }
 
-export function reversePayment(user: AuthUser, paymentId: string, reason: string) {
+export async function reversePayment(
+  user: AuthUser,
+  paymentId: string,
+  reason: string,
+  existingTx?: DbExecutor
+) {
   if (!reason?.trim()) throw new Error('Mandatory reason is required to reverse a payment');
-  return withTransaction((tx) => {
-    const pay = tx.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId) as
-      | { id: string; payment_number: string; party_type: string; party_id: string; direction: string; method: string; amount: string; status: string }
-      | undefined;
+  return withTransaction(async (tx) => {
+    const pay = await tx.queryOne<{
+      id: string;
+      payment_number: string;
+      party_type: string;
+      party_id: string;
+      direction: string;
+      method: string;
+      amount: string;
+      status: string;
+    }>('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [paymentId]);
     if (!pay) throw new Error('Payment not found');
     if (pay.status !== 'POSTED') throw new Error('Payment is already reversed');
 
     const ts = nowIso();
     const amt = money(pay.amount);
 
-    const advRows = tx
-      .prepare(
-        "SELECT amount_signed FROM party_advance_ledger WHERE source_type = 'PAYMENT' AND source_id = ? AND entry_type = 'ADVANCE_RECEIPT'"
-      )
-      .all(pay.id) as Array<{ amount_signed: string }>;
+    const advRows = await tx.query<{ amount_signed: string }>(
+      "SELECT amount_signed FROM party_advance_ledger WHERE source_type = 'PAYMENT' AND source_id = $1 AND entry_type = 'ADVANCE_RECEIPT'",
+      [pay.id]
+    );
     let advanceAdded = new Decimal(0);
     for (const ar of advRows) {
       advanceAdded = advanceAdded.add(money(ar.amount_signed));
@@ -534,9 +595,10 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
     const restoredDueDelta = roundMoney(amt.sub(advanceAdded));
 
     if (pay.party_type === 'CUSTOMER' && pay.party_id) {
-      const cust = tx.prepare('SELECT current_balance, advance_balance FROM customers WHERE id = ?').get(pay.party_id) as
-        | { current_balance: string; advance_balance: string }
-        | undefined;
+      const cust = await tx.queryOne<{ current_balance: string; advance_balance: string }>(
+        'SELECT current_balance, advance_balance FROM customers WHERE id = $1 FOR UPDATE',
+        [pay.party_id]
+      );
       if (cust) {
         const curAdv = money(cust.advance_balance || '0.00');
         if (curAdv.lt(advanceAdded)) {
@@ -544,17 +606,18 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
             `Cannot reverse payment ${pay.payment_number}: advance credit (${advanceAdded.toFixed(2)}) created by this payment has already been consumed on subsequent transactions`
           );
         }
-        tx.prepare('UPDATE customers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
+        await tx.execute('UPDATE customers SET current_balance = $1, advance_balance = $2, updated_at = $3 WHERE id = $4', [
           roundMoney(d(cust.current_balance).add(restoredDueDelta)).toFixed(2),
           roundMoney(curAdv.sub(advanceAdded)).toFixed(2),
           ts,
-          pay.party_id
-        );
+          pay.party_id,
+        ]);
       }
     } else if (pay.party_type === 'SUPPLIER' && pay.party_id) {
-      const sup = tx.prepare('SELECT current_balance, advance_balance FROM suppliers WHERE id = ?').get(pay.party_id) as
-        | { current_balance: string; advance_balance: string }
-        | undefined;
+      const sup = await tx.queryOne<{ current_balance: string; advance_balance: string }>(
+        'SELECT current_balance, advance_balance FROM suppliers WHERE id = $1 FOR UPDATE',
+        [pay.party_id]
+      );
       if (sup) {
         const curAdv = money(sup.advance_balance || '0.00');
         if (curAdv.lt(advanceAdded)) {
@@ -562,79 +625,86 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
             `Cannot reverse payment ${pay.payment_number}: supplier advance credit (${advanceAdded.toFixed(2)}) created by this payment has already been consumed on subsequent purchases`
           );
         }
-        tx.prepare('UPDATE suppliers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
+        await tx.execute('UPDATE suppliers SET current_balance = $1, advance_balance = $2, updated_at = $3 WHERE id = $4', [
           roundMoney(d(sup.current_balance).add(restoredDueDelta)).toFixed(2),
           roundMoney(curAdv.sub(advanceAdded)).toFixed(2),
           ts,
-          pay.party_id
-        );
+          pay.party_id,
+        ]);
       }
     }
 
     if (advanceAdded.gt(0) && (pay.party_type === 'CUSTOMER' || pay.party_type === 'SUPPLIER') && pay.party_id) {
-      tx.prepare(
+      await tx.execute(
         `INSERT INTO party_advance_ledger (
           id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at
-        ) VALUES (?, ?, ?, 'REVERSAL', 'PAYMENT_REVERSAL', ?, ?, ?, ?, ?)`
-      ).run(
-        uuid(),
-        pay.party_type,
-        pay.party_id,
-        pay.id,
-        advanceAdded.neg().toFixed(2),
-        `Advance reversed from payment ${pay.payment_number}: ${reason.trim()}`,
-        user.id,
-        ts
+        ) VALUES ($1, $2, $3, 'REVERSAL', 'PAYMENT_REVERSAL', $4, $5, $6, $7, $8)`,
+        [
+          uuid(),
+          pay.party_type,
+          pay.party_id,
+          pay.id,
+          advanceAdded.neg().toFixed(2),
+          `Advance reversed from payment ${pay.payment_number}: ${reason.trim()}`,
+          user.id,
+          ts,
+        ]
       );
     }
 
-    const allocs = tx.prepare('SELECT * FROM payment_allocations WHERE payment_id = ?').all(pay.id) as Array<{
+    const allocs = await tx.query<{
       target_type: string;
       target_id: string;
       amount_allocated: string;
-    }>;
+    }>('SELECT * FROM payment_allocations WHERE payment_id = $1 ORDER BY target_id ASC', [pay.id]);
 
     for (const a of allocs) {
       const alAmt = money(a.amount_allocated);
       if (a.target_type === 'SALE') {
-        const s = tx.prepare('SELECT paid_amount, due_amount FROM sales WHERE id = ?').get(a.target_id) as
-          | { paid_amount: string; due_amount: string }
-          | undefined;
+        const s = await tx.queryOne<{ paid_amount: string; due_amount: string }>(
+          'SELECT paid_amount, due_amount FROM sales WHERE id = $1 FOR UPDATE',
+          [a.target_id]
+        );
         if (s) {
-          tx.prepare('UPDATE sales SET paid_amount = ?, due_amount = ? WHERE id = ?').run(
+          await tx.execute('UPDATE sales SET paid_amount = $1, due_amount = $2 WHERE id = $3', [
             roundMoney(d(s.paid_amount).sub(alAmt)).toFixed(2),
             roundMoney(d(s.due_amount).add(alAmt)).toFixed(2),
-            a.target_id
-          );
+            a.target_id,
+          ]);
         }
       } else if (a.target_type === 'PURCHASE') {
-        const p = tx.prepare('SELECT paid_amount, due_amount FROM purchases WHERE id = ?').get(a.target_id) as
-          | { paid_amount: string; due_amount: string }
-          | undefined;
+        const p = await tx.queryOne<{ paid_amount: string; due_amount: string }>(
+          'SELECT paid_amount, due_amount FROM purchases WHERE id = $1 FOR UPDATE',
+          [a.target_id]
+        );
         if (p) {
-          tx.prepare('UPDATE purchases SET paid_amount = ?, due_amount = ?, updated_at = ? WHERE id = ?').run(
+          await tx.execute('UPDATE purchases SET paid_amount = $1, due_amount = $2, updated_at = $3 WHERE id = $4', [
             roundMoney(d(p.paid_amount).sub(alAmt)).toFixed(2),
             roundMoney(d(p.due_amount).add(alAmt)).toFixed(2),
             ts,
-            a.target_id
-          );
+            a.target_id,
+          ]);
         }
       }
     }
 
     if (pay.method === 'CASH') {
-      const cashSessionId = getActiveCashSessionId(tx);
+      const cashSessionId = await getActiveCashSessionId(tx);
       if (!cashSessionId) throw new Error('Open cash session required to reverse a CASH payment');
       const signed = pay.direction === 'IN' ? amt.neg().toFixed(2) : amt.toFixed(2);
-      tx.prepare(
+      await tx.execute(
         `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
-         VALUES (?, ?, 'REVERSAL', ?, 'PAYMENT_REVERSAL', ?, ?, ?, ?)`
-      ).run(uuid(), cashSessionId, signed, pay.id, `Reversal of ${pay.payment_number}: ${reason.trim()}`, user.id, ts);
+         VALUES ($1, $2, 'REVERSAL', $3, 'PAYMENT_REVERSAL', $4, $5, $6, $7)`,
+        [uuid(), cashSessionId, signed, pay.id, `Reversal of ${pay.payment_number}: ${reason.trim()}`, user.id, ts]
+      );
     }
 
-    tx.prepare("UPDATE payments SET status = 'REVERSED', reversal_reason = ? WHERE id = ?").run(reason.trim(), pay.id);
+    await tx.execute("UPDATE payments SET status = 'REVERSED', reversal_reason = $1 WHERE id = $2", [
+      reason.trim(),
+      pay.id,
+    ]);
 
-    recordAudit(tx, {
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: 'REVERSE_PAYMENT',
@@ -650,10 +720,10 @@ export function reversePayment(user: AuthUser, paymentId: string, reason: string
       },
       reason: reason.trim(),
     });
-  });
+  }, existingTx);
 }
 
-export function createExpense(
+export async function createExpense(
   user: AuthUser,
   input: {
     categoryId: string;
@@ -663,32 +733,47 @@ export function createExpense(
     paymentMethod: 'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD' | 'OTHER';
     referenceNo?: string;
     notes?: string;
-  }
+  },
+  existingTx?: DbExecutor
 ) {
   if (!input.name?.trim()) throw new Error('Expense name is required');
   const amt = validateCurrencyInput(input.amount, 'Expense amount', { allowZero: false });
 
-  return withTransaction((tx) => {
+  return withTransaction(async (tx) => {
     const id = uuid();
-    const num = generateDocNumber(tx, 'EXP', 'expenses', 'expense_number');
+    const num = await generateDocNumber(tx, 'EXP', 'expenses', 'expense_number');
     const ts = nowIso();
     const expDate = input.expenseDate || todayDate();
 
-    tx.prepare(
+    await tx.execute(
       `INSERT INTO expenses (id, expense_number, category_id, name, amount, expense_date, payment_method, reference_no, notes, status, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'POSTED', ?, ?)`
-    ).run(id, num, input.categoryId, input.name.trim(), amt.toFixed(2), expDate, input.paymentMethod, (input.referenceNo || '').trim(), (input.notes || '').trim(), user.id, ts);
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'POSTED', $10, $11)`,
+      [
+        id,
+        num,
+        input.categoryId,
+        input.name.trim(),
+        amt.toFixed(2),
+        expDate,
+        input.paymentMethod,
+        (input.referenceNo || '').trim(),
+        (input.notes || '').trim(),
+        user.id,
+        ts,
+      ]
+    );
 
     if (input.paymentMethod === 'CASH') {
-      const cashSessionId = getActiveCashSessionId(tx);
+      const cashSessionId = await getActiveCashSessionId(tx);
       if (!cashSessionId) throw new Error('Cannot pay CASH expense without an OPEN cash session');
-      tx.prepare(
+      await tx.execute(
         `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
-         VALUES (?, ?, 'CASH_EXPENSE', ?, 'EXPENSE', ?, ?, ?, ?)`
-      ).run(uuid(), cashSessionId, amt.neg().toFixed(2), id, `${input.name.trim()} (${num})`, user.id, ts);
+         VALUES ($1, $2, 'CASH_EXPENSE', $3, 'EXPENSE', $4, $5, $6, $7)`,
+        [uuid(), cashSessionId, amt.neg().toFixed(2), id, `${input.name.trim()} (${num})`, user.id, ts]
+      );
     }
 
-    recordAudit(tx, {
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: 'CREATE_EXPENSE',
@@ -700,33 +785,53 @@ export function createExpense(
     });
 
     return { expenseId: id, expenseNumber: num };
-  });
+  }, existingTx);
 }
 
-export function reverseExpense(user: AuthUser, expenseId: string, reason: string) {
+export async function reverseExpense(
+  user: AuthUser,
+  expenseId: string,
+  reason: string,
+  existingTx?: DbExecutor
+) {
   if (!reason?.trim()) throw new Error('Mandatory reason is required to reverse an expense');
-  return withTransaction((tx) => {
-    const exp = tx.prepare('SELECT * FROM expenses WHERE id = ?').get(expenseId) as
-      | { id: string; expense_number: string; name: string; amount: string; payment_method: string; status: string }
-      | undefined;
+  return withTransaction(async (tx) => {
+    const exp = await tx.queryOne<{
+      id: string;
+      expense_number: string;
+      name: string;
+      amount: string;
+      payment_method: string;
+      status: string;
+    }>('SELECT * FROM expenses WHERE id = $1 FOR UPDATE', [expenseId]);
     if (!exp) throw new Error('Expense not found');
     if (exp.status !== 'POSTED') throw new Error('Expense is already reversed');
 
     const ts = nowIso();
     if (exp.payment_method === 'CASH') {
-      const cashSessionId = getActiveCashSessionId(tx);
+      const cashSessionId = await getActiveCashSessionId(tx);
       if (!cashSessionId) throw new Error('Open cash session required to reverse CASH expense');
-      tx.prepare(
+      await tx.execute(
         `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
-         VALUES (?, ?, 'REVERSAL', ?, 'EXPENSE_REVERSAL', ?, ?, ?, ?)`
-      ).run(uuid(), cashSessionId, money(exp.amount).toFixed(2), exp.id, `Reversal of ${exp.expense_number}: ${reason.trim()}`, user.id, ts);
+         VALUES ($1, $2, 'REVERSAL', $3, 'EXPENSE_REVERSAL', $4, $5, $6, $7)`,
+        [
+          uuid(),
+          cashSessionId,
+          money(exp.amount).toFixed(2),
+          exp.id,
+          `Reversal of ${exp.expense_number}: ${reason.trim()}`,
+          user.id,
+          ts,
+        ]
+      );
     }
 
-    tx.prepare(
-      "UPDATE expenses SET status = 'REVERSED', reversed_by = ?, reversed_at = ?, reversal_reason = ? WHERE id = ?"
-    ).run(user.id, ts, reason.trim(), exp.id);
+    await tx.execute(
+      "UPDATE expenses SET status = 'REVERSED', reversed_by = $1, reversed_at = $2, reversal_reason = $3 WHERE id = $4",
+      [user.id, ts, reason.trim(), exp.id]
+    );
 
-    recordAudit(tx, {
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: 'REVERSE_EXPENSE',
@@ -738,5 +843,5 @@ export function reverseExpense(user: AuthUser, expenseId: string, reason: string
       afterState: { status: 'REVERSED' },
       reason: reason.trim(),
     });
-  });
+  }, existingTx);
 }

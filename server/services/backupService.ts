@@ -1,10 +1,21 @@
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { backup, DatabaseSync } from 'node:sqlite';
+import { promisify } from 'node:util';
 import * as XLSX from 'xlsx';
-import { BACKUP_DIR, DB_PATH, closeDb, getDb, nowIso, todayDate, uuid, withTransaction } from '../db.ts';
-import { recordAudit } from '../audit.ts';
+import {
+  BACKUP_DIR,
+  closeDb,
+  generateSequentialCode,
+  getDb,
+  getPgConnectionDetails,
+  nowIso,
+  todayDate,
+  uuid,
+  withTransaction,
+} from '../db.ts';
+import { recordAudit, verifyAuditChain } from '../audit.ts';
 import type { AuthUser } from '../auth.ts';
 import {
   qty,
@@ -13,44 +24,125 @@ import {
   validateCurrencyInput,
   validateQuantityInput,
 } from '../../src/shared/decimalMath.ts';
+import { reconcileInventoryLedger } from './inventoryService.ts';
+
+const execFileAsync = promisify(execFile);
+
+function resolvePgBinary(tool: 'pg_dump' | 'pg_restore' | 'psql'): string {
+  const candidates: string[] = [
+    tool,
+    `/usr/local/bin/${tool}`,
+    `/usr/bin/${tool}`,
+  ];
+
+  // Check standard Debian/Ubuntu PostgreSQL versioned paths
+  if (fs.existsSync('/usr/lib/postgresql')) {
+    for (const dir of fs.readdirSync('/usr/lib/postgresql').sort().reverse()) {
+      candidates.push(`/usr/lib/postgresql/${dir}/bin/${tool}`);
+    }
+  }
+
+  // Check standard Windows PostgreSQL installation paths
+  if (process.platform === 'win32') {
+    for (const base of ['C:\\Program Files\\PostgreSQL', 'C:\\Program Files (x86)\\PostgreSQL']) {
+      if (fs.existsSync(base)) {
+        for (const dir of fs.readdirSync(base).sort().reverse()) {
+          candidates.push(path.join(base, dir, 'bin', `${tool}.exe`));
+        }
+      }
+    }
+  }
+
+  for (const c of candidates) {
+    if (c === tool) continue;
+    if (fs.existsSync(c)) return c;
+  }
+  return tool;
+}
+
+function buildPgToolEnv(): NodeJS.ProcessEnv {
+  const cfg = getPgConnectionDetails();
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  env.PGHOST = cfg.host;
+  env.PGPORT = String(cfg.port);
+  env.PGDATABASE = cfg.database;
+  env.PGUSER = cfg.user;
+  if (cfg.password) {
+    env.PGPASSWORD = cfg.password;
+  } else {
+    delete env.PGPASSWORD;
+  }
+  if (cfg.ssl) {
+    env.PGSSLMODE = typeof cfg.ssl === 'object' && cfg.ssl.rejectUnauthorized ? 'verify-full' : 'require';
+  }
+  return env;
+}
+
+async function verifyDumpArchiveToc(filePath: string): Promise<string> {
+  const pgRestoreBin = resolvePgBinary('pg_restore');
+  const { stdout } = await execFileAsync(pgRestoreBin, ['--list', filePath], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith(';'));
+
+  const requiredTables = ['users', 'medicines', 'batches', 'sales', 'audit_logs'];
+  for (const tbl of requiredTables) {
+    if (!stdout.includes(tbl)) {
+      throw new Error(`Backup archive verification failed: missing table '${tbl}' in dump TOC`);
+    }
+  }
+  return `pg_restore TOC verified (${lines.length} objects)`;
+}
 
 export async function createVerifiedBackup(
   user: AuthUser | null,
   backupType: 'MANUAL' | 'AUTO_DAILY' | 'PRE_UPDATE' | 'PRE_RESTORE' = 'MANUAL'
 ) {
-  const db = getDb();
+  const db = await getDb();
+  const cfg = getPgConnectionDetails();
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filename = `medinest-backup-${backupType.toLowerCase()}-${stamp}.sqlite`;
+  const filename = `medinest-pg-backup-${backupType.toLowerCase()}-${stamp}.dump`;
   const targetPath = path.join(BACKUP_DIR, filename);
   const ts = nowIso();
   const id = uuid();
 
   try {
-    await backup(db, targetPath);
+    const pgDumpBin = resolvePgBinary('pg_dump');
+    await execFileAsync(
+      pgDumpBin,
+      [
+        '--format=custom',
+        '--no-owner',
+        '--no-privileges',
+        '--schema=public',
+        '--file',
+        targetPath,
+        cfg.database,
+      ],
+      {
+        env: buildPgToolEnv(),
+        maxBuffer: 32 * 1024 * 1024,
+      }
+    );
 
-    const verifyDb = new DatabaseSync(targetPath, { readOnly: true });
-    let integrityResult = 'failed';
-    try {
-      const checkRow = verifyDb.prepare('PRAGMA integrity_check;').get() as { integrity_check: string };
-      integrityResult = checkRow?.integrity_check || 'unknown';
-    } finally {
-      verifyDb.close();
-    }
-
-    if (integrityResult.toLowerCase() !== 'ok') {
-      throw new Error(`SQLite integrity_check returned '${integrityResult}'`);
-    }
-
+    const integrityResult = await verifyDumpArchiveToc(targetPath);
     const stat = fs.statSync(targetPath);
+    if (stat.size <= 0) {
+      throw new Error('pg_dump produced an empty backup file');
+    }
     const sha256 = crypto.createHash('sha256').update(fs.readFileSync(targetPath)).digest('hex');
 
-    withTransaction((tx) => {
-      tx.prepare(
+    await withTransaction(async (tx) => {
+      await tx.execute(
         `INSERT INTO backup_records (id, filename, file_path, size_bytes, sha256, integrity_check_result, backup_type, status, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'VERIFIED', ?, ?)`
-      ).run(id, filename, targetPath, stat.size, sha256, integrityResult, backupType, user?.id || null, ts);
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'VERIFIED', $8, $9)`,
+        [id, filename, targetPath, stat.size, sha256, integrityResult, backupType, user?.id || null, ts]
+      );
 
-      recordAudit(tx, {
+      await recordAudit(tx, {
         userId: user?.id || null,
         username: user?.username || 'system',
         action: 'CREATE_VERIFIED_BACKUP',
@@ -62,18 +154,19 @@ export async function createVerifiedBackup(
       });
     });
 
-    const settings = db.prepare('SELECT backup_retention_count FROM pharmacy_settings WHERE id = 1').get() as
-      | { backup_retention_count: number }
-      | undefined;
-    const retain = Math.max(3, settings?.backup_retention_count || 14);
-    const oldBackups = db
-      .prepare("SELECT id, file_path FROM backup_records WHERE status = 'VERIFIED' ORDER BY created_at DESC LIMIT -1 OFFSET ?")
-      .all(retain) as Array<{ id: string; file_path: string }>;
+    const settings = await db.queryOne<{ backup_retention_count: number }>(
+      'SELECT backup_retention_count FROM pharmacy_settings WHERE id = 1'
+    );
+    const retain = Math.max(3, Number(settings?.backup_retention_count || 14));
+    const oldBackups = await db.query<{ id: string; file_path: string }>(
+      "SELECT id, file_path FROM backup_records WHERE status = 'VERIFIED' ORDER BY created_at DESC OFFSET $1",
+      [retain]
+    );
     for (const old of oldBackups) {
       if (fs.existsSync(old.file_path)) {
         fs.unlinkSync(old.file_path);
       }
-      db.prepare('DELETE FROM backup_records WHERE id = ?').run(old.id);
+      await db.execute('DELETE FROM backup_records WHERE id = $1', [old.id]);
     }
 
     return { id, filename, sizeBytes: stat.size, sha256, integrityCheck: integrityResult };
@@ -85,13 +178,14 @@ export async function createVerifiedBackup(
       // ignore cleanup error
     }
     try {
-      withTransaction((tx) => {
-        tx.prepare(
+      await withTransaction(async (tx) => {
+        await tx.execute(
           `INSERT INTO backup_records (id, filename, file_path, size_bytes, sha256, integrity_check_result, backup_type, status, error_message, created_by, created_at)
-           VALUES (?, ?, ?, 0, '', 'FAILED', ?, 'FAILED', ?, ?, ?)`
-        ).run(id, filename, targetPath, backupType, msg, user?.id || null, ts);
+           VALUES ($1, $2, $3, 0, '', 'FAILED', $4, 'FAILED', $5, $6, $7)`,
+          [id, filename, targetPath, backupType, msg, user?.id || null, ts]
+        );
 
-        recordAudit(tx, {
+        await recordAudit(tx, {
           userId: user?.id || null,
           username: user?.username || 'system',
           action: 'CREATE_VERIFIED_BACKUP',
@@ -104,16 +198,16 @@ export async function createVerifiedBackup(
         });
       });
     } catch {
-      // If DB itself is unreachable during error recording, preserve original error
+      // Preserve primary error
     }
     throw err;
   }
 }
 
-function recordRestoreFailureAudit(user: AuthUser, backupId: string, filename: string, reason: string) {
+async function recordRestoreFailureAudit(user: AuthUser, backupId: string, filename: string, reason: string) {
   try {
-    withTransaction((tx) => {
-      recordAudit(tx, {
+    await withTransaction(async (tx) => {
+      await recordAudit(tx, {
         userId: user.id,
         username: user.username,
         action: 'RESTORE_BACKUP',
@@ -126,31 +220,56 @@ function recordRestoreFailureAudit(user: AuthUser, backupId: string, filename: s
       });
     });
   } catch {
-    // Do not mask original restore error if audit logging fails
+    // Do not mask original restore error
   }
 }
 
+async function executePgRestoreArchive(filePath: string): Promise<void> {
+  const cfg = getPgConnectionDetails();
+  const pgRestoreBin = resolvePgBinary('pg_restore');
+  await execFileAsync(
+    pgRestoreBin,
+    [
+      '--clean',
+      '--if-exists',
+      '--no-owner',
+      '--no-privileges',
+      '--exit-on-error',
+      '--single-transaction',
+      '--dbname',
+      cfg.database,
+      filePath,
+    ],
+    {
+      env: buildPgToolEnv(),
+      maxBuffer: 32 * 1024 * 1024,
+    }
+  );
+}
+
 export async function restoreFromBackup(user: AuthUser, backupId: string) {
-  const db = getDb();
-  const rec = db
-    .prepare('SELECT id, filename, file_path, sha256, status FROM backup_records WHERE id = ?')
-    .get(backupId) as
-    | { id: string; filename: string; file_path: string; sha256: string; status: string }
-    | undefined;
+  const db = await getDb();
+  const rec = await db.queryOne<{
+    id: string;
+    filename: string;
+    file_path: string;
+    sha256: string;
+    status: string;
+  }>('SELECT id, filename, file_path, sha256, status FROM backup_records WHERE id = $1', [backupId]);
 
   if (!rec || rec.status !== 'VERIFIED') {
     const msg = 'Selected backup record is missing or unverified';
-    recordRestoreFailureAudit(user, backupId, rec?.filename || backupId, msg);
+    await recordRestoreFailureAudit(user, backupId, rec?.filename || backupId, msg);
     throw new Error(msg);
   }
   if (!rec.sha256 || !/^[a-f0-9]{64}$/i.test(rec.sha256)) {
     const msg = 'Selected backup record is missing a valid expected SHA-256 checksum';
-    recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
+    await recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
     throw new Error(msg);
   }
   if (!fs.existsSync(rec.file_path)) {
     const msg = 'Backup file does not exist on disk';
-    recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
+    await recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
     throw new Error(msg);
   }
 
@@ -159,27 +278,16 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
   const actualBuf = Buffer.from(actualSha256.toLowerCase(), 'utf8');
   if (expectedBuf.length !== actualBuf.length || !crypto.timingSafeEqual(expectedBuf, actualBuf)) {
     const msg = `Backup SHA-256 checksum mismatch for ${rec.filename}. Restore aborted to prevent corrupted or tampered recovery.`;
-    recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
+    await recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
     throw new Error(msg);
   }
 
-  let checkDb: DatabaseSync | null = null;
   try {
-    checkDb = new DatabaseSync(rec.file_path, { readOnly: true });
-    const res = checkDb.prepare('PRAGMA integrity_check;').get() as { integrity_check: string };
-    if (res?.integrity_check?.toLowerCase() !== 'ok') {
-      throw new Error(`Backup file failed integrity check: ${res?.integrity_check}`);
-    }
+    await verifyDumpArchiveToc(rec.file_path);
   } catch (err) {
-    const msg = (err as Error).message || 'Backup file failed SQLite integrity verification';
-    recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
+    const msg = (err as Error).message || 'Backup archive failed pg_restore verification';
+    await recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
     throw new Error(msg);
-  } finally {
-    try {
-      checkDb?.close();
-    } catch {
-      // ignore close failure
-    }
   }
 
   let preRestore: Awaited<ReturnType<typeof createVerifiedBackup>>;
@@ -187,27 +295,31 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
     preRestore = await createVerifiedBackup(user, 'PRE_RESTORE');
   } catch (err) {
     const msg = `Pre-restore safety backup failed: ${(err as Error).message}`;
-    recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
+    await recordRestoreFailureAudit(user, rec.id, rec.filename, msg);
     throw new Error(msg);
   }
 
   const preRestorePath = path.join(BACKUP_DIR, preRestore.filename);
 
-  closeDb();
+  // Close Node pool before dropping/recreating tables via pg_restore so active sockets do not block DDL
+  await closeDb();
   try {
-    fs.copyFileSync(rec.file_path, DB_PATH);
-    for (const suffix of ['-wal', '-shm']) {
-      if (fs.existsSync(DB_PATH + suffix)) fs.unlinkSync(DB_PATH + suffix);
+    await executePgRestoreArchive(rec.file_path);
+
+    const restoredDb = await getDb();
+    const auditVerification = await verifyAuditChain(restoredDb);
+    if (!auditVerification.valid) {
+      throw new Error(`Post-restore audit chain check failed at seq #${auditVerification.brokenAtSeq}`);
+    }
+    const ledgerCheck = await reconcileInventoryLedger(restoredDb);
+    if (!ledgerCheck.healthy) {
+      throw new Error(`Post-restore inventory ledger reconciliation found ${ledgerCheck.discrepancyCount} discrepancy(ies)`);
     }
 
-    const restored = getDb();
-    const postCheck = restored.prepare('PRAGMA integrity_check;').get() as { integrity_check: string };
-    if (postCheck?.integrity_check?.toLowerCase() !== 'ok') {
-      throw new Error(`Post-restore integrity verification failed: ${postCheck?.integrity_check}`);
-    }
+    const integritySummary = `ok (audit=${auditVerification.totalEntries}, batches=${ledgerCheck.checkedBatches})`;
 
-    withTransaction((tx) => {
-      recordAudit(tx, {
+    await withTransaction(async (tx) => {
+      await recordAudit(tx, {
         userId: user.id,
         username: user.username,
         action: 'RESTORE_BACKUP',
@@ -219,9 +331,9 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
           restoredFrom: rec.filename,
           sha256Verified: actualSha256,
           preRestoreBackup: preRestore.filename,
-          integrity: postCheck.integrity_check,
+          integrity: integritySummary,
         },
-        reason: `Restored database from SHA-256 verified backup ${rec.filename}`,
+        reason: `Restored PostgreSQL database from SHA-256 verified backup ${rec.filename}`,
       });
     });
 
@@ -229,19 +341,17 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
       restoredFrom: rec.filename,
       sha256: actualSha256,
       preRestoreBackup: preRestore.filename,
-      integrity: postCheck.integrity_check,
+      integrity: 'ok',
+      details: integritySummary,
     };
   } catch (restoreErr) {
     const msg = (restoreErr as Error).message;
     try {
-      closeDb();
+      await closeDb();
       if (fs.existsSync(preRestorePath)) {
-        fs.copyFileSync(preRestorePath, DB_PATH);
-        for (const suffix of ['-wal', '-shm']) {
-          if (fs.existsSync(DB_PATH + suffix)) fs.unlinkSync(DB_PATH + suffix);
-        }
-        getDb();
-        recordRestoreFailureAudit(
+        await executePgRestoreArchive(preRestorePath);
+        await getDb();
+        await recordRestoreFailureAudit(
           user,
           rec.id,
           rec.filename,
@@ -249,7 +359,7 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
         );
       }
     } catch {
-      // Preserve primary restore failure error
+      // Preserve primary error
     }
     throw restoreErr;
   }
@@ -315,14 +425,24 @@ export interface ParsedImportRow {
   errors: string[];
 }
 
-export function parseAndValidateExcelImport(buffer: Buffer): ParsedImportRow[] {
+export async function parseAndValidateExcelImport(buffer: Buffer): Promise<ParsedImportRow[]> {
   const wb = XLSX.read(buffer, { type: 'buffer' });
   const sheetName = wb.SheetNames[0];
   if (!sheetName) throw new Error('Excel workbook contains no sheets');
   const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[sheetName], { defval: '' });
-  const db = getDb();
+  const db = await getDb();
   const today = todayDate();
   const seenBarcodes = new Set<string>();
+
+  const existingMeds = await db.query<{ id: string; barcode: string; brand_name: string; strength: string }>(
+    'SELECT id, barcode, brand_name, strength FROM medicines'
+  );
+  const barcodeMap = new Map<string, string>();
+  const nameStrengthMap = new Map<string, string>();
+  for (const m of existingMeds) {
+    if (m.barcode) barcodeMap.set(m.barcode.toLowerCase(), m.id);
+    nameStrengthMap.set(`${m.brand_name.toLowerCase()}||${m.strength.toLowerCase()}`, m.id);
+  }
 
   return rows.map((raw, idx) => {
     const errors: string[] = [];
@@ -355,10 +475,7 @@ export function parseAndValidateExcelImport(buffer: Buffer): ParsedImportRow[] {
       } else {
         seenBarcodes.add(lowerBc);
       }
-      const existingBc = db
-        .prepare("SELECT id FROM medicines WHERE LOWER(barcode) = LOWER(?) AND barcode != ''")
-        .get(barcode) as { id: string } | undefined;
-      if (existingBc) {
+      if (barcodeMap.has(lowerBc)) {
         errors.push(`Barcode '${barcode}' already exists in database`);
       }
     }
@@ -417,9 +534,7 @@ export function parseAndValidateExcelImport(buffer: Buffer): ParsedImportRow[] {
       }
     }
 
-    const dup = db
-      .prepare('SELECT id FROM medicines WHERE LOWER(brand_name) = LOWER(?) AND LOWER(strength) = LOWER(?)')
-      .get(brandName, strength) as { id: string } | undefined;
+    const dupId = nameStrengthMap.get(`${brandName.toLowerCase()}||${strength.toLowerCase()}`) || null;
 
     return {
       rowIndex: idx + 2,
@@ -445,24 +560,22 @@ export function parseAndValidateExcelImport(buffer: Buffer): ParsedImportRow[] {
       openingQtyBase,
       costPerBase,
       sellingPricePerBase,
-      duplicateMedicineId: dup?.id || null,
+      duplicateMedicineId: dupId,
       errors,
     };
   });
 }
 
-export function executeExcelImport(
+export async function executeExcelImport(
   user: AuthUser,
   rows: Array<ParsedImportRow & { duplicateAction?: 'SKIP' | 'USE_EXISTING' | 'CREATE_NEW' }>
 ) {
-  return withTransaction((tx) => {
+  return withTransaction(async (tx) => {
     const ts = nowIso();
     const today = todayDate();
     let createdMeds = 0;
     let addedBatches = 0;
     let skipped = 0;
-
-    let medCodeCounter = (tx.prepare('SELECT COUNT(*) as cnt FROM medicines').get() as { cnt: number }).cnt;
 
     for (const r of rows) {
       if (r.errors && r.errors.length > 0) {
@@ -484,70 +597,78 @@ export function executeExcelImport(
       if (!medId) {
         let catId: string | null = null;
         if (r.category) {
-          const cat = tx.prepare('SELECT id FROM categories WHERE LOWER(name) = LOWER(?)').get(r.category) as { id: string } | undefined;
+          const cat = await tx.queryOne<{ id: string }>('SELECT id FROM categories WHERE LOWER(name) = LOWER($1)', [
+            r.category,
+          ]);
           if (cat) catId = cat.id;
           else {
             catId = uuid();
-            tx.prepare('INSERT INTO categories (id, name) VALUES (?, ?)').run(catId, r.category);
+            await tx.execute('INSERT INTO categories (id, name) VALUES ($1, $2)', [catId, r.category]);
           }
         }
         let mfgId: string | null = null;
         if (r.manufacturer) {
-          const mfg = tx.prepare('SELECT id FROM manufacturers WHERE LOWER(name) = LOWER(?)').get(r.manufacturer) as { id: string } | undefined;
+          const mfg = await tx.queryOne<{ id: string }>('SELECT id FROM manufacturers WHERE LOWER(name) = LOWER($1)', [
+            r.manufacturer,
+          ]);
           if (mfg) mfgId = mfg.id;
           else {
             mfgId = uuid();
-            tx.prepare('INSERT INTO manufacturers (id, name) VALUES (?, ?)').run(mfgId, r.manufacturer);
+            await tx.execute('INSERT INTO manufacturers (id, name) VALUES ($1, $2)', [mfgId, r.manufacturer]);
           }
         }
 
-        medCodeCounter++;
-        const medCode = r.medicineCode?.trim() || `MED-${String(medCodeCounter).padStart(4, '0')}`;
+        const medCode =
+          r.medicineCode?.trim() || (await generateSequentialCode(tx, 'CODE-MED', 'MED', 4, 'medicines', 'medicine_code'));
         const minStock = validateQuantityInput(r.minStockLevel || '0', 'min_stock_level', { allowZero: true });
 
         medId = uuid();
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO medicines (
             id, medicine_code, barcode, brand_name, generic_name, bangla_name, strength, dosage_form,
             category_id, manufacturer_id, storage_info, base_unit_name, min_stock_level, rx_required,
             is_active, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
-        ).run(
-          medId,
-          medCode,
-          (r.barcode || '').trim(),
-          r.brandName,
-          r.genericName,
-          r.strength,
-          r.dosageForm,
-          catId,
-          mfgId,
-          (r.storageInfo || '').trim(),
-          r.baseUnit,
-          minStock.toFixed(6),
-          r.rxRequired ? 1 : 0,
-          ts,
-          ts
+          ) VALUES ($1, $2, $3, $4, $5, '', $6, $7, $8, $9, $10, $11, $12, $13, TRUE, $14, $15)`,
+          [
+            medId,
+            medCode,
+            (r.barcode || '').trim(),
+            r.brandName,
+            r.genericName,
+            r.strength,
+            r.dosageForm,
+            catId,
+            mfgId,
+            (r.storageInfo || '').trim(),
+            r.baseUnit,
+            minStock.toFixed(6),
+            Boolean(r.rxRequired),
+            ts,
+            ts,
+          ]
         );
 
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO medicine_units (id, medicine_id, unit_name, conversion_to_base, is_base, allow_purchase, allow_sale, is_active, created_at, updated_at)
-           VALUES (?, ?, ?, '1.000000', 1, 1, 1, 1, ?, ?)`
-        ).run(uuid(), medId, r.baseUnit, ts, ts);
+           VALUES ($1, $2, $3, '1.000000', TRUE, TRUE, TRUE, TRUE, $4, $5)`,
+          [uuid(), medId, r.baseUnit, ts, ts]
+        );
 
         if (r.secondaryUnit && r.secondaryConversion) {
           const secConv = validateConversionInput(r.secondaryConversion, 'secondary_conversion');
-          tx.prepare(
+          await tx.execute(
             `INSERT INTO medicine_units (id, medicine_id, unit_name, conversion_to_base, is_base, allow_purchase, allow_sale, is_active, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 0, 1, 1, 1, ?, ?)`
-          ).run(uuid(), medId, r.secondaryUnit, secConv.toFixed(6), ts, ts);
+             VALUES ($1, $2, $3, $4, FALSE, TRUE, TRUE, TRUE, $5, $6)`,
+            [uuid(), medId, r.secondaryUnit, secConv.toFixed(6), ts, ts]
+          );
         }
         if (r.boxUnit && r.boxConversion && r.boxUnit.toLowerCase() !== r.secondaryUnit.toLowerCase()) {
           const boxConv = validateConversionInput(r.boxConversion, 'box_conversion');
-          tx.prepare(
+          await tx.execute(
             `INSERT INTO medicine_units (id, medicine_id, unit_name, conversion_to_base, is_base, allow_purchase, allow_sale, is_active, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 0, 1, 1, 1, ?, ?)`
-          ).run(uuid(), medId, r.boxUnit, boxConv.toFixed(6), ts, ts);
+             VALUES ($1, $2, $3, $4, FALSE, TRUE, TRUE, TRUE, $5, $6)`,
+            [uuid(), medId, r.boxUnit, boxConv.toFixed(6), ts, ts]
+          );
         }
         createdMeds++;
       }
@@ -557,37 +678,39 @@ export function executeExcelImport(
         const openCost = validateCostInput(r.costPerBase || '0', 'cost_per_base', { allowZero: true });
         const openPrice = validateCurrencyInput(r.sellingPricePerBase, 'selling_price_per_base');
         const batchId = uuid();
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO batches (
             id, medicine_id, batch_number, expiry_date, received_date,
             purchase_cost_per_base, selling_price_per_base, initial_qty_base, current_qty_base,
             base_unit_name, status, notes, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 'Imported via Excel', ?, ?)`
-        ).run(
-          batchId,
-          medId,
-          r.openingBatchNumber,
-          r.openingExpiryDate,
-          today,
-          openCost.toFixed(6),
-          openPrice.toFixed(2),
-          openQty.toFixed(6),
-          openQty.toFixed(6),
-          r.baseUnit,
-          ts,
-          ts
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'ACTIVE', 'Imported via Excel', $11, $12)`,
+          [
+            batchId,
+            medId,
+            r.openingBatchNumber,
+            r.openingExpiryDate,
+            today,
+            openCost.toFixed(6),
+            openPrice.toFixed(2),
+            openQty.toFixed(6),
+            openQty.toFixed(6),
+            r.baseUnit,
+            ts,
+            ts,
+          ]
         );
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO stock_movements (
             id, medicine_id, batch_id, qty_change_base, movement_type, reference_type, reference_id,
             cost_per_base_snapshot, reason, created_by, created_at
-          ) VALUES (?, ?, ?, ?, 'OPENING_STOCK', 'EXCEL_IMPORT', ?, ?, 'Excel opening stock import', ?, ?)`
-        ).run(uuid(), medId, batchId, openQty.toFixed(6), batchId, openCost.toFixed(6), user.id, ts);
+          ) VALUES ($1, $2, $3, $4, 'OPENING_STOCK', 'EXCEL_IMPORT', $5, $6, 'Excel opening stock import', $7, $8)`,
+          [uuid(), medId, batchId, openQty.toFixed(6), batchId, openCost.toFixed(6), user.id, ts]
+        );
         addedBatches++;
       }
     }
 
-    recordAudit(tx, {
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: 'EXCEL_IMPORT',

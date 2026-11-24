@@ -48,10 +48,9 @@ interface InventoryPayload {
 
 interface Props {
   user: AuthUser;
-  writable: boolean;
 }
 
-export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
+export const InventoryPage: React.FC<Props> = ({ user }) => {
   const [data, setData] = useState<InventoryPayload | null>(null);
   const [search, setSearch] = useState('');
   const [tab, setTab] = useState<'batches' | 'movements' | 'adjustments'>('batches');
@@ -306,13 +305,12 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
                       {user.permissions['inventory.adjust'] && b.status !== 'WRITTEN_OFF' && (
                         <button
                           type="button"
-                          disabled={!writable}
                           onClick={() => {
                             adjIdempKeyRef.current = newIdempotencyKey();
                             setAdjBatch(b);
                             setAdjActual(formatQty(b.current_qty_base));
                           }}
-                          className="text-teal-700 hover:underline font-medium disabled:opacity-40"
+                          className="text-teal-700 hover:underline font-medium"
                         >
                           Adjust
                         </button>
@@ -321,17 +319,15 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
                         <>
                           <button
                             type="button"
-                            disabled={!writable}
                             onClick={() => handleStatusAction(b.id, 'QUARANTINED')}
-                            className="text-amber-700 hover:underline font-medium disabled:opacity-40"
+                            className="text-amber-700 hover:underline font-medium"
                           >
                             Quarantine
                           </button>
                           <button
                             type="button"
-                            disabled={!writable}
                             onClick={() => handleStatusAction(b.id, 'DAMAGED')}
-                            className="text-orange-700 hover:underline font-medium disabled:opacity-40"
+                            className="text-orange-700 hover:underline font-medium"
                           >
                             Damaged
                           </button>
@@ -342,9 +338,8 @@ export const InventoryPage: React.FC<Props> = ({ user, writable }) => {
                         (isExpired || b.status === 'QUARANTINED' || b.status === 'DAMAGED') && (
                           <button
                             type="button"
-                            disabled={!writable}
                             onClick={() => handleStatusAction(b.id, 'WRITTEN_OFF')}
-                            className="text-red-700 hover:underline font-medium disabled:opacity-40"
+                            className="text-red-700 hover:underline font-medium"
                           >
                             Write Off
                           </button>

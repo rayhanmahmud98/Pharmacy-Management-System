@@ -65,10 +65,9 @@ interface FinanceData {
 
 interface Props {
   user: AuthUser;
-  writable: boolean;
 }
 
-export const FinancePage: React.FC<Props> = ({ user, writable }) => {
+export const FinancePage: React.FC<Props> = ({ user }) => {
   const [data, setData] = useState<FinanceData | null>(null);
   const [openingCash, setOpeningCash] = useState('5000.00');
   const [actualCash, setActualCash] = useState('');
@@ -228,9 +227,8 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
         {user.permissions['expenses.manage'] && (
           <button
             type="button"
-            disabled={!writable}
             onClick={() => setShowExpenseModal(true)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
           >
             <Plus className="w-4 h-4" /> Record Expense
           </button>
@@ -319,7 +317,7 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
                   )}
                   <button
                     type="submit"
-                    disabled={!writable || submitting}
+                    disabled={submitting}
                     className="w-full inline-flex items-center justify-center gap-2 py-2 px-4 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md"
                   >
                     <Lock className="w-3.5 h-3.5" />
@@ -347,7 +345,7 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
               </div>
               <button
                 type="submit"
-                disabled={!writable || !user.permissions['cash.open'] || submitting}
+                disabled={!user.permissions['cash.open'] || submitting}
                 className="w-full py-2 px-4 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
               >
                 {submitting ? 'Opening...' : 'Open Cash Session'}
@@ -460,7 +458,6 @@ export const FinancePage: React.FC<Props> = ({ user, writable }) => {
                       {e.status === 'POSTED' && user.permissions['expenses.reverse'] ? (
                         <button
                           type="button"
-                          disabled={!writable}
                           onClick={() => handleReverseExpense(e.id, e.expense_number)}
                           className="text-red-700 hover:underline font-medium"
                         >

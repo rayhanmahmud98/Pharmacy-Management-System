@@ -61,10 +61,9 @@ interface AdvanceLedgerRow {
 
 interface Props {
   user: AuthUser;
-  writable: boolean;
 }
 
-export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
+export const PartiesPage: React.FC<Props> = ({ user }) => {
   const [tab, setTab] = useState<'customers' | 'suppliers' | 'payments'>('customers');
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
@@ -254,17 +253,15 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
             <>
               <button
                 type="button"
-                disabled={!writable}
                 onClick={() => setShowAddModal('CUSTOMER')}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
               >
                 <Plus className="w-3.5 h-3.5" /> Add Customer
               </button>
               <button
                 type="button"
-                disabled={!writable}
                 onClick={() => setShowAddModal('SUPPLIER')}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 rounded-md"
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md"
               >
                 <Plus className="w-3.5 h-3.5" /> Add Supplier
               </button>
@@ -327,7 +324,6 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                     {user.permissions['parties.manage'] && c.code !== 'CUST-WALKIN' && (
                       <button
                         type="button"
-                        disabled={!writable}
                         onClick={() => {
                           setCreditAdjTarget(c);
                           setCreditAdjDelta('');
@@ -341,7 +337,6 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                     {user.permissions['payments.record'] && c.code !== 'CUST-WALKIN' && (
                       <button
                         type="button"
-                        disabled={!writable}
                         onClick={() => {
                           paymentIdempKeyRef.current = newIdempotencyKey();
                           setPayModal({ partyType: 'CUSTOMER', partyId: c.id, name: c.name });
@@ -391,7 +386,6 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                     {user.permissions['payments.record'] && (
                       <button
                         type="button"
-                        disabled={!writable}
                         onClick={() => {
                           paymentIdempKeyRef.current = newIdempotencyKey();
                           setPayModal({ partyType: 'SUPPLIER', partyId: s.id, name: s.name });
@@ -439,7 +433,6 @@ export const PartiesPage: React.FC<Props> = ({ user, writable }) => {
                       {p.status === 'POSTED' && user.permissions['payments.reverse'] && (
                         <button
                           type="button"
-                          disabled={!writable}
                           onClick={() => handleReversePayment(p)}
                           className="text-red-700 hover:underline font-medium"
                         >

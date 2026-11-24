@@ -34,10 +34,9 @@ interface ImportRowPreview {
 
 interface Props {
   user: AuthUser;
-  writable: boolean;
 }
 
-export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
+export const MedicinesPage: React.FC<Props> = ({ user }) => {
   const [search, setSearch] = useState('');
   const [medicines, setMedicines] = useState<Medicine[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -316,9 +315,8 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
               </button>
               <button
                 type="button"
-                disabled={!writable}
                 onClick={() => setShowCreateModal(true)}
-                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
               >
                 <Plus className="w-3.5 h-3.5" />
                 New Medicine
@@ -395,7 +393,6 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                       {user.permissions['medicines.manage'] && (
                         <button
                           type="button"
-                          disabled={!writable}
                           onClick={() => {
                             setEditingMed(m);
                             setEditForm({
@@ -477,7 +474,7 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                             <input
                               type="text"
                               inputMode="decimal"
-                              disabled={!user.permissions['medicines.units'] || !writable}
+                              disabled={!user.permissions['medicines.units']}
                               defaultValue={formatQty(u.conversion_to_base)}
                               onBlur={(e) => {
                                 const val = e.target.value.trim();
@@ -492,7 +489,7 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                         <td className="px-2 py-2 text-center">
                           <input
                             type="checkbox"
-                            disabled={!user.permissions['medicines.units'] || !writable}
+                            disabled={!user.permissions['medicines.units']}
                             checked={Boolean(u.allow_purchase)}
                             onChange={(e) => handleUpdateUnit(u, { allow_purchase: e.target.checked ? 1 : 0 })}
                           />
@@ -500,7 +497,7 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                         <td className="px-2 py-2 text-center">
                           <input
                             type="checkbox"
-                            disabled={!user.permissions['medicines.units'] || !writable}
+                            disabled={!user.permissions['medicines.units']}
                             checked={Boolean(u.allow_sale)}
                             onChange={(e) => handleUpdateUnit(u, { allow_sale: e.target.checked ? 1 : 0 })}
                           />
@@ -508,7 +505,7 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                         <td className="px-2 py-2 text-center">
                           <input
                             type="checkbox"
-                            disabled={Boolean(u.is_base) || !user.permissions['medicines.units'] || !writable}
+                            disabled={Boolean(u.is_base) || !user.permissions['medicines.units']}
                             checked={Boolean(u.is_active)}
                             onChange={(e) => handleUpdateUnit(u, { is_active: e.target.checked ? 1 : 0 })}
                           />
@@ -562,8 +559,7 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
                     </div>
                     <button
                       type="submit"
-                      disabled={!writable}
-                      className="px-3 py-1.5 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded"
+                      className="px-3 py-1.5 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded"
                     >
                       Save Unit
                     </button>
@@ -981,7 +977,7 @@ export const MedicinesPage: React.FC<Props> = ({ user, writable }) => {
               </button>
               <button
                 type="button"
-                disabled={importRows.length === 0 || importRows.some((r) => r.errors.length > 0) || !writable}
+                disabled={importRows.length === 0 || importRows.some((r) => r.errors.length > 0)}
                 onClick={handleExecuteImport}
                 className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
               >

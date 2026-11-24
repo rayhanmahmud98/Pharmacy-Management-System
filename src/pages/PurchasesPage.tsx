@@ -53,10 +53,9 @@ interface PurchaseRecord {
 
 interface Props {
   user: AuthUser;
-  writable: boolean;
 }
 
-export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
+export const PurchasesPage: React.FC<Props> = ({ user }) => {
   const [purchases, setPurchases] = useState<PurchaseRecord[]>([]);
   const [search, setSearch] = useState('');
   const [medicines, setMedicines] = useState<Medicine[]>([]);
@@ -274,9 +273,8 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
           {user.permissions['purchases.create'] && (
             <button
               type="button"
-              disabled={!writable}
               onClick={() => setShowNew(true)}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
             >
               <Plus className="w-4 h-4" />
               New Purchase
@@ -331,7 +329,6 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
                   {p.status === 'DRAFT' && user.permissions['purchases.receive'] && (
                     <button
                       type="button"
-                      disabled={!writable}
                       onClick={() => handleReceiveDraft(p)}
                       className="text-teal-700 hover:underline font-medium"
                     >
@@ -341,7 +338,6 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
                   {p.status === 'RECEIVED' && user.permissions['purchases.return'] && (
                     <button
                       type="button"
-                      disabled={!writable}
                       onClick={() => setReturnTarget(p)}
                       className="inline-flex items-center gap-1 text-amber-700 hover:underline font-medium"
                     >
@@ -351,7 +347,6 @@ export const PurchasesPage: React.FC<Props> = ({ user, writable }) => {
                   {p.status === 'RECEIVED' && user.permissions['purchases.reverse'] && (
                     <button
                       type="button"
-                      disabled={!writable}
                       onClick={() => setReverseTarget(p)}
                       className="text-red-700 hover:underline font-medium"
                     >

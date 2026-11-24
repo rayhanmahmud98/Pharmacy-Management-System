@@ -1,5 +1,5 @@
 import Decimal from 'decimal.js';
-import { generateDocNumber, nowIso, todayDate, uuid, withTransaction } from '../db.ts';
+import { generateDocNumber, nowIso, todayDate, uuid, withTransaction, type DbExecutor } from '../db.ts';
 import { recordAudit } from '../audit.ts';
 import type { AuthUser } from '../auth.ts';
 import {
@@ -28,7 +28,7 @@ export interface PurchaseLineInput {
   lineDiscount?: string;
 }
 
-export function createPurchase(
+export async function createPurchase(
   user: AuthUser,
   input: {
     supplierId: string;
@@ -41,7 +41,8 @@ export function createPurchase(
     paymentReference?: string;
     notes?: string;
     lines: PurchaseLineInput[];
-  }
+  },
+  existingTx?: DbExecutor
 ) {
   if (!input.supplierId) throw new Error('Supplier is required');
   if (!input.lines || input.lines.length === 0) throw new Error('At least one purchase line is required');
@@ -52,17 +53,23 @@ export function createPurchase(
     validateCurrencyInput(input.paidAmount, 'Paid amount', { allowZero: true });
   }
 
-  return withTransaction((tx) => {
-    const supplier = tx.prepare('SELECT * FROM suppliers WHERE id = ? AND is_active = 1').get(input.supplierId) as
-      | { id: string; name: string; current_balance: string; advance_balance: string }
-      | undefined;
+  return withTransaction(async (tx) => {
+    const supplier = await tx.queryOne<{
+      id: string;
+      name: string;
+      current_balance: string;
+      advance_balance: string;
+    }>('SELECT id, name, current_balance, advance_balance FROM suppliers WHERE id = $1 AND is_active = TRUE FOR UPDATE', [
+      input.supplierId,
+    ]);
     if (!supplier) throw new Error('Active supplier not found');
 
     const purchaseId = uuid();
-    const purchaseNumber = generateDocNumber(tx, 'PUR', 'purchases', 'purchase_number');
+    const purchaseNumber = await generateDocNumber(tx, 'PUR', 'purchases', 'purchase_number');
     const ts = nowIso();
 
-    const computedLines = input.lines.map((line) => {
+    const computedLines = [];
+    for (const line of input.lines) {
       if (!line.batchNumber?.trim()) throw new Error('Batch number is required for all purchase lines');
       if (!line.expiryDate || !/^\d{4}-\d{2}-\d{2}$/.test(line.expiryDate)) {
         throw new Error('Valid expiry date (YYYY-MM-DD) is required');
@@ -71,16 +78,21 @@ export function createPurchase(
         throw new Error(`Cannot purchase already expired batch ${line.batchNumber} (${line.expiryDate})`);
       }
 
-      const med = tx.prepare('SELECT id, brand_name, base_unit_name FROM medicines WHERE id = ?').get(line.medicineId) as
-        | { id: string; brand_name: string; base_unit_name: string }
-        | undefined;
+      const med = await tx.queryOne<{ id: string; brand_name: string; base_unit_name: string }>(
+        'SELECT id, brand_name, base_unit_name FROM medicines WHERE id = $1',
+        [line.medicineId]
+      );
       if (!med) throw new Error('Medicine not found');
 
-      const unit = tx
-        .prepare('SELECT * FROM medicine_units WHERE id = ? AND medicine_id = ? AND is_active = 1')
-        .get(line.unitId, line.medicineId) as
-        | { id: string; unit_name: string; conversion_to_base: string; allow_purchase: number }
-        | undefined;
+      const unit = await tx.queryOne<{
+        id: string;
+        unit_name: string;
+        conversion_to_base: string;
+        allow_purchase: boolean;
+      }>('SELECT id, unit_name, conversion_to_base, allow_purchase FROM medicine_units WHERE id = $1 AND medicine_id = $2 AND is_active = TRUE', [
+        line.unitId,
+        line.medicineId,
+      ]);
       if (!unit) throw new Error(`Unit not found for ${med.brand_name}`);
       if (!unit.allow_purchase) throw new Error(`Unit '${unit.unit_name}' is disabled for purchasing on ${med.brand_name}`);
 
@@ -94,15 +106,15 @@ export function createPurchase(
         allowZero: false,
       });
 
-      return {
+      computedLines.push({
         ...line,
         med,
         unit,
         calc,
         sellPrice,
         costPerBase: roundCost6(d(calc.netTotal).div(calc.quantityBase)),
-      };
-    });
+      });
+    }
 
     const totals = computeInvoiceTotals({
       lines: computedLines.map((l) => ({
@@ -124,39 +136,32 @@ export function createPurchase(
       }
     }
 
-    tx.prepare(
+    await tx.execute(
       `INSERT INTO purchases (
         id, purchase_number, supplier_id, supplier_invoice_no, purchase_date, status,
         gross_subtotal, discount_total, net_total, paid_amount, due_amount, advance_applied, notes,
         created_by, received_by, received_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      purchaseId,
-      purchaseNumber,
-      supplier.id,
-      (input.supplierInvoiceNo || '').trim(),
-      pDate,
-      input.status,
-      totals.grossSubtotal.toFixed(2),
-      totals.lineDiscountTotal.toFixed(2),
-      totals.netTotal.toFixed(2),
-      totals.paidAmount.toFixed(2),
-      finalDueAmount.toFixed(2),
-      advanceApplied.toFixed(2),
-      (input.notes || '').trim(),
-      user.id,
-      input.status === 'RECEIVED' ? user.id : null,
-      input.status === 'RECEIVED' ? ts : null,
-      ts,
-      ts
-    );
-
-    const insertPL = tx.prepare(
-      `INSERT INTO purchase_lines (
-        id, purchase_id, medicine_id, batch_id, batch_number, expiry_date,
-        unit_id, unit_name_snapshot, conversion_ratio_snapshot, qty_input, qty_base,
-        unit_cost, selling_price_per_base, line_discount, line_total
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+      [
+        purchaseId,
+        purchaseNumber,
+        supplier.id,
+        (input.supplierInvoiceNo || '').trim(),
+        pDate,
+        input.status,
+        totals.grossSubtotal.toFixed(2),
+        totals.lineDiscountTotal.toFixed(2),
+        totals.netTotal.toFixed(2),
+        totals.paidAmount.toFixed(2),
+        finalDueAmount.toFixed(2),
+        advanceApplied.toFixed(2),
+        (input.notes || '').trim(),
+        user.id,
+        input.status === 'RECEIVED' ? user.id : null,
+        input.status === 'RECEIVED' ? ts : null,
+        ts,
+        ts,
+      ]
     );
 
     for (const l of computedLines) {
@@ -164,17 +169,19 @@ export function createPurchase(
       let batchId: string | null = null;
 
       if (input.status === 'RECEIVED') {
-        const existingBatch = tx
-          .prepare('SELECT * FROM batches WHERE medicine_id = ? AND batch_number = ? AND expiry_date = ?')
-          .get(l.med.id, l.batchNumber.trim(), l.expiryDate) as
-          | {
-              id: string;
-              status: string;
-              current_qty_base: string;
-              initial_qty_base: string;
-              purchase_cost_per_base: string;
-            }
-          | undefined;
+        await tx.execute('SELECT pg_advisory_xact_lock(hashtext($1))', [
+          `batch:${l.med.id}:${l.batchNumber.trim()}:${l.expiryDate}`,
+        ]);
+        const existingBatch = await tx.queryOne<{
+          id: string;
+          status: string;
+          current_qty_base: string;
+          initial_qty_base: string;
+          purchase_cost_per_base: string;
+        }>(
+          'SELECT id, status, current_qty_base, initial_qty_base, purchase_cost_per_base FROM batches WHERE medicine_id = $1 AND batch_number = $2 AND expiry_date = $3 FOR UPDATE',
+          [l.med.id, l.batchNumber.trim(), l.expiryDate]
+        );
 
         if (existingBatch) {
           if (['QUARANTINED', 'WRITTEN_OFF', 'DAMAGED', 'EXPIRED'].includes(existingBatch.status)) {
@@ -191,144 +198,158 @@ export function createPurchase(
           );
           const newCur = roundQty(qty(existingBatch.current_qty_base).add(l.calc.quantityBase)).toFixed(6);
           const newInit = roundQty(qty(existingBatch.initial_qty_base).add(l.calc.quantityBase)).toFixed(6);
-          tx.prepare(
-            `UPDATE batches SET current_qty_base = ?, initial_qty_base = ?, purchase_cost_per_base = ?, selling_price_per_base = ?, status = 'ACTIVE', updated_at = ? WHERE id = ?`
-          ).run(newCur, newInit, wac.toFixed(6), l.sellPrice.toFixed(2), ts, batchId);
+          await tx.execute(
+            `UPDATE batches SET current_qty_base = $1, initial_qty_base = $2, purchase_cost_per_base = $3, selling_price_per_base = $4, status = 'ACTIVE', updated_at = $5 WHERE id = $6`,
+            [newCur, newInit, wac.toFixed(6), l.sellPrice.toFixed(2), ts, batchId]
+          );
         } else {
           batchId = uuid();
-          tx.prepare(
+          await tx.execute(
             `INSERT INTO batches (
               id, medicine_id, batch_number, expiry_date, supplier_id, purchase_id, received_date,
               purchase_cost_per_base, selling_price_per_base, initial_qty_base, current_qty_base,
               base_unit_name, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)`
-          ).run(
-            batchId,
-            l.med.id,
-            l.batchNumber.trim(),
-            l.expiryDate,
-            supplier.id,
-            purchaseId,
-            pDate,
-            l.costPerBase.toFixed(6),
-            l.sellPrice.toFixed(2),
-            l.calc.quantityBase.toFixed(6),
-            l.calc.quantityBase.toFixed(6),
-            l.med.base_unit_name,
-            ts,
-            ts
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'ACTIVE', $13, $14)`,
+            [
+              batchId,
+              l.med.id,
+              l.batchNumber.trim(),
+              l.expiryDate,
+              supplier.id,
+              purchaseId,
+              pDate,
+              l.costPerBase.toFixed(6),
+              l.sellPrice.toFixed(2),
+              l.calc.quantityBase.toFixed(6),
+              l.calc.quantityBase.toFixed(6),
+              l.med.base_unit_name,
+              ts,
+              ts,
+            ]
           );
         }
 
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO stock_movements (
             id, medicine_id, batch_id, qty_change_base, movement_type,
             reference_type, reference_id, reference_line_id, cost_per_base_snapshot,
             reason, created_by, created_at
-          ) VALUES (?, ?, ?, ?, 'PURCHASE_RECEIVED', 'PURCHASE', ?, ?, ?, ?, ?, ?)`
-        ).run(
-          uuid(),
-          l.med.id,
-          batchId,
-          l.calc.quantityBase.toFixed(6),
-          purchaseId,
-          plId,
-          l.costPerBase.toFixed(6),
-          `Purchase ${purchaseNumber}`,
-          user.id,
-          ts
+          ) VALUES ($1, $2, $3, $4, 'PURCHASE_RECEIVED', 'PURCHASE', $5, $6, $7, $8, $9, $10)`,
+          [
+            uuid(),
+            l.med.id,
+            batchId,
+            l.calc.quantityBase.toFixed(6),
+            purchaseId,
+            plId,
+            l.costPerBase.toFixed(6),
+            `Purchase ${purchaseNumber}`,
+            user.id,
+            ts,
+          ]
         );
       }
 
-      insertPL.run(
-        plId,
-        purchaseId,
-        l.med.id,
-        batchId,
-        l.batchNumber.trim(),
-        l.expiryDate,
-        l.unit.id,
-        l.unit.unit_name,
-        d(l.unit.conversion_to_base).toFixed(6),
-        validateQuantityInput(l.quantityInput, 'Quantity').toFixed(6),
-        l.calc.quantityBase.toFixed(6),
-        validateCurrencyInput(l.unitCost, 'Unit cost').toFixed(2),
-        l.sellPrice.toFixed(2),
-        l.calc.discount.toFixed(2),
-        l.calc.netTotal.toFixed(2)
+      await tx.execute(
+        `INSERT INTO purchase_lines (
+          id, purchase_id, medicine_id, batch_id, batch_number, expiry_date,
+          unit_id, unit_name_snapshot, conversion_ratio_snapshot, qty_input, qty_base,
+          unit_cost, selling_price_per_base, line_discount, line_total
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+        [
+          plId,
+          purchaseId,
+          l.med.id,
+          batchId,
+          l.batchNumber.trim(),
+          l.expiryDate,
+          l.unit.id,
+          l.unit.unit_name,
+          d(l.unit.conversion_to_base).toFixed(6),
+          validateQuantityInput(l.quantityInput, 'Quantity').toFixed(6),
+          l.calc.quantityBase.toFixed(6),
+          validateCurrencyInput(l.unitCost, 'Unit cost').toFixed(2),
+          l.sellPrice.toFixed(2),
+          l.calc.discount.toFixed(2),
+          l.calc.netTotal.toFixed(2),
+        ]
       );
     }
 
     if (input.status === 'RECEIVED') {
       if (advanceApplied.gt(0)) {
         const nextAdv = roundMoney(money(supplier.advance_balance || '0.00').sub(advanceApplied));
-        tx.prepare('UPDATE suppliers SET advance_balance = ?, updated_at = ? WHERE id = ?').run(
+        await tx.execute('UPDATE suppliers SET advance_balance = $1, updated_at = $2 WHERE id = $3', [
           nextAdv.toFixed(2),
           ts,
-          supplier.id
-        );
-        tx.prepare(
+          supplier.id,
+        ]);
+        await tx.execute(
           `INSERT INTO party_advance_ledger (id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at)
-           VALUES (?, 'SUPPLIER', ?, 'APPLIED_TO_INVOICE', 'PURCHASE', ?, ?, ?, ?, ?)`
-        ).run(uuid(), supplier.id, purchaseId, advanceApplied.neg().toFixed(2), `Advance applied to ${purchaseNumber}`, user.id, ts);
+           VALUES ($1, 'SUPPLIER', $2, 'APPLIED_TO_INVOICE', 'PURCHASE', $3, $4, $5, $6, $7)`,
+          [uuid(), supplier.id, purchaseId, advanceApplied.neg().toFixed(2), `Advance applied to ${purchaseNumber}`, user.id, ts]
+        );
       }
 
       if (finalDueAmount.gt(0)) {
         const nextBal = roundMoney(d(supplier.current_balance).add(finalDueAmount)).toFixed(2);
-        tx.prepare('UPDATE suppliers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
+        await tx.execute('UPDATE suppliers SET current_balance = $1, updated_at = $2 WHERE id = $3', [
           nextBal,
           ts,
-          supplier.id
-        );
+          supplier.id,
+        ]);
       }
 
       if (totals.paidAmount.gt(0)) {
         const method = input.paymentMethod || 'CASH';
         const payId = uuid();
-        const payNo = generateDocNumber(tx, 'PAY', 'payments', 'payment_number');
-        tx.prepare(
+        const payNo = await generateDocNumber(tx, 'PAY', 'payments', 'payment_number');
+        await tx.execute(
           `INSERT INTO payments (
             id, payment_number, party_type, party_id, direction, method, amount, reference_no, notes, status, created_by, created_at
-          ) VALUES (?, ?, 'SUPPLIER', ?, 'OUT', ?, ?, ?, ?, 'POSTED', ?, ?)`
-        ).run(
-          payId,
-          payNo,
-          supplier.id,
-          method,
-          totals.paidAmount.toFixed(2),
-          (input.paymentReference || '').trim(),
-          `Payment on ${purchaseNumber}`,
-          user.id,
-          ts
+          ) VALUES ($1, $2, 'SUPPLIER', $3, 'OUT', $4, $5, $6, $7, 'POSTED', $8, $9)`,
+          [
+            payId,
+            payNo,
+            supplier.id,
+            method,
+            totals.paidAmount.toFixed(2),
+            (input.paymentReference || '').trim(),
+            `Payment on ${purchaseNumber}`,
+            user.id,
+            ts,
+          ]
         );
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated)
-           VALUES (?, ?, 'PURCHASE', ?, ?)`
-        ).run(uuid(), payId, purchaseId, totals.paidAmount.toFixed(2));
+           VALUES ($1, $2, 'PURCHASE', $3, $4)`,
+          [uuid(), payId, purchaseId, totals.paidAmount.toFixed(2)]
+        );
 
         if (method === 'CASH') {
-          const cashSessionId = getActiveCashSessionId(tx);
+          const cashSessionId = await getActiveCashSessionId(tx);
           if (!cashSessionId) {
             throw new Error('Cannot pay supplier in CASH without an OPEN cash session');
           }
-          tx.prepare(
+          await tx.execute(
             `INSERT INTO cash_movements (
               id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at
-            ) VALUES (?, ?, 'SUPPLIER_CASH_PAYMENT', ?, 'PURCHASE', ?, ?, ?, ?)`
-          ).run(
-            uuid(),
-            cashSessionId,
-            totals.paidAmount.neg().toFixed(2),
-            purchaseId,
-            `Cash paid for ${purchaseNumber}`,
-            user.id,
-            ts
+            ) VALUES ($1, $2, 'SUPPLIER_CASH_PAYMENT', $3, 'PURCHASE', $4, $5, $6, $7)`,
+            [
+              uuid(),
+              cashSessionId,
+              totals.paidAmount.neg().toFixed(2),
+              purchaseId,
+              `Cash paid for ${purchaseNumber}`,
+              user.id,
+              ts,
+            ]
           );
         }
       }
     }
 
-    recordAudit(tx, {
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: input.status === 'RECEIVED' ? 'RECEIVE_PURCHASE' : 'CREATE_PURCHASE_DRAFT',
@@ -346,31 +367,40 @@ export function createPurchase(
     });
 
     return { purchaseId, purchaseNumber };
-  });
+  }, existingTx);
 }
 
-export function receiveDraftPurchase(
+export async function receiveDraftPurchase(
   user: AuthUser,
   purchaseId: string,
   paidAmountStr = '0',
   paymentMethod: 'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD' | 'OTHER' = 'CASH',
-  applyAdvance = true
+  applyAdvance = true,
+  existingTx?: DbExecutor
 ) {
   const paid = validateCurrencyInput(paidAmountStr || '0', 'Paid amount', { allowZero: true });
 
-  return withTransaction((tx) => {
-    const pur = tx.prepare('SELECT * FROM purchases WHERE id = ?').get(purchaseId) as
-      | { id: string; purchase_number: string; supplier_id: string; status: string; net_total: string; purchase_date: string }
-      | undefined;
+  return withTransaction(async (tx) => {
+    const pur = await tx.queryOne<{
+      id: string;
+      purchase_number: string;
+      supplier_id: string;
+      status: string;
+      net_total: string;
+      purchase_date: string;
+    }>('SELECT id, purchase_number, supplier_id, status, net_total, purchase_date FROM purchases WHERE id = $1 FOR UPDATE', [
+      purchaseId,
+    ]);
     if (!pur) throw new Error('Purchase not found');
     if (pur.status !== 'DRAFT') throw new Error('Only DRAFT purchases can be received');
 
-    const supplier = tx.prepare('SELECT * FROM suppliers WHERE id = ?').get(pur.supplier_id) as {
+    const supplier = (await tx.queryOne<{
       id: string;
       current_balance: string;
       advance_balance: string;
-    };
-    const lines = tx.prepare('SELECT * FROM purchase_lines WHERE purchase_id = ?').all(purchaseId) as Array<{
+    }>('SELECT id, current_balance, advance_balance FROM suppliers WHERE id = $1 FOR UPDATE', [pur.supplier_id]))!;
+
+    const lines = await tx.query<{
       id: string;
       medicine_id: string;
       batch_number: string;
@@ -378,7 +408,7 @@ export function receiveDraftPurchase(
       qty_base: string;
       line_total: string;
       selling_price_per_base: string;
-    }>;
+    }>('SELECT * FROM purchase_lines WHERE purchase_id = $1 ORDER BY id ASC', [purchaseId]);
 
     const today = todayDate();
     const ts = nowIso();
@@ -397,21 +427,22 @@ export function receiveDraftPurchase(
 
     for (const l of lines) {
       if (l.expiry_date <= today) throw new Error(`Batch ${l.batch_number} is already expired (${l.expiry_date})`);
-      const med = tx.prepare('SELECT base_unit_name FROM medicines WHERE id = ?').get(l.medicine_id) as {
-        base_unit_name: string;
-      };
+      const med = (await tx.queryOne<{ base_unit_name: string }>('SELECT base_unit_name FROM medicines WHERE id = $1', [
+        l.medicine_id,
+      ]))!;
       const costPerBase = roundCost6(d(l.line_total).div(d(l.qty_base)));
-      const existingBatch = tx
-        .prepare('SELECT * FROM batches WHERE medicine_id = ? AND batch_number = ? AND expiry_date = ?')
-        .get(l.medicine_id, l.batch_number, l.expiry_date) as
-        | {
-            id: string;
-            status: string;
-            current_qty_base: string;
-            initial_qty_base: string;
-            purchase_cost_per_base: string;
-          }
-        | undefined;
+
+      await tx.execute('SELECT pg_advisory_xact_lock(hashtext($1))', [`batch:${l.medicine_id}:${l.batch_number}:${l.expiry_date}`]);
+      const existingBatch = await tx.queryOne<{
+        id: string;
+        status: string;
+        current_qty_base: string;
+        initial_qty_base: string;
+        purchase_cost_per_base: string;
+      }>(
+        'SELECT id, status, current_qty_base, initial_qty_base, purchase_cost_per_base FROM batches WHERE medicine_id = $1 AND batch_number = $2 AND expiry_date = $3 FOR UPDATE',
+        [l.medicine_id, l.batch_number, l.expiry_date]
+      );
 
       let batchId: string;
       if (existingBatch) {
@@ -427,97 +458,116 @@ export function receiveDraftPurchase(
           l.qty_base,
           costPerBase
         );
-        tx.prepare(
-          "UPDATE batches SET current_qty_base = ?, initial_qty_base = ?, purchase_cost_per_base = ?, selling_price_per_base = ?, status = 'ACTIVE', updated_at = ? WHERE id = ?"
-        ).run(
-          roundQty(qty(existingBatch.current_qty_base).add(qty(l.qty_base))).toFixed(6),
-          roundQty(qty(existingBatch.initial_qty_base).add(qty(l.qty_base))).toFixed(6),
-          wac.toFixed(6),
-          l.selling_price_per_base,
-          ts,
-          batchId
+        await tx.execute(
+          "UPDATE batches SET current_qty_base = $1, initial_qty_base = $2, purchase_cost_per_base = $3, selling_price_per_base = $4, status = 'ACTIVE', updated_at = $5 WHERE id = $6",
+          [
+            roundQty(qty(existingBatch.current_qty_base).add(qty(l.qty_base))).toFixed(6),
+            roundQty(qty(existingBatch.initial_qty_base).add(qty(l.qty_base))).toFixed(6),
+            wac.toFixed(6),
+            l.selling_price_per_base,
+            ts,
+            batchId,
+          ]
         );
       } else {
         batchId = uuid();
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO batches (
             id, medicine_id, batch_number, expiry_date, supplier_id, purchase_id, received_date,
             purchase_cost_per_base, selling_price_per_base, initial_qty_base, current_qty_base,
             base_unit_name, status, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)`
-        ).run(
-          batchId,
-          l.medicine_id,
-          l.batch_number,
-          l.expiry_date,
-          pur.supplier_id,
-          purchaseId,
-          pur.purchase_date,
-          costPerBase.toFixed(6),
-          l.selling_price_per_base,
-          qty(l.qty_base).toFixed(6),
-          qty(l.qty_base).toFixed(6),
-          med.base_unit_name,
-          ts,
-          ts
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'ACTIVE', $13, $14)`,
+          [
+            batchId,
+            l.medicine_id,
+            l.batch_number,
+            l.expiry_date,
+            pur.supplier_id,
+            purchaseId,
+            pur.purchase_date,
+            costPerBase.toFixed(6),
+            l.selling_price_per_base,
+            qty(l.qty_base).toFixed(6),
+            qty(l.qty_base).toFixed(6),
+            med.base_unit_name,
+            ts,
+            ts,
+          ]
         );
       }
 
-      tx.prepare('UPDATE purchase_lines SET batch_id = ? WHERE id = ?').run(batchId, l.id);
-      tx.prepare(
+      await tx.execute('UPDATE purchase_lines SET batch_id = $1 WHERE id = $2', [batchId, l.id]);
+      await tx.execute(
         `INSERT INTO stock_movements (
           id, medicine_id, batch_id, qty_change_base, movement_type, reference_type, reference_id, reference_line_id,
           cost_per_base_snapshot, reason, created_by, created_at
-        ) VALUES (?, ?, ?, ?, 'PURCHASE_RECEIVED', 'PURCHASE', ?, ?, ?, ?, ?, ?)`
-      ).run(uuid(), l.medicine_id, batchId, qty(l.qty_base).toFixed(6), purchaseId, l.id, costPerBase.toFixed(6), `Received ${pur.purchase_number}`, user.id, ts);
+        ) VALUES ($1, $2, $3, $4, 'PURCHASE_RECEIVED', 'PURCHASE', $5, $6, $7, $8, $9, $10)`,
+        [
+          uuid(),
+          l.medicine_id,
+          batchId,
+          qty(l.qty_base).toFixed(6),
+          purchaseId,
+          l.id,
+          costPerBase.toFixed(6),
+          `Received ${pur.purchase_number}`,
+          user.id,
+          ts,
+        ]
+      );
     }
 
-    tx.prepare(
-      `UPDATE purchases SET status = 'RECEIVED', paid_amount = ?, due_amount = ?, advance_applied = ?, received_by = ?, received_at = ?, updated_at = ? WHERE id = ?`
-    ).run(paid.toFixed(2), finalDue.toFixed(2), advanceApplied.toFixed(2), user.id, ts, ts, purchaseId);
+    await tx.execute(
+      `UPDATE purchases SET status = 'RECEIVED', paid_amount = $1, due_amount = $2, advance_applied = $3, received_by = $4, received_at = $5, updated_at = $6 WHERE id = $7`,
+      [paid.toFixed(2), finalDue.toFixed(2), advanceApplied.toFixed(2), user.id, ts, ts, purchaseId]
+    );
 
     if (advanceApplied.gt(0)) {
       const nextAdv = roundMoney(money(supplier.advance_balance || '0.00').sub(advanceApplied));
-      tx.prepare('UPDATE suppliers SET advance_balance = ?, updated_at = ? WHERE id = ?').run(
+      await tx.execute('UPDATE suppliers SET advance_balance = $1, updated_at = $2 WHERE id = $3', [
         nextAdv.toFixed(2),
         ts,
-        supplier.id
-      );
-      tx.prepare(
+        supplier.id,
+      ]);
+      await tx.execute(
         `INSERT INTO party_advance_ledger (id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at)
-         VALUES (?, 'SUPPLIER', ?, 'APPLIED_TO_INVOICE', 'PURCHASE', ?, ?, ?, ?, ?)`
-      ).run(uuid(), supplier.id, purchaseId, advanceApplied.neg().toFixed(2), `Advance applied to ${pur.purchase_number}`, user.id, ts);
+         VALUES ($1, 'SUPPLIER', $2, 'APPLIED_TO_INVOICE', 'PURCHASE', $3, $4, $5, $6, $7)`,
+        [uuid(), supplier.id, purchaseId, advanceApplied.neg().toFixed(2), `Advance applied to ${pur.purchase_number}`, user.id, ts]
+      );
     }
 
     if (finalDue.gt(0)) {
-      tx.prepare('UPDATE suppliers SET current_balance = ?, updated_at = ? WHERE id = ?').run(
+      await tx.execute('UPDATE suppliers SET current_balance = $1, updated_at = $2 WHERE id = $3', [
         roundMoney(d(supplier.current_balance).add(finalDue)).toFixed(2),
         ts,
-        supplier.id
-      );
+        supplier.id,
+      ]);
     }
 
     if (paid.gt(0)) {
       const payId = uuid();
-      const payNo = generateDocNumber(tx, 'PAY', 'payments', 'payment_number');
-      tx.prepare(
+      const payNo = await generateDocNumber(tx, 'PAY', 'payments', 'payment_number');
+      await tx.execute(
         `INSERT INTO payments (id, payment_number, party_type, party_id, direction, method, amount, notes, status, created_by, created_at)
-         VALUES (?, ?, 'SUPPLIER', ?, 'OUT', ?, ?, ?, 'POSTED', ?, ?)`
-      ).run(payId, payNo, supplier.id, paymentMethod, paid.toFixed(2), `Payment on ${pur.purchase_number}`, user.id, ts);
-      tx.prepare(
-        `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES (?, ?, 'PURCHASE', ?, ?)`
-      ).run(uuid(), payId, purchaseId, paid.toFixed(2));
+         VALUES ($1, $2, 'SUPPLIER', $3, 'OUT', $4, $5, $6, 'POSTED', $7, $8)`,
+        [payId, payNo, supplier.id, paymentMethod, paid.toFixed(2), `Payment on ${pur.purchase_number}`, user.id, ts]
+      );
+      await tx.execute(
+        `INSERT INTO payment_allocations (id, payment_id, target_type, target_id, amount_allocated) VALUES ($1, $2, 'PURCHASE', $3, $4)`,
+        [uuid(), payId, purchaseId, paid.toFixed(2)]
+      );
       if (paymentMethod === 'CASH') {
-        const cashSessionId = getActiveCashSessionId(tx);
+        const cashSessionId = await getActiveCashSessionId(tx);
         if (!cashSessionId) throw new Error('Cannot pay cash without an OPEN cash session');
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
-           VALUES (?, ?, 'SUPPLIER_CASH_PAYMENT', ?, 'PURCHASE', ?, ?, ?, ?)`
-        ).run(uuid(), cashSessionId, paid.neg().toFixed(2), purchaseId, `Cash paid for ${pur.purchase_number}`, user.id, ts);
+           VALUES ($1, $2, 'SUPPLIER_CASH_PAYMENT', $3, 'PURCHASE', $4, $5, $6, $7)`,
+          [uuid(), cashSessionId, paid.neg().toFixed(2), purchaseId, `Cash paid for ${pur.purchase_number}`, user.id, ts]
+        );
       }
     }
 
-    recordAudit(tx, {
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: 'RECEIVE_PURCHASE',
@@ -528,18 +578,24 @@ export function receiveDraftPurchase(
       beforeState: { status: 'DRAFT' },
       afterState: { status: 'RECEIVED', paid: paid.toFixed(2), advanceApplied: advanceApplied.toFixed(2), due: finalDue.toFixed(2) },
     });
-  });
+  }, existingTx);
 }
 
-export function cancelDraftPurchase(user: AuthUser, purchaseId: string, reason: string) {
-  return withTransaction((tx) => {
-    const pur = tx.prepare('SELECT id, purchase_number, status FROM purchases WHERE id = ?').get(purchaseId) as
-      | { id: string; purchase_number: string; status: string }
-      | undefined;
+export async function cancelDraftPurchase(
+  user: AuthUser,
+  purchaseId: string,
+  reason: string,
+  existingTx?: DbExecutor
+) {
+  return withTransaction(async (tx) => {
+    const pur = await tx.queryOne<{ id: string; purchase_number: string; status: string }>(
+      'SELECT id, purchase_number, status FROM purchases WHERE id = $1 FOR UPDATE',
+      [purchaseId]
+    );
     if (!pur) throw new Error('Purchase not found');
     if (pur.status !== 'DRAFT') throw new Error('Only DRAFT purchases can be cancelled; use Reversal for RECEIVED purchases');
-    tx.prepare("UPDATE purchases SET status = 'CANCELLED', updated_at = ? WHERE id = ?").run(nowIso(), purchaseId);
-    recordAudit(tx, {
+    await tx.execute("UPDATE purchases SET status = 'CANCELLED', updated_at = $1 WHERE id = $2", [nowIso(), purchaseId]);
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: 'CANCEL_PURCHASE_DRAFT',
@@ -551,17 +607,18 @@ export function cancelDraftPurchase(user: AuthUser, purchaseId: string, reason: 
       afterState: { status: 'CANCELLED' },
       reason,
     });
-  });
+  }, existingTx);
 }
 
-export function createPurchaseReturn(
+export async function createPurchaseReturn(
   user: AuthUser,
   input: {
     purchaseId: string;
     settlementType: 'SUPPLIER_CREDIT' | 'CASH_REFUND' | 'BANK_REFUND';
     reason: string;
     lines: Array<{ purchaseLineId: string; qtyBase: string }>;
-  }
+  },
+  existingTx?: DbExecutor
 ) {
   if (!input.reason?.trim()) throw new Error('Return reason is required');
   if (!input.lines?.length) throw new Error('At least one return line is required');
@@ -570,32 +627,28 @@ export function createPurchaseReturn(
     validateQuantityInput(item.qtyBase ?? '0', 'Return quantity', { allowZero: true });
   }
 
-  return withTransaction((tx) => {
-    const pur = tx.prepare('SELECT * FROM purchases WHERE id = ?').get(input.purchaseId) as
-      | {
-          id: string;
-          purchase_number: string;
-          supplier_id: string;
-          status: string;
-          paid_amount: string;
-          due_amount: string;
-        }
-      | undefined;
+  return withTransaction(async (tx) => {
+    const pur = await tx.queryOne<{
+      id: string;
+      purchase_number: string;
+      supplier_id: string;
+      status: string;
+      paid_amount: string;
+      due_amount: string;
+    }>('SELECT * FROM purchases WHERE id = $1 FOR UPDATE', [input.purchaseId]);
     if (!pur || pur.status !== 'RECEIVED') throw new Error('Purchase must be RECEIVED to process a return');
 
-    const supplier = tx.prepare('SELECT * FROM suppliers WHERE id = ?').get(pur.supplier_id) as {
+    const supplier = (await tx.queryOne<{
       id: string;
       current_balance: string;
       advance_balance: string;
-    };
+    }>('SELECT id, current_balance, advance_balance FROM suppliers WHERE id = $1 FOR UPDATE', [pur.supplier_id]))!;
 
     const ts = nowIso();
     const today = todayDate();
     const retId = uuid();
-    const retNo = generateDocNumber(tx, 'PRN', 'purchase_returns', 'return_number');
+    const retNo = await generateDocNumber(tx, 'PRN', 'purchase_returns', 'return_number');
 
-    // Track cumulative returns per purchase line and cumulative deductions per batch IN MEMORY
-    // so duplicate purchaseLineId entries (or lines sharing the same batch) cannot exceed limits or drive stock negative.
     const qtyReturnedByLine = new Map<string, Decimal>();
     const pendingBatchDeduction = new Map<string, Decimal>();
 
@@ -609,18 +662,45 @@ export function createPurchaseReturn(
       lineTotal: Decimal;
     }> = [];
 
+    // Lock all involved purchase lines & batches deterministically
+    const lineIds = Array.from(new Set(input.lines.map((i) => i.purchaseLineId))).sort();
+    const plRows = await tx.query<{
+      id: string;
+      batch_id: string;
+      medicine_id: string;
+      qty_base: string;
+      line_total: string;
+    }>('SELECT id, batch_id, medicine_id, qty_base, line_total FROM purchase_lines WHERE purchase_id = $1 AND id = ANY($2::text[]) ORDER BY id ASC', [
+      pur.id,
+      lineIds,
+    ]);
+    const plMap = new Map(plRows.map((p) => [p.id, p]));
+    const batchIdsToLock = Array.from(new Set(plRows.map((p) => p.batch_id).filter(Boolean))).sort();
+    const lockedBatches =
+      batchIdsToLock.length > 0
+        ? await tx.query<{
+            id: string;
+            batch_number: string;
+            status: string;
+            current_qty_base: string;
+            purchase_cost_per_base: string;
+          }>('SELECT id, batch_number, status, current_qty_base, purchase_cost_per_base FROM batches WHERE id = ANY($1::text[]) ORDER BY id ASC FOR UPDATE', [
+            batchIdsToLock,
+          ])
+        : [];
+    const batchMap = new Map(lockedBatches.map((b) => [b.id, b]));
+
     for (const item of input.lines) {
       const qRet = validateQuantityInput(item.qtyBase, 'Return quantity', { allowZero: true });
       if (qRet.lte(0)) continue;
-      const pl = tx.prepare('SELECT * FROM purchase_lines WHERE id = ? AND purchase_id = ?').get(item.purchaseLineId, pur.id) as
-        | { id: string; batch_id: string; medicine_id: string; qty_base: string; line_total: string }
-        | undefined;
+      const pl = plMap.get(item.purchaseLineId);
       if (!pl || !pl.batch_id) throw new Error('Purchase line or batch not found');
 
       if (!qtyReturnedByLine.has(pl.id)) {
-        const prevReturnRows = tx
-          .prepare('SELECT qty_base FROM purchase_return_lines WHERE purchase_line_id = ?')
-          .all(pl.id) as Array<{ qty_base: string }>;
+        const prevReturnRows = await tx.query<{ qty_base: string }>(
+          'SELECT qty_base FROM purchase_return_lines WHERE purchase_line_id = $1',
+          [pl.id]
+        );
         let alreadyReturned = new Decimal(0);
         for (const pr of prevReturnRows) {
           alreadyReturned = alreadyReturned.add(qty(pr.qty_base));
@@ -636,13 +716,8 @@ export function createPurchaseReturn(
         );
       }
 
-      const batch = tx.prepare('SELECT * FROM batches WHERE id = ?').get(pl.batch_id) as {
-        id: string;
-        batch_number: string;
-        status: string;
-        current_qty_base: string;
-        purchase_cost_per_base: string;
-      };
+      const batch = batchMap.get(pl.batch_id);
+      if (!batch) throw new Error('Batch not found');
       if (['WRITTEN_OFF', 'INACTIVE'].includes(batch.status)) {
         throw new Error(`Cannot return stock from batch ${batch.batch_number} with status ${batch.status}`);
       }
@@ -695,105 +770,108 @@ export function createPurchaseReturn(
       advanceCreated = roundMoney(creditAmount.sub(dueSettled));
     }
 
-    tx.prepare(
+    await tx.execute(
       `INSERT INTO purchase_returns (
         id, return_number, purchase_id, supplier_id, return_date, total_amount,
         settlement_type, refund_amount, credit_amount, due_settled, advance_created, reason, created_by, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      retId,
-      retNo,
-      pur.id,
-      pur.supplier_id,
-      today,
-      totalReturn.toFixed(2),
-      input.settlementType,
-      refundAmount.toFixed(2),
-      creditAmount.toFixed(2),
-      dueSettled.toFixed(2),
-      advanceCreated.toFixed(2),
-      input.reason.trim(),
-      user.id,
-      ts
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+      [
+        retId,
+        retNo,
+        pur.id,
+        pur.supplier_id,
+        today,
+        totalReturn.toFixed(2),
+        input.settlementType,
+        refundAmount.toFixed(2),
+        creditAmount.toFixed(2),
+        dueSettled.toFixed(2),
+        advanceCreated.toFixed(2),
+        input.reason.trim(),
+        user.id,
+        ts,
+      ]
     );
 
     for (const lr of lineRecords) {
       const prlId = uuid();
-      tx.prepare(
+      await tx.execute(
         `INSERT INTO purchase_return_lines (id, purchase_return_id, purchase_line_id, batch_id, medicine_id, qty_base, cost_per_base_snapshot, line_total)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(prlId, retId, lr.plId, lr.batchId, lr.medId, lr.qtyBase.toFixed(6), lr.costPerBase.toFixed(6), lr.lineTotal.toFixed(2));
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [prlId, retId, lr.plId, lr.batchId, lr.medId, lr.qtyBase.toFixed(6), lr.costPerBase.toFixed(6), lr.lineTotal.toFixed(2)]
+      );
 
-      const batch = tx.prepare('SELECT current_qty_base FROM batches WHERE id = ?').get(lr.batchId) as { current_qty_base: string };
-      const nextBatchQty = roundQty(qty(batch.current_qty_base).sub(lr.qtyBase));
-      if (nextBatchQty.lt(0)) {
+      const deducted = await tx.queryOne<{ id: string }>(
+        `UPDATE batches SET current_qty_base = current_qty_base - $1::numeric, updated_at = $2
+         WHERE id = $3 AND current_qty_base >= $1::numeric
+         RETURNING id`,
+        [lr.qtyBase.toFixed(6), ts, lr.batchId]
+      );
+      if (!deducted) {
         throw new Error('Negative batch stock prevented during purchase return');
       }
-      tx.prepare('UPDATE batches SET current_qty_base = ?, updated_at = ? WHERE id = ?').run(
-        nextBatchQty.toFixed(6),
-        ts,
-        lr.batchId
-      );
-      tx.prepare(
+
+      await tx.execute(
         `INSERT INTO stock_movements (
           id, medicine_id, batch_id, qty_change_base, movement_type, reference_type, reference_id, reference_line_id,
           cost_per_base_snapshot, reason, created_by, created_at
-        ) VALUES (?, ?, ?, ?, 'PURCHASE_RETURN', 'PURCHASE_RETURN', ?, ?, ?, ?, ?, ?)`
-      ).run(uuid(), lr.medId, lr.batchId, lr.qtyBase.neg().toFixed(6), retId, prlId, lr.costPerBase.toFixed(6), input.reason.trim(), user.id, ts);
+        ) VALUES ($1, $2, $3, $4, 'PURCHASE_RETURN', 'PURCHASE_RETURN', $5, $6, $7, $8, $9, $10)`,
+        [uuid(), lr.medId, lr.batchId, lr.qtyBase.neg().toFixed(6), retId, prlId, lr.costPerBase.toFixed(6), input.reason.trim(), user.id, ts]
+      );
     }
 
     if (input.settlementType === 'SUPPLIER_CREDIT') {
       const nextPurDue = roundMoney(purDue.sub(dueSettled));
-      tx.prepare('UPDATE purchases SET due_amount = ?, updated_at = ? WHERE id = ?').run(
+      await tx.execute('UPDATE purchases SET due_amount = $1, updated_at = $2 WHERE id = $3', [
         nextPurDue.toFixed(2),
         ts,
-        pur.id
-      );
+        pur.id,
+      ]);
 
       const curBal = money(supplier.current_balance);
-      const nextBal = dueSettled.gt(0)
-        ? roundMoney(Decimal.max(new Decimal(0), curBal.sub(dueSettled)))
-        : curBal;
+      const nextBal = dueSettled.gt(0) ? roundMoney(Decimal.max(new Decimal(0), curBal.sub(dueSettled))) : curBal;
       const nextAdv = roundMoney(money(supplier.advance_balance || '0.00').add(advanceCreated));
 
-      tx.prepare('UPDATE suppliers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
+      await tx.execute('UPDATE suppliers SET current_balance = $1, advance_balance = $2, updated_at = $3 WHERE id = $4', [
         nextBal.toFixed(2),
         nextAdv.toFixed(2),
         ts,
-        supplier.id
-      );
+        supplier.id,
+      ]);
 
       if (advanceCreated.gt(0)) {
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO party_advance_ledger (id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at)
-           VALUES (?, 'SUPPLIER', ?, 'RETURN_CREDIT', 'PURCHASE_RETURN', ?, ?, ?, ?, ?)`
-        ).run(
-          uuid(),
-          supplier.id,
-          retId,
-          advanceCreated.toFixed(2),
-          `Supplier advance credit excess from ${retNo} (${pur.purchase_number})`,
-          user.id,
-          ts
+           VALUES ($1, 'SUPPLIER', $2, 'RETURN_CREDIT', 'PURCHASE_RETURN', $3, $4, $5, $6, $7)`,
+          [
+            uuid(),
+            supplier.id,
+            retId,
+            advanceCreated.toFixed(2),
+            `Supplier advance credit excess from ${retNo} (${pur.purchase_number})`,
+            user.id,
+            ts,
+          ]
         );
       }
     } else {
-      tx.prepare('UPDATE purchases SET paid_amount = ?, updated_at = ? WHERE id = ?').run(
+      await tx.execute('UPDATE purchases SET paid_amount = $1, updated_at = $2 WHERE id = $3', [
         roundMoney(purPaid.sub(refundAmount)).toFixed(2),
         ts,
-        pur.id
-      );
+        pur.id,
+      ]);
       if (input.settlementType === 'CASH_REFUND') {
-        const cashSessionId = getActiveCashSessionId(tx);
+        const cashSessionId = await getActiveCashSessionId(tx);
         if (!cashSessionId) throw new Error('Cannot receive cash refund without an OPEN cash session');
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
-           VALUES (?, ?, 'CASH_REFUND', ?, 'PURCHASE_RETURN', ?, ?, ?, ?)`
-        ).run(uuid(), cashSessionId, refundAmount.toFixed(2), retId, `Cash refund from supplier on ${retNo}`, user.id, ts);
+           VALUES ($1, $2, 'CASH_REFUND', $3, 'PURCHASE_RETURN', $4, $5, $6, $7)`,
+          [uuid(), cashSessionId, refundAmount.toFixed(2), retId, `Cash refund from supplier on ${retNo}`, user.id, ts]
+        );
       }
     }
 
-    recordAudit(tx, {
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: 'PURCHASE_RETURN',
@@ -817,109 +895,126 @@ export function createPurchaseReturn(
       dueSettled: dueSettled.toFixed(2),
       advanceCreated: advanceCreated.toFixed(2),
     };
-  });
+  }, existingTx);
 }
 
-export function reversePurchase(user: AuthUser, purchaseId: string, reason: string) {
+export async function reversePurchase(
+  user: AuthUser,
+  purchaseId: string,
+  reason: string,
+  existingTx?: DbExecutor
+) {
   if (!reason?.trim()) throw new Error('Mandatory reason is required for purchase reversal');
-  return withTransaction((tx) => {
-    const pur = tx.prepare('SELECT * FROM purchases WHERE id = ?').get(purchaseId) as
-      | {
-          id: string;
-          purchase_number: string;
-          supplier_id: string;
-          status: string;
-          due_amount: string;
-          paid_amount: string;
-          advance_applied: string;
-        }
-      | undefined;
+  return withTransaction(async (tx) => {
+    const pur = await tx.queryOne<{
+      id: string;
+      purchase_number: string;
+      supplier_id: string;
+      status: string;
+      due_amount: string;
+      paid_amount: string;
+      advance_applied: string;
+    }>('SELECT * FROM purchases WHERE id = $1 FOR UPDATE', [purchaseId]);
     if (!pur) throw new Error('Purchase not found');
     if (pur.status !== 'RECEIVED') throw new Error('Only RECEIVED purchases can be reversed');
 
-    const existingReturns = tx
-      .prepare('SELECT COUNT(*) as cnt FROM purchase_returns WHERE purchase_id = ?')
-      .get(purchaseId) as { cnt: number };
-    if (existingReturns.cnt > 0) {
+    const existingReturns = await tx.queryOne<{ cnt: number }>(
+      'SELECT COUNT(*)::int AS cnt FROM purchase_returns WHERE purchase_id = $1',
+      [purchaseId]
+    );
+    if (Number(existingReturns?.cnt ?? 0) > 0) {
       throw new Error('Cannot reverse a purchase that already has partial/full purchase returns');
     }
 
-    const lines = tx.prepare('SELECT * FROM purchase_lines WHERE purchase_id = ?').all(purchaseId) as Array<{
+    const lines = await tx.query<{
       id: string;
       batch_id: string;
       medicine_id: string;
       qty_base: string;
       line_total: string;
-    }>;
+    }>('SELECT id, batch_id, medicine_id, qty_base, line_total FROM purchase_lines WHERE purchase_id = $1 ORDER BY batch_id ASC, id ASC', [
+      purchaseId,
+    ]);
 
     const ts = nowIso();
     for (const l of lines) {
-      const batch = tx.prepare('SELECT current_qty_base, batch_number FROM batches WHERE id = ?').get(l.batch_id) as {
-        current_qty_base: string;
-        batch_number: string;
-      };
+      const batch = (await tx.queryOne<{ current_qty_base: string; batch_number: string }>(
+        'SELECT current_qty_base, batch_number FROM batches WHERE id = $1 FOR UPDATE',
+        [l.batch_id]
+      ))!;
       if (qty(batch.current_qty_base).lt(qty(l.qty_base))) {
         throw new Error(`Cannot reverse purchase: stock from batch ${batch.batch_number} has already been sold or adjusted`);
       }
       const costPerBase = roundCost6(d(l.line_total).div(d(l.qty_base)));
-      tx.prepare('UPDATE batches SET current_qty_base = ?, updated_at = ? WHERE id = ?').run(
-        roundQty(qty(batch.current_qty_base).sub(qty(l.qty_base))).toFixed(6),
-        ts,
-        l.batch_id
+      const deducted = await tx.queryOne<{ id: string }>(
+        `UPDATE batches SET current_qty_base = current_qty_base - $1::numeric, updated_at = $2
+         WHERE id = $3 AND current_qty_base >= $1::numeric
+         RETURNING id`,
+        [qty(l.qty_base).toFixed(6), ts, l.batch_id]
       );
-      tx.prepare(
+      if (!deducted) {
+        throw new Error(`Cannot reverse purchase: stock from batch ${batch.batch_number} has already been sold or adjusted`);
+      }
+      await tx.execute(
         `INSERT INTO stock_movements (
           id, medicine_id, batch_id, qty_change_base, movement_type, reference_type, reference_id, reference_line_id,
           cost_per_base_snapshot, reason, created_by, created_at
-        ) VALUES (?, ?, ?, ?, 'PURCHASE_REVERSAL', 'PURCHASE_REVERSAL', ?, ?, ?, ?, ?, ?)`
-      ).run(uuid(), l.medicine_id, l.batch_id, qty(l.qty_base).neg().toFixed(6), purchaseId, l.id, costPerBase.toFixed(6), reason.trim(), user.id, ts);
+        ) VALUES ($1, $2, $3, $4, 'PURCHASE_REVERSAL', 'PURCHASE_REVERSAL', $5, $6, $7, $8, $9, $10)`,
+        [uuid(), l.medicine_id, l.batch_id, qty(l.qty_base).neg().toFixed(6), purchaseId, l.id, costPerBase.toFixed(6), reason.trim(), user.id, ts]
+      );
     }
 
     const advApplied = money(pur.advance_applied || '0.00');
     if (money(pur.due_amount).gt(0) || advApplied.gt(0)) {
-      const sup = tx.prepare('SELECT current_balance, advance_balance FROM suppliers WHERE id = ?').get(pur.supplier_id) as {
-        current_balance: string;
-        advance_balance: string;
-      };
-      tx.prepare('UPDATE suppliers SET current_balance = ?, advance_balance = ?, updated_at = ? WHERE id = ?').run(
+      const sup = (await tx.queryOne<{ current_balance: string; advance_balance: string }>(
+        'SELECT current_balance, advance_balance FROM suppliers WHERE id = $1 FOR UPDATE',
+        [pur.supplier_id]
+      ))!;
+      await tx.execute('UPDATE suppliers SET current_balance = $1, advance_balance = $2, updated_at = $3 WHERE id = $4', [
         roundMoney(d(sup.current_balance).sub(d(pur.due_amount))).toFixed(2),
         roundMoney(money(sup.advance_balance || '0.00').add(advApplied)).toFixed(2),
         ts,
-        pur.supplier_id
-      );
+        pur.supplier_id,
+      ]);
       if (advApplied.gt(0)) {
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO party_advance_ledger (id, party_type, party_id, entry_type, source_type, source_id, amount_signed, notes, created_by, created_at)
-           VALUES (?, 'SUPPLIER', ?, 'REVERSAL', 'PURCHASE_REVERSAL', ?, ?, ?, ?, ?)`
-        ).run(uuid(), pur.supplier_id, purchaseId, advApplied.toFixed(2), `Restored advance on reversal of ${pur.purchase_number}`, user.id, ts);
+           VALUES ($1, 'SUPPLIER', $2, 'REVERSAL', 'PURCHASE_REVERSAL', $3, $4, $5, $6, $7)`,
+          [uuid(), pur.supplier_id, purchaseId, advApplied.toFixed(2), `Restored advance on reversal of ${pur.purchase_number}`, user.id, ts]
+        );
       }
     }
 
-    const allocs = tx
-      .prepare(
-        `SELECT p.id, p.method, p.amount FROM payment_allocations pa
-         JOIN payments p ON p.id = pa.payment_id
-         WHERE pa.target_type = 'PURCHASE' AND pa.target_id = ? AND p.status = 'POSTED'`
-      )
-      .all(purchaseId) as Array<{ id: string; method: string; amount: string }>;
+    const allocs = await tx.query<{ id: string; method: string; amount: string }>(
+      `SELECT p.id, p.method, p.amount FROM payment_allocations pa
+       JOIN payments p ON p.id = pa.payment_id
+       WHERE pa.target_type = 'PURCHASE' AND pa.target_id = $1 AND p.status = 'POSTED'
+       FOR UPDATE OF p`,
+      [purchaseId]
+    );
 
     for (const p of allocs) {
-      tx.prepare("UPDATE payments SET status = 'REVERSED', reversal_reason = ? WHERE id = ?").run(reason.trim(), p.id);
+      await tx.execute("UPDATE payments SET status = 'REVERSED', reversal_reason = $1 WHERE id = $2", [
+        reason.trim(),
+        p.id,
+      ]);
       if (p.method === 'CASH') {
-        const cashSessionId = getActiveCashSessionId(tx);
+        const cashSessionId = await getActiveCashSessionId(tx);
         if (!cashSessionId) throw new Error('Open cash session required to reverse cash purchase payment');
-        tx.prepare(
+        await tx.execute(
           `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
-           VALUES (?, ?, 'REVERSAL', ?, 'PURCHASE_REVERSAL', ?, ?, ?, ?)`
-        ).run(uuid(), cashSessionId, money(p.amount).toFixed(2), purchaseId, `Reversal of ${pur.purchase_number}`, user.id, ts);
+           VALUES ($1, $2, 'REVERSAL', $3, 'PURCHASE_REVERSAL', $4, $5, $6, $7)`,
+          [uuid(), cashSessionId, money(p.amount).toFixed(2), purchaseId, `Reversal of ${pur.purchase_number}`, user.id, ts]
+        );
       }
     }
 
-    tx.prepare(
-      "UPDATE purchases SET status = 'REVERSED', reversed_by = ?, reversed_at = ?, reversal_reason = ?, updated_at = ? WHERE id = ?"
-    ).run(user.id, ts, reason.trim(), ts, purchaseId);
+    await tx.execute(
+      "UPDATE purchases SET status = 'REVERSED', reversed_by = $1, reversed_at = $2, reversal_reason = $3, updated_at = $4 WHERE id = $5",
+      [user.id, ts, reason.trim(), ts, purchaseId]
+    );
 
-    recordAudit(tx, {
+    await recordAudit(tx, {
       userId: user.id,
       username: user.username,
       action: 'REVERSE_PURCHASE',
@@ -931,5 +1026,5 @@ export function reversePurchase(user: AuthUser, purchaseId: string, reason: stri
       afterState: { status: 'REVERSED' },
       reason: reason.trim(),
     });
-  });
+  }, existingTx);
 }

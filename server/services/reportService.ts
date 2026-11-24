@@ -10,18 +10,62 @@ function addDays(baseIsoDate: string, days: number): string {
   return dt.toISOString().slice(0, 10);
 }
 
-export function getDashboardStats() {
-  const db = getDb();
+export async function getDashboardStats() {
+  const db = await getDb();
   const today = todayDate();
-  const settings = db.prepare('SELECT expiry_warning_days FROM pharmacy_settings WHERE id = 1').get() as
-    | { expiry_warning_days: number }
-    | undefined;
-  const warnDays = settings?.expiry_warning_days ?? 90;
+  const settings = await db.queryOne<{ expiry_warning_days: number }>(
+    'SELECT expiry_warning_days FROM pharmacy_settings WHERE id = 1'
+  );
+  const warnDays = Number(settings?.expiry_warning_days ?? 90);
   const warnDate = addDays(today, warnDays);
 
-  const todaySalesRows = db
-    .prepare("SELECT net_total, total_cogs FROM sales WHERE sale_date = ? AND status = 'COMPLETED'")
-    .all(today) as Array<{ net_total: string; total_cogs: string }>;
+  const [
+    todaySalesRows,
+    todayReturnRows,
+    todayExpRows,
+    customerRows,
+    supplierRows,
+    allBatches,
+    activeMeds,
+    activeSessionId,
+  ] = await Promise.all([
+    db.query<{ net_total: string; total_cogs: string }>(
+      "SELECT net_total, total_cogs FROM sales WHERE sale_date = $1 AND status = 'COMPLETED'",
+      [today]
+    ),
+    db.query<{ total_refund_value: string; total_cogs_reversed: string }>(
+      'SELECT total_refund_value, total_cogs_reversed FROM sales_returns WHERE return_date = $1',
+      [today]
+    ),
+    db.query<{ amount: string }>("SELECT amount FROM expenses WHERE expense_date = $1 AND status = 'POSTED'", [today]),
+    db.query<{ current_balance: string }>('SELECT current_balance FROM customers WHERE is_active = TRUE'),
+    db.query<{ current_balance: string }>('SELECT current_balance FROM suppliers WHERE is_active = TRUE'),
+    db.query<{
+      id: string;
+      medicine_id: string;
+      batch_number: string;
+      expiry_date: string;
+      current_qty_base: string;
+      base_unit_name: string;
+      status: string;
+      brand_name: string;
+      strength: string;
+    }>(
+      `SELECT b.id, b.medicine_id, b.batch_number, b.expiry_date, b.current_qty_base, b.base_unit_name, b.status,
+              m.brand_name, m.strength
+       FROM batches b
+       JOIN medicines m ON m.id = b.medicine_id
+       ORDER BY b.expiry_date ASC`
+    ),
+    db.query<{
+      id: string;
+      brand_name: string;
+      strength: string;
+      base_unit_name: string;
+      min_stock_level: string;
+    }>('SELECT id, brand_name, strength, base_unit_name, min_stock_level FROM medicines WHERE is_active = TRUE'),
+    getActiveCashSessionId(db),
+  ]);
 
   let todayNetSales = new Decimal(0);
   let todayTotalCogs = new Decimal(0);
@@ -30,10 +74,6 @@ export function getDashboardStats() {
     todayTotalCogs = todayTotalCogs.add(d(r.total_cogs));
   }
 
-  const todayReturnRows = db
-    .prepare('SELECT total_refund_value, total_cogs_reversed FROM sales_returns WHERE return_date = ?')
-    .all(today) as Array<{ total_refund_value: string; total_cogs_reversed: string }>;
-
   let todayRefundTotal = new Decimal(0);
   let todayCogsReversed = new Decimal(0);
   for (const r of todayReturnRows) {
@@ -41,49 +81,20 @@ export function getDashboardStats() {
     todayCogsReversed = todayCogsReversed.add(d(r.total_cogs_reversed));
   }
 
-  const todayExpRows = db
-    .prepare("SELECT amount FROM expenses WHERE expense_date = ? AND status = 'POSTED'")
-    .all(today) as Array<{ amount: string }>;
   let todayExpenses = new Decimal(0);
   for (const r of todayExpRows) {
     todayExpenses = todayExpenses.add(d(r.amount));
   }
 
-  const customerRows = db
-    .prepare('SELECT current_balance FROM customers WHERE is_active = 1')
-    .all() as Array<{ current_balance: string }>;
   let customerDueTotal = new Decimal(0);
   for (const r of customerRows) {
     customerDueTotal = customerDueTotal.add(d(r.current_balance));
   }
 
-  const supplierRows = db
-    .prepare('SELECT current_balance FROM suppliers WHERE is_active = 1')
-    .all() as Array<{ current_balance: string }>;
   let supplierDueTotal = new Decimal(0);
   for (const r of supplierRows) {
     supplierDueTotal = supplierDueTotal.add(d(r.current_balance));
   }
-
-  const allBatches = db
-    .prepare(
-      `SELECT b.id, b.medicine_id, b.batch_number, b.expiry_date, b.current_qty_base, b.base_unit_name, b.status,
-              m.brand_name, m.strength
-       FROM batches b
-       JOIN medicines m ON m.id = b.medicine_id
-       ORDER BY b.expiry_date ASC`
-    )
-    .all() as Array<{
-    id: string;
-    medicine_id: string;
-    batch_number: string;
-    expiry_date: string;
-    current_qty_base: string;
-    base_unit_name: string;
-    status: string;
-    brand_name: string;
-    strength: string;
-  }>;
 
   const nearExpiryBatches: typeof allBatches = [];
   const expiredBatches: typeof allBatches = [];
@@ -103,16 +114,6 @@ export function getDashboardStats() {
     }
   }
 
-  const activeMeds = db
-    .prepare('SELECT id, brand_name, strength, base_unit_name, min_stock_level FROM medicines WHERE is_active = 1')
-    .all() as Array<{
-    id: string;
-    brand_name: string;
-    strength: string;
-    base_unit_name: string;
-    min_stock_level: string;
-  }>;
-
   const lowStockMeds = activeMeds
     .map((m) => {
       const minLvl = qty(m.min_stock_level);
@@ -131,8 +132,7 @@ export function getDashboardStats() {
       sellable_stock: m.stock.toNumber(),
     }));
 
-  const activeSessionId = getActiveCashSessionId();
-  const activeCashSession = activeSessionId ? getCashSessionSummary(activeSessionId) : null;
+  const activeCashSession = activeSessionId ? await getCashSessionSummary(activeSessionId, db) : null;
 
   const grossProfitToday = roundMoney(
     todayNetSales.sub(todayRefundTotal).sub(todayTotalCogs.sub(todayCogsReversed))
@@ -159,7 +159,7 @@ export function getDashboardStats() {
   };
 }
 
-export function getComprehensiveReport(filters: {
+export async function getComprehensiveReport(filters: {
   fromDate?: string;
   toDate?: string;
   categoryId?: string;
@@ -167,7 +167,7 @@ export function getComprehensiveReport(filters: {
   customerId?: string;
   userId?: string;
 }) {
-  const db = getDb();
+  const db = await getDb();
   const today = todayDate();
   const fromDate = filters.fromDate || today.slice(0, 8) + '01';
   const toDate = filters.toDate || today;
@@ -175,24 +175,102 @@ export function getComprehensiveReport(filters: {
   const saleParams: Array<string> = [fromDate, toDate];
   let saleExtra = '';
   if (filters.customerId) {
-    saleExtra += ' AND s.customer_id = ?';
     saleParams.push(filters.customerId);
+    saleExtra += ` AND s.customer_id = $${saleParams.length}`;
   }
   if (filters.userId) {
-    saleExtra += ' AND s.created_by = ?';
     saleParams.push(filters.userId);
+    saleExtra += ` AND s.created_by = $${saleParams.length}`;
   }
 
-  const salesRows = db
-    .prepare(
-      `SELECT s.*, COALESCE(c.name, 'Walk-in Customer') as customer_name, u.full_name as cashier_name
+  const purParams: Array<string> = [fromDate, toDate];
+  let purExtra = '';
+  if (filters.supplierId) {
+    purParams.push(filters.supplierId);
+    purExtra += ` AND p.supplier_id = $${purParams.length}`;
+  }
+
+  const [
+    salesRows,
+    returnRows,
+    saleLineRows,
+    purchaseRows,
+    paymentRows,
+    meds,
+    activeBatches,
+    expensesRows,
+  ] = await Promise.all([
+    db.query<Record<string, unknown>>(
+      `SELECT s.*, COALESCE(c.name, 'Walk-in Customer') AS customer_name, u.full_name AS cashier_name
        FROM sales s
        LEFT JOIN customers c ON c.id = s.customer_id
        JOIN users u ON u.id = s.created_by
-       WHERE s.sale_date >= ? AND s.sale_date <= ? ${saleExtra}
-       ORDER BY s.created_at DESC`
-    )
-    .all(...saleParams) as Array<Record<string, unknown>>;
+       WHERE s.sale_date >= $1 AND s.sale_date <= $2 ${saleExtra}
+       ORDER BY s.created_at DESC`,
+      saleParams
+    ),
+    db.query<{ total_refund_value: string; total_cogs_reversed: string }>(
+      'SELECT total_refund_value, total_cogs_reversed FROM sales_returns WHERE return_date >= $1 AND return_date <= $2',
+      [fromDate, toDate]
+    ),
+    db.query<{
+      id: string;
+      brand_name: string;
+      generic_name: string;
+      base_unit_name: string;
+      category_name: string;
+      qty_base: string;
+      line_total: string;
+      cogs_total: string;
+    }>(
+      `SELECT m.id, m.brand_name, m.generic_name, m.base_unit_name, COALESCE(c.name, 'Uncategorized') AS category_name,
+              sl.qty_base, sl.line_total, sl.cogs_total
+       FROM sale_lines sl
+       JOIN sales s ON s.id = sl.sale_id
+       JOIN medicines m ON m.id = sl.medicine_id
+       LEFT JOIN categories c ON c.id = m.category_id
+       WHERE s.status = 'COMPLETED' AND s.sale_date >= $1 AND s.sale_date <= $2
+         ${filters.categoryId ? 'AND m.category_id = $3' : ''}`,
+      filters.categoryId ? [fromDate, toDate, filters.categoryId] : [fromDate, toDate]
+    ),
+    db.query<Record<string, unknown>>(
+      `SELECT p.*, s.name AS supplier_name, u.full_name AS created_by_name
+       FROM purchases p
+       JOIN suppliers s ON s.id = p.supplier_id
+       JOIN users u ON u.id = p.created_by
+       WHERE p.purchase_date >= $1 AND p.purchase_date <= $2 ${purExtra}
+       ORDER BY p.created_at DESC`,
+      purParams
+    ),
+    db.query<{ method: string; direction: string; amount: string }>(
+      `SELECT method, direction, amount
+       FROM payments
+       WHERE status = 'POSTED'
+         AND (created_at AT TIME ZONE 'UTC')::date >= $1::date
+         AND (created_at AT TIME ZONE 'UTC')::date <= $2::date`,
+      [fromDate, toDate]
+    ),
+    db.query<{ id: string; brand_name: string; strength: string; base_unit_name: string }>(
+      'SELECT id, brand_name, strength, base_unit_name FROM medicines WHERE is_active = TRUE'
+    ),
+    db.query<{
+      medicine_id: string;
+      current_qty_base: string;
+      purchase_cost_per_base: string;
+      selling_price_per_base: string;
+    }>("SELECT medicine_id, current_qty_base, purchase_cost_per_base, selling_price_per_base FROM batches WHERE status = 'ACTIVE' AND expiry_date > $1", [
+      today,
+    ]),
+    db.query<Record<string, unknown>>(
+      `SELECT e.*, ec.name AS category_name, u.full_name AS user_name
+       FROM expenses e
+       JOIN expense_categories ec ON ec.id = e.category_id
+       JOIN users u ON u.id = e.created_by
+       WHERE e.expense_date >= $1 AND e.expense_date <= $2
+       ORDER BY e.expense_date DESC`,
+      [fromDate, toDate]
+    ),
+  ]);
 
   const completedSales = salesRows.filter((s) => s.status === 'COMPLETED');
   let grossSales = new Decimal(0);
@@ -207,10 +285,6 @@ export function getComprehensiveReport(filters: {
     totalCogs = totalCogs.add(d(String(s.total_cogs)));
   }
 
-  const returnRows = db
-    .prepare('SELECT total_refund_value, total_cogs_reversed FROM sales_returns WHERE return_date >= ? AND return_date <= ?')
-    .all(fromDate, toDate) as Array<{ total_refund_value: string; total_cogs_reversed: string }>;
-
   let totalRefunds = new Decimal(0);
   let totalCogsRev = new Decimal(0);
   for (const r of returnRows) {
@@ -221,29 +295,6 @@ export function getComprehensiveReport(filters: {
   const netCogs = roundMoney(totalCogs.sub(totalCogsRev));
   const netSalesAfterReturns = roundMoney(netSales.sub(totalRefunds));
   const grossProfit = roundMoney(netSalesAfterReturns.sub(netCogs));
-
-  // Sales by medicine (aggregated in Decimal)
-  const saleLineRows = db
-    .prepare(
-      `SELECT m.id, m.brand_name, m.generic_name, m.base_unit_name, COALESCE(c.name, 'Uncategorized') as category_name,
-              sl.qty_base, sl.line_total, sl.cogs_total
-       FROM sale_lines sl
-       JOIN sales s ON s.id = sl.sale_id
-       JOIN medicines m ON m.id = sl.medicine_id
-       LEFT JOIN categories c ON c.id = m.category_id
-       WHERE s.status = 'COMPLETED' AND s.sale_date >= ? AND s.sale_date <= ?
-         ${filters.categoryId ? 'AND m.category_id = ?' : ''}`
-    )
-    .all(...(filters.categoryId ? [fromDate, toDate, filters.categoryId] : [fromDate, toDate])) as Array<{
-    id: string;
-    brand_name: string;
-    generic_name: string;
-    base_unit_name: string;
-    category_name: string;
-    qty_base: string;
-    line_total: string;
-    cogs_total: string;
-  }>;
 
   const salesByMedMap = new Map<
     string,
@@ -287,33 +338,6 @@ export function getComprehensiveReport(filters: {
       total_cogs: roundMoney(m.cogs).toNumber(),
     }));
 
-  // Purchases
-  const purParams: Array<string> = [fromDate, toDate];
-  let purExtra = '';
-  if (filters.supplierId) {
-    purExtra += ' AND p.supplier_id = ?';
-    purParams.push(filters.supplierId);
-  }
-  const purchaseRows = db
-    .prepare(
-      `SELECT p.*, s.name as supplier_name, u.full_name as created_by_name
-       FROM purchases p
-       JOIN suppliers s ON s.id = p.supplier_id
-       JOIN users u ON u.id = p.created_by
-       WHERE p.purchase_date >= ? AND p.purchase_date <= ? ${purExtra}
-       ORDER BY p.created_at DESC`
-    )
-    .all(...purParams);
-
-  // Payment collections by method (aggregated in Decimal)
-  const paymentRows = db
-    .prepare(
-      `SELECT method, direction, amount
-       FROM payments
-       WHERE status = 'POSTED' AND substr(created_at, 1, 10) >= ? AND substr(created_at, 1, 10) <= ?`
-    )
-    .all(fromDate, toDate) as Array<{ method: string; direction: string; amount: string }>;
-
   const collectionsMap = new Map<string, { inflow: Decimal; outflow: Decimal }>();
   for (const p of paymentRows) {
     const cur = collectionsMap.get(p.method) || { inflow: new Decimal(0), outflow: new Decimal(0) };
@@ -326,22 +350,6 @@ export function getComprehensiveReport(filters: {
     inflow: roundMoney(v.inflow).toNumber(),
     outflow: roundMoney(v.outflow).toNumber(),
   }));
-
-  // Inventory valuation & Fast/Slow/Dead stock (aggregated in Decimal)
-  const meds = db
-    .prepare('SELECT id, brand_name, strength, base_unit_name FROM medicines WHERE is_active = 1')
-    .all() as Array<{ id: string; brand_name: string; strength: string; base_unit_name: string }>;
-
-  const activeBatches = db
-    .prepare(
-      "SELECT medicine_id, current_qty_base, purchase_cost_per_base, selling_price_per_base FROM batches WHERE status = 'ACTIVE' AND expiry_date > ?"
-    )
-    .all(today) as Array<{
-    medicine_id: string;
-    current_qty_base: string;
-    purchase_cost_per_base: string;
-    selling_price_per_base: string;
-  }>;
 
   const valMap = new Map<string, { qty: Decimal; cost: Decimal; retail: Decimal }>();
   for (const b of activeBatches) {
@@ -370,17 +378,6 @@ export function getComprehensiveReport(filters: {
       };
     })
     .sort((a, b) => b.cost_valuation - a.cost_valuation);
-
-  const expensesRows = db
-    .prepare(
-      `SELECT e.*, ec.name as category_name, u.full_name as user_name
-       FROM expenses e
-       JOIN expense_categories ec ON ec.id = e.category_id
-       JOIN users u ON u.id = e.created_by
-       WHERE e.expense_date >= ? AND e.expense_date <= ?
-       ORDER BY e.expense_date DESC`
-    )
-    .all(fromDate, toDate) as Array<Record<string, unknown>>;
 
   let postedExpenses = new Decimal(0);
   for (const e of expensesRows) {
@@ -414,8 +411,8 @@ export function getComprehensiveReport(filters: {
   };
 }
 
-export function exportReportToExcelBuffer(filters: { fromDate?: string; toDate?: string }): Buffer {
-  const report = getComprehensiveReport(filters);
+export async function exportReportToExcelBuffer(filters: { fromDate?: string; toDate?: string }): Promise<Buffer> {
+  const report = await getComprehensiveReport(filters);
   const wb = XLSX.utils.book_new();
 
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([report.profitSummary]), 'Profit_Summary');

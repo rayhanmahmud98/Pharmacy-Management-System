@@ -17,7 +17,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiFetch, setDisplayCurrencySymbol } from './lib/api';
-import type { AuthUser, LicenseStatus, PharmacySettings } from './types';
+import type { AuthUser, PharmacySettings } from './types';
 import { LoginPage } from './pages/LoginPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { PosPage } from './pages/PosPage';
@@ -34,7 +34,6 @@ interface BootstrapState {
   authenticated: boolean;
   user: AuthUser | null;
   settings: PharmacySettings;
-  license: LicenseStatus;
 }
 
 export default function App() {
@@ -86,7 +85,6 @@ export default function App() {
   }
 
   const user = boot.user;
-  const writable = boot.license.writable;
 
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, perm: null },
@@ -248,33 +246,35 @@ export default function App() {
           </div>
         </header>
 
-        {!writable && (
-          <div className="px-6 py-2.5 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 font-medium">
-            {boot.license.message}
-          </div>
-        )}
-
         <main className="flex-1 p-6 max-w-[1440px] w-full mx-auto">
-          {currentNav.id === 'dashboard' && (
-            <DashboardPage
-              onNavigate={setActiveTab}
-              canViewProfit={Boolean(user.permissions['reports.profit'])}
-            />
-          )}
-          {currentNav.id === 'pos' && (
-            <PosPage user={user} settings={boot.settings} writable={writable} />
-          )}
-          {currentNav.id === 'medicines' && <MedicinesPage user={user} writable={writable} />}
-          {currentNav.id === 'inventory' && <InventoryPage user={user} writable={writable} />}
-          {currentNav.id === 'purchases' && <PurchasesPage user={user} writable={writable} />}
-          {currentNav.id === 'sales' && (
-            <SalesHistoryPage user={user} settings={boot.settings} writable={writable} />
-          )}
-          {currentNav.id === 'parties' && <PartiesPage user={user} writable={writable} />}
-          {currentNav.id === 'finance' && <FinancePage user={user} writable={writable} />}
-          {currentNav.id === 'reports' && <ReportsPage />}
-          {currentNav.id === 'admin' && (
-            <AdminPage user={user} onRefreshBootstrap={refreshBootstrap} />
+          {user.mustChangePassword ? (
+            <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900">
+              Password update required before accessing pharmacy operations.
+            </div>
+          ) : (
+            <>
+              {currentNav.id === 'dashboard' && (
+                <DashboardPage
+                  onNavigate={setActiveTab}
+                  canViewProfit={Boolean(user.permissions['reports.profit'])}
+                />
+              )}
+              {currentNav.id === 'pos' && (
+                <PosPage user={user} settings={boot.settings} />
+              )}
+              {currentNav.id === 'medicines' && <MedicinesPage user={user} />}
+              {currentNav.id === 'inventory' && <InventoryPage user={user} />}
+              {currentNav.id === 'purchases' && <PurchasesPage user={user} />}
+              {currentNav.id === 'sales' && (
+                <SalesHistoryPage user={user} settings={boot.settings} />
+              )}
+              {currentNav.id === 'parties' && <PartiesPage user={user} />}
+              {currentNav.id === 'finance' && <FinancePage user={user} />}
+              {currentNav.id === 'reports' && <ReportsPage />}
+              {currentNav.id === 'admin' && (
+                <AdminPage user={user} onRefreshBootstrap={refreshBootstrap} />
+              )}
+            </>
           )}
         </main>
       </div>

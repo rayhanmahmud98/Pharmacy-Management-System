@@ -36,10 +36,9 @@ interface SalesReturnRecord {
 interface Props {
   user: AuthUser;
   settings: PharmacySettings;
-  writable: boolean;
 }
 
-export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) => {
+export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
   const [sales, setSales] = useState<SaleRecord[]>([]);
   const [returns, setReturns] = useState<SalesReturnRecord[]>([]);
   const [search, setSearch] = useState('');
@@ -229,9 +228,8 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) 
                     {s.status === 'COMPLETED' && user.permissions['sales.return'] && (
                       <button
                         type="button"
-                        disabled={!writable}
                         onClick={() => openReturnModal(s)}
-                        className="inline-flex items-center gap-1 text-amber-700 hover:underline font-medium disabled:opacity-40"
+                        className="inline-flex items-center gap-1 text-amber-700 hover:underline font-medium"
                       >
                         <RotateCcw className="w-3.5 h-3.5" /> Return
                       </button>
@@ -239,9 +237,8 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings, writable }) 
                     {s.status === 'COMPLETED' && user.permissions['sales.reverse'] && (
                       <button
                         type="button"
-                        disabled={!writable}
                         onClick={() => setReverseSaleTarget(s)}
-                        className="text-red-700 hover:underline font-medium disabled:opacity-40"
+                        className="text-red-700 hover:underline font-medium"
                       >
                         Reverse
                       </button>

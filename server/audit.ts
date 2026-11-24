@@ -1,7 +1,6 @@
 import crypto from 'node:crypto';
-import type { DatabaseSync } from 'node:sqlite';
 import * as XLSX from 'xlsx';
-import { nowIso, uuid } from './db.ts';
+import { nowIso, uuid, type DbExecutor } from './db.ts';
 
 export interface AuditInput {
   userId: string | null;
@@ -61,12 +60,15 @@ function computeEntryHashV2(payload: {
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
-export function recordAudit(db: DatabaseSync, input: AuditInput): void {
-  const last = db
-    .prepare('SELECT seq, entry_hash FROM audit_logs ORDER BY seq DESC LIMIT 1')
-    .get() as { seq: number; entry_hash: string } | undefined;
+export async function recordAudit(tx: DbExecutor, input: AuditInput): Promise<void> {
+  // Serialize audit chain appends across concurrent counters/transactions
+  await tx.execute('SELECT pg_advisory_xact_lock(90421001)');
 
-  const seq = (last?.seq ?? 0) + 1;
+  const last = await tx.queryOne<{ seq: number; entry_hash: string }>(
+    'SELECT seq, entry_hash FROM audit_logs ORDER BY seq DESC LIMIT 1'
+  );
+
+  const seq = Number(last?.seq ?? 0) + 1;
   const prevHash = last?.entry_hash ?? 'GENESIS';
   const createdAt = nowIso();
   const beforeStr = JSON.stringify(input.beforeState ?? {});
@@ -98,48 +100,42 @@ export function recordAudit(db: DatabaseSync, input: AuditInput): void {
     createdAt,
   });
 
-  db.prepare(
+  await tx.execute(
     `INSERT INTO audit_logs (
       id, seq, user_id, username, session_id, ip_address, action, module,
       target_type, target_id, transaction_ref, status, before_state, after_state,
       metadata_json, reason, prev_hash, entry_hash, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    uuid(),
-    seq,
-    input.userId,
-    input.username,
-    sessionId,
-    ipAddress,
-    input.action,
-    input.module,
-    input.targetType,
-    input.targetId,
-    txRef,
-    status,
-    beforeStr,
-    afterStr,
-    metadataStr,
-    reason,
-    prevHash,
-    entryHash,
-    createdAt
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+    [
+      uuid(),
+      seq,
+      input.userId,
+      input.username,
+      sessionId,
+      ipAddress,
+      input.action,
+      input.module,
+      input.targetType,
+      input.targetId,
+      txRef,
+      status,
+      beforeStr,
+      afterStr,
+      metadataStr,
+      reason,
+      prevHash,
+      entryHash,
+      createdAt,
+    ]
   );
 }
 
-export function verifyAuditChain(db: DatabaseSync): {
+export async function verifyAuditChain(db: DbExecutor): Promise<{
   valid: boolean;
   totalEntries: number;
   brokenAtSeq: number | null;
-} {
-  const rows = db
-    .prepare(
-      `SELECT seq, user_id, username, session_id, ip_address, action, module, target_type, target_id,
-              transaction_ref, status, before_state, after_state, metadata_json, reason,
-              prev_hash, entry_hash, created_at
-       FROM audit_logs ORDER BY seq ASC`
-    )
-    .all() as Array<{
+}> {
+  const rows = await db.query<{
     seq: number;
     user_id: string | null;
     username: string;
@@ -158,16 +154,22 @@ export function verifyAuditChain(db: DatabaseSync): {
     prev_hash: string;
     entry_hash: string;
     created_at: string;
-  }>;
+  }>(
+    `SELECT seq, user_id, username, session_id, ip_address, action, module, target_type, target_id,
+            transaction_ref, status, before_state, after_state, metadata_json, reason,
+            prev_hash, entry_hash, created_at
+     FROM audit_logs ORDER BY seq ASC`
+  );
 
   let expectedPrev = 'GENESIS';
   for (const row of rows) {
+    const seqNum = Number(row.seq);
     if (row.prev_hash !== expectedPrev) {
-      return { valid: false, totalEntries: rows.length, brokenAtSeq: row.seq };
+      return { valid: false, totalEntries: rows.length, brokenAtSeq: seqNum };
     }
 
     const v2Hash = computeEntryHashV2({
-      seq: row.seq,
+      seq: seqNum,
       userId: row.user_id,
       username: row.username ?? 'system',
       sessionId: row.session_id ?? '',
@@ -187,7 +189,6 @@ export function verifyAuditChain(db: DatabaseSync): {
     });
 
     let matched = v2Hash === row.entry_hash;
-    // Backward compatibility for historical v1 audit entries created before extended audit metadata columns
     if (
       !matched &&
       (row.session_id ?? '') === '' &&
@@ -196,7 +197,7 @@ export function verifyAuditChain(db: DatabaseSync): {
       (row.metadata_json ?? '{}') === '{}'
     ) {
       const v1Hash = computeEntryHashV1({
-        seq: row.seq,
+        seq: seqNum,
         userId: row.user_id,
         action: row.action,
         module: row.module,
@@ -213,7 +214,7 @@ export function verifyAuditChain(db: DatabaseSync): {
     }
 
     if (!matched) {
-      return { valid: false, totalEntries: rows.length, brokenAtSeq: row.seq };
+      return { valid: false, totalEntries: rows.length, brokenAtSeq: seqNum };
     }
     expectedPrev = row.entry_hash;
   }
@@ -233,64 +234,63 @@ export interface AuditQueryFilters {
   offset?: number;
 }
 
-export function queryAuditLogs(db: DatabaseSync, filters: AuditQueryFilters = {}) {
+export async function queryAuditLogs(db: DbExecutor, filters: AuditQueryFilters = {}) {
   const clauses: string[] = [];
-  const params: (string | number)[] = [];
+  const params: Array<string | number> = [];
+
+  const pushParam = (val: string | number) => {
+    params.push(val);
+    return `$${params.length}`;
+  };
 
   if (filters.search?.trim()) {
-    const t = `%${filters.search.trim().toLowerCase()}%`;
+    const p = pushParam(`%${filters.search.trim().toLowerCase()}%`);
     clauses.push(
-      `(LOWER(username) LIKE ? OR LOWER(action) LIKE ? OR LOWER(module) LIKE ? OR LOWER(target_id) LIKE ? OR LOWER(transaction_ref) LIKE ? OR LOWER(reason) LIKE ?)`
+      `(LOWER(username) LIKE ${p} OR LOWER(action) LIKE ${p} OR LOWER(module) LIKE ${p} OR LOWER(target_id) LIKE ${p} OR LOWER(transaction_ref) LIKE ${p} OR LOWER(reason) LIKE ${p})`
     );
-    params.push(t, t, t, t, t, t);
   }
   if (filters.action?.trim()) {
-    clauses.push('action = ?');
-    params.push(filters.action.trim());
+    clauses.push(`action = ${pushParam(filters.action.trim())}`);
   }
   if (filters.module?.trim()) {
-    clauses.push('module = ?');
-    params.push(filters.module.trim());
+    clauses.push(`module = ${pushParam(filters.module.trim())}`);
   }
   if (filters.userId?.trim()) {
-    clauses.push('user_id = ?');
-    params.push(filters.userId.trim());
+    clauses.push(`user_id = ${pushParam(filters.userId.trim())}`);
   }
   if (filters.status?.trim()) {
-    clauses.push('status = ?');
-    params.push(filters.status.trim());
+    clauses.push(`status = ${pushParam(filters.status.trim())}`);
   }
   if (filters.fromDate?.trim()) {
-    clauses.push('substr(created_at, 1, 10) >= ?');
-    params.push(filters.fromDate.trim());
+    clauses.push(`(created_at AT TIME ZONE 'UTC')::date >= ${pushParam(filters.fromDate.trim())}::date`);
   }
   if (filters.toDate?.trim()) {
-    clauses.push('substr(created_at, 1, 10) <= ?');
-    params.push(filters.toDate.trim());
+    clauses.push(`(created_at AT TIME ZONE 'UTC')::date <= ${pushParam(filters.toDate.trim())}::date`);
   }
 
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
   const limit = Math.min(500, Math.max(1, Number(filters.limit ?? 100)));
   const offset = Math.max(0, Number(filters.offset ?? 0));
 
-  const totalRow = db
-    .prepare(`SELECT COUNT(*) as cnt FROM audit_logs ${where}`)
-    .get(...params) as { cnt: number };
+  const totalRow = await db.queryOne<{ cnt: number }>(`SELECT COUNT(*)::int AS cnt FROM audit_logs ${where}`, params);
 
-  const rows = db
-    .prepare(`SELECT * FROM audit_logs ${where} ORDER BY seq DESC LIMIT ? OFFSET ?`)
-    .all(...params, limit, offset) as Array<Record<string, unknown>>;
+  const limitParam = `$${params.length + 1}`;
+  const offsetParam = `$${params.length + 2}`;
+  const rows = await db.query<Record<string, unknown>>(
+    `SELECT * FROM audit_logs ${where} ORDER BY seq DESC LIMIT ${limitParam} OFFSET ${offsetParam}`,
+    [...params, limit, offset]
+  );
 
   return {
-    total: totalRow.cnt,
+    total: Number(totalRow?.cnt ?? 0),
     limit,
     offset,
     logs: rows,
   };
 }
 
-export function exportAuditLogsExcelBuffer(db: DatabaseSync, filters: AuditQueryFilters = {}): Buffer {
-  const { logs } = queryAuditLogs(db, { ...filters, limit: 5000, offset: 0 });
+export async function exportAuditLogsExcelBuffer(db: DbExecutor, filters: AuditQueryFilters = {}): Promise<Buffer> {
+  const { logs } = await queryAuditLogs(db, { ...filters, limit: 5000, offset: 0 });
   const wb = XLSX.utils.book_new();
   const formatted = logs.map((l) => ({
     Seq: l.seq,

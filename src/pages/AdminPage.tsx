@@ -5,7 +5,6 @@ import {
   Download,
   Edit3,
   Eye,
-  KeyRound,
   Network,
   RotateCcw,
   ShieldCheck,
@@ -15,7 +14,7 @@ import {
 } from 'lucide-react';
 import { apiFetch, checkStrictDecimalInput } from '../lib/api';
 import { ConfirmActionModal } from '../components/ActionModals';
-import type { AuthUser, LicenseStatus, PharmacySettings } from '../types';
+import type { AuthUser, PharmacySettings } from '../types';
 
 interface AuditRow {
   id: string;
@@ -71,7 +70,6 @@ interface AdminPayload {
     created_at: string;
   }>;
   settings: PharmacySettings;
-  license: LicenseStatus;
   networkInfo?: {
     port: number;
     hostname: string;
@@ -95,7 +93,7 @@ function prettyJson(raw: string | null): string {
 
 export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
   const [data, setData] = useState<AdminPayload | null>(null);
-  const [tab, setTab] = useState<'users' | 'audit' | 'backups' | 'license' | 'settings'>('users');
+  const [tab, setTab] = useState<'users' | 'audit' | 'backups' | 'settings'>('users');
   const [selectedUserId, setSelectedUserId] = useState('');
   const [newUser, setNewUser] = useState({ username: '', fullName: '', password: '', roleId: '', phone: '', email: '' });
   const [editUserTarget, setEditUserTarget] = useState<{
@@ -123,7 +121,6 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
   });
   const [inspectAudit, setInspectAudit] = useState<AuditRow | null>(null);
 
-  const [licenseJson, setLicenseJson] = useState('');
   const [settingsForm, setSettingsForm] = useState<PharmacySettings | null>(null);
   const [restoreTarget, setRestoreTarget] = useState<{ id: string; filename: string } | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
@@ -155,8 +152,10 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
     if (filter.toDate) params.set('toDate', filter.toDate);
     params.set('limit', '50');
     params.set('offset', String(offset));
-    const res = await apiFetch<{ rows: AuditRow[]; total: number }>(`/api/admin/audit?${params.toString()}`);
-    setAuditRows(res.rows);
+    const res = await apiFetch<{ rows?: AuditRow[]; logs?: AuditRow[]; total: number }>(
+      `/api/admin/audit?${params.toString()}`
+    );
+    setAuditRows(res.logs ?? res.rows ?? []);
     setAuditTotal(res.total);
     setAuditOffset(offset);
   }
@@ -247,7 +246,7 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
       const res = await apiFetch<{ filename: string; integrityCheck: string }>('/api/admin/backups', {
         method: 'POST',
       });
-      setNotice(`Verified SQLite backup '${res.filename}' created (PRAGMA integrity_check: ${res.integrityCheck}).`);
+      setNotice(`Verified PostgreSQL backup '${res.filename}' created (verification: ${res.integrityCheck}).`);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Backup failed');
@@ -271,24 +270,6 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
       onRefreshBootstrap();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Restore failed');
-    }
-  }
-
-  async function handleInstallLicense(e: React.FormEvent) {
-    e.preventDefault();
-    setError('');
-    try {
-      const parsed = JSON.parse(licenseJson);
-      const res = await apiFetch<LicenseStatus>('/api/admin/license/install', {
-        method: 'POST',
-        body: JSON.stringify(parsed),
-      });
-      setNotice(`License installed: ${res.message}`);
-      setLicenseJson('');
-      await load();
-      onRefreshBootstrap();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'License installation failed');
     }
   }
 
@@ -366,7 +347,7 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
   return (
     <div className="space-y-5">
       <div>
-        <h1 className="text-xl font-bold text-slate-900">Administration, Security, Backups & Offline Licensing</h1>
+        <h1 className="text-xl font-bold text-slate-900">Administration, Security, Backups & LAN Settings</h1>
         <p className="text-xs text-slate-500">
           Permission precedence: Inactive Account (Deny) &gt; Super Admin &gt; Individual Override &gt; Role Rule.
         </p>
@@ -379,9 +360,8 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
         {[
           { id: 'users', label: 'Users & Permission Overrides' },
           { id: 'audit', label: 'Audit Log & Hash Chain' },
-          { id: 'backups', label: 'Verified SQLite Backups' },
-          { id: 'license', label: 'Offline License & LAN' },
-          { id: 'settings', label: 'Pharmacy Setup & Settings' },
+          { id: 'backups', label: 'Verified PostgreSQL Backups' },
+          { id: 'settings', label: 'Pharmacy Setup, LAN & Settings' },
         ].map((t) => (
           <button
             key={t.id}
@@ -397,6 +377,7 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
       </div>
 
       {tab === 'users' && (
+        <div className="space-y-4">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
           <div className="lg:col-span-5 space-y-4">
             <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
@@ -484,62 +465,64 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
             {user.permissions['admin.users'] && (
               <form onSubmit={handleCreateUser} className="bg-white border border-slate-200 rounded-lg p-4 space-y-2.5 text-xs">
                 <div className="font-semibold text-slate-900">Add Staff User</div>
-                <input
-                  type="text"
-                  required
-                  placeholder="Username"
-                  value={newUser.username}
-                  onChange={(e) => setNewUser({ ...newUser, username: e.target.value })}
-                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
-                />
-                <input
-                  type="text"
-                  required
-                  placeholder="Full Name"
-                  value={newUser.fullName}
-                  onChange={(e) => setNewUser({ ...newUser, fullName: e.target.value })}
-                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
-                />
-                <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-2.5">
                   <input
                     type="text"
-                    placeholder="Phone"
-                    value={newUser.phone}
-                    onChange={(e) => setNewUser({ ...newUser, phone: e.target.value })}
+                    required
+                    placeholder="Username"
+                    value={newUser.username}
+                    onChange={(e) => setNewUser({ ...newUser, username: e.target.value })}
                     className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
                   />
                   <input
-                    type="email"
-                    placeholder="Email"
-                    value={newUser.email}
-                    onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
+                    type="text"
+                    required
+                    placeholder="Full Name"
+                    value={newUser.fullName}
+                    onChange={(e) => setNewUser({ ...newUser, fullName: e.target.value })}
                     className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
                   />
+                  <div className="grid grid-cols-2 gap-2">
+                    <input
+                      type="text"
+                      placeholder="Phone"
+                      value={newUser.phone}
+                      onChange={(e) => setNewUser({ ...newUser, phone: e.target.value })}
+                      className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                    />
+                    <input
+                      type="email"
+                      placeholder="Email"
+                      value={newUser.email}
+                      onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
+                      className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                    />
+                  </div>
+                  <input
+                    type="password"
+                    required
+                    minLength={6}
+                    placeholder="Password (min 6 chars)"
+                    value={newUser.password}
+                    onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
+                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                  />
+                  <select
+                    value={newUser.roleId}
+                    onChange={(e) => setNewUser({ ...newUser, roleId: e.target.value })}
+                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                  >
+                    {data.roles.map((r) => (
+                      <option key={r.id} value={r.id}>{r.name}</option>
+                    ))}
+                  </select>
+                  <button
+                    type="submit"
+                    className="w-full py-2 bg-teal-700 hover:bg-teal-800 text-white font-semibold rounded"
+                  >
+                    Create Staff Account
+                  </button>
                 </div>
-                <input
-                  type="password"
-                  required
-                  minLength={6}
-                  placeholder="Password (min 6 chars)"
-                  value={newUser.password}
-                  onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
-                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
-                />
-                <select
-                  value={newUser.roleId}
-                  onChange={(e) => setNewUser({ ...newUser, roleId: e.target.value })}
-                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
-                >
-                  {data.roles.map((r) => (
-                    <option key={r.id} value={r.id}>{r.name}</option>
-                  ))}
-                </select>
-                <button
-                  type="submit"
-                  className="w-full py-2 bg-teal-700 hover:bg-teal-800 text-white font-semibold rounded"
-                >
-                  Create Staff Account
-                </button>
               </form>
             )}
           </div>
@@ -578,7 +561,7 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
                       onChange={(e) =>
                         handleOverrideChange(p.code, e.target.value as 'ALLOW' | 'DENY' | 'INHERIT')
                       }
-                      className="px-2 py-1 border border-slate-300 rounded bg-white text-xs"
+                      className="px-2 py-1 border border-slate-300 rounded bg-white text-xs disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <option value="INHERIT">Inherit ({roleAllows ? 'Allow' : 'Deny'})</option>
                       <option value="ALLOW">Force Allow</option>
@@ -589,6 +572,7 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
               })}
             </div>
           </div>
+        </div>
         </div>
       )}
 
@@ -610,7 +594,7 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
                 </span>
               </div>
               <span className="text-[11px] opacity-80">
-                Detects post-write modifications inside the local SQLite audit ledger.
+                Detects post-write modifications inside the PostgreSQL audit ledger.
               </span>
             </div>
           )}
@@ -649,7 +633,6 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
                 <option value="settings">Settings</option>
                 <option value="permissions">Permissions</option>
                 <option value="backups">Backups</option>
-                <option value="licensing">Licensing</option>
               </select>
             </div>
             <div>
@@ -791,9 +774,9 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
         <div className="space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white border border-slate-200 rounded-lg p-4">
             <div className="text-xs">
-              <div className="font-semibold text-slate-900 text-sm">SQLite Online Backup API (WAL-Safe)</div>
+              <div className="font-semibold text-slate-900 text-sm">PostgreSQL Verified Backup Archive (pg_dump)</div>
               <div className="text-slate-500 mt-0.5">
-                Every backup is written using native SQLite online backup and verified with PRAGMA integrity_check.
+                Every backup is exported using PostgreSQL pg_dump custom format and verified with pg_restore TOC & SHA-256 checks.
               </div>
             </div>
             <button
@@ -844,7 +827,7 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
                 {data.backups.length === 0 && (
                   <tr>
                     <td colSpan={6} className="px-4 py-6 text-center text-slate-500">
-                      No manual backups created yet. Click Create Verified Backup Now to verify WAL backup & restore.
+                      No manual backups created yet. Click Create Verified Backup Now to verify pg_dump backup & restore.
                     </td>
                   </tr>
                 )}
@@ -854,72 +837,9 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
         </div>
       )}
 
-      {tab === 'license' && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-          <div className="space-y-4">
-            <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-3 text-xs">
-              <div className="flex items-center gap-2 text-sm font-bold text-slate-900">
-                <KeyRound className="w-4 h-4 text-teal-700" />
-                Offline Ed25519 License Status
-              </div>
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded space-y-1.5 font-mono-num">
-                <div>Status: <strong>{data.license.status}</strong></div>
-                <div>Writable: <strong>{data.license.writable ? 'YES (Full Operation)' : 'READ-ONLY (Data Export & Reprints Unlocked)'}</strong></div>
-                <div>Device Fingerprint: <strong>{data.license.deviceFingerprint}</strong></div>
-                {data.license.payload && (
-                  <>
-                    <div>License ID: {data.license.payload.licenseId}</div>
-                    <div>Licensed To: {data.license.payload.pharmacyName}</div>
-                    <div>Type: {data.license.payload.licenseType}</div>
-                    <div>Expiry: {data.license.payload.expiryDate || 'Lifetime'}</div>
-                  </>
-                )}
-              </div>
-              <p className="text-slate-500">
-                Only the Ed25519 public verification key is stored inside the application. Clock-rollback protection compares UTC timestamps monotonically across restarts.
-              </p>
-            </div>
-
-            {data.networkInfo && (
-              <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-2.5 text-xs">
-                <div className="flex items-center gap-2 text-sm font-bold text-slate-900">
-                  <Network className="w-4 h-4 text-teal-700" />
-                  Multi-Device LAN Access URLs
-                </div>
-                <p className="text-slate-500">
-                  Open any URL below from counter PCs or tablets connected to the same shop Wi-Fi/LAN ({data.networkInfo.hostname}, Port {data.networkInfo.port}):
-                </p>
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded space-y-1 font-mono-num text-slate-800">
-                  {data.networkInfo.urls.map((u) => (
-                    <div key={u}>{u}</div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-
-          <form onSubmit={handleInstallLicense} className="bg-white border border-slate-200 rounded-lg p-5 space-y-3 text-xs h-fit">
-            <div className="font-bold text-sm text-slate-900">Install Signed License JSON</div>
-            <textarea
-              rows={9}
-              required
-              placeholder='Paste signed license JSON payload from License Manager...'
-              value={licenseJson}
-              onChange={(e) => setLicenseJson(e.target.value)}
-              className="w-full p-2.5 border border-slate-300 rounded font-mono-num text-[11px]"
-            />
-            <button
-              type="submit"
-              className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
-            >
-              Verify Signature & Activate License
-            </button>
-          </form>
-        </div>
-      )}
-
       {tab === 'settings' && settingsForm && (
-        <form onSubmit={handleSaveSettings} className="bg-white border border-slate-200 rounded-lg p-5 max-w-3xl space-y-4 text-xs">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+        <form onSubmit={handleSaveSettings} className="lg:col-span-8 bg-white border border-slate-200 rounded-lg p-5 space-y-4 text-xs">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-sm font-bold text-slate-900">
               <ShieldCheck className="w-4 h-4 text-teal-700" />
@@ -937,6 +857,8 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
               Launch Setup Wizard
             </button>
           </div>
+
+          <div className="space-y-4">
 
           <div className="flex flex-wrap items-center gap-4 p-3 bg-slate-50 border border-slate-200 rounded-md">
             <div className="w-14 h-14 bg-white border border-slate-200 rounded-md flex items-center justify-center overflow-hidden shrink-0">
@@ -1125,6 +1047,7 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
               />
             </div>
           </div>
+          </div>
           <button
             type="submit"
             className="px-5 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
@@ -1132,6 +1055,24 @@ export const AdminPage: React.FC<Props> = ({ user, onRefreshBootstrap }) => {
             Save Pharmacy Settings
           </button>
         </form>
+
+        {data.networkInfo && (
+          <div className="lg:col-span-4 bg-white border border-slate-200 rounded-lg p-5 space-y-2.5 text-xs">
+            <div className="flex items-center gap-2 text-sm font-bold text-slate-900">
+              <Network className="w-4 h-4 text-teal-700" />
+              Multi-Device LAN Access URLs
+            </div>
+            <p className="text-slate-500">
+              Open any URL below from counter PCs or tablets connected to the same shop Wi-Fi/LAN ({data.networkInfo.hostname}, Port {data.networkInfo.port}):
+            </p>
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded space-y-1 font-mono-num text-slate-800">
+              {data.networkInfo.urls.map((u) => (
+                <div key={u}>{u}</div>
+              ))}
+            </div>
+          </div>
+        )}
+        </div>
       )}
 
       <ConfirmActionModal

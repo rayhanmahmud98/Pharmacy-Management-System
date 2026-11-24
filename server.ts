@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import cookieParser from 'cookie-parser';
 import express from 'express';
 import fs from 'node:fs';
@@ -23,10 +24,20 @@ function getLanUrls(port: number): string[] {
 }
 
 async function startServer() {
-  getDb();
-  seedDatabaseIfEmpty();
+  await getDb();
+  await seedDatabaseIfEmpty();
 
   const app = express();
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Referrer-Policy', 'same-origin');
+    next();
+  });
+
   app.use(express.json({ limit: '12mb' }));
   app.use(cookieParser());
   app.use(resolveSessionMiddleware);
@@ -59,15 +70,20 @@ async function startServer() {
     }
   });
 
+  let shuttingDown = false;
   const shutdown = (signal: string) => {
-    console.log(`Received ${signal}; closing MediNest server and checkpointing SQLite WAL...`);
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}; closing MediNest server and PostgreSQL connection pool...`);
     server.close(() => {
-      closeDb();
-      process.exit(0);
+      closeDb()
+        .catch(() => undefined)
+        .finally(() => process.exit(0));
     });
     setTimeout(() => {
-      closeDb();
-      process.exit(0);
+      closeDb()
+        .catch(() => undefined)
+        .finally(() => process.exit(0));
     }, 3000).unref();
   };
 
