@@ -4,40 +4,49 @@ import {
   apiFetch,
   checkStrictDecimalInput,
   formatBDT,
+  getCounterCode,
   getDisplayCurrencySymbol,
   newIdempotencyKey,
+  normalizeCounterCode,
+  setCounterCode,
 } from '../lib/api';
 import { ReasonPromptModal } from '../components/ActionModals';
 import type { AuthUser } from '../types';
 
+interface CashSessionSummary {
+  session: {
+    id: string;
+    session_number: string;
+    counter_code?: string;
+    opened_by_name: string;
+    opened_at: string;
+    opening_cash: string;
+  };
+  movements: Array<{
+    id: string;
+    movement_type: string;
+    amount_signed: string;
+    notes: string;
+    username: string;
+    created_at: string;
+  }>;
+  totals: {
+    openingCash: string;
+    cashReceived: string;
+    cashPaid: string;
+    cashAdjustments: string;
+    expectedCash: string;
+  };
+}
+
 interface FinanceData {
-  activeSummary: {
-    session: {
-      id: string;
-      session_number: string;
-      opened_by_name: string;
-      opened_at: string;
-      opening_cash: string;
-    };
-    movements: Array<{
-      id: string;
-      movement_type: string;
-      amount_signed: string;
-      notes: string;
-      username: string;
-      created_at: string;
-    }>;
-    totals: {
-      openingCash: string;
-      cashReceived: string;
-      cashPaid: string;
-      cashAdjustments: string;
-      expectedCash: string;
-    };
-  } | null;
+  currentCounter?: string;
+  activeSummary: CashSessionSummary | null;
+  openSessions?: CashSessionSummary[];
   sessions: Array<{
     id: string;
     session_number: string;
+    counter_code?: string;
     status: string;
     opened_by_name: string;
     opened_at: string;
@@ -69,6 +78,8 @@ interface Props {
 
 export const FinancePage: React.FC<Props> = ({ user }) => {
   const [data, setData] = useState<FinanceData | null>(null);
+  const [selectedCounter, setSelectedCounter] = useState<string>(() => getCounterCode());
+  const [customCounterInput, setCustomCounterInput] = useState<string>(() => getCounterCode());
   const [openingCash, setOpeningCash] = useState('5000.00');
   const [actualCash, setActualCash] = useState('');
   const [varianceReason, setVarianceReason] = useState('');
@@ -86,16 +97,25 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const submitLockRef = useRef(false);
   const openIdempKeyRef = useRef(newIdempotencyKey());
   const closeIdempKeyRef = useRef(newIdempotencyKey());
   const expenseIdempKeyRef = useRef(newIdempotencyKey());
+  const reverseExpIdempKeyRef = useRef(newIdempotencyKey());
   const currencySym = getDisplayCurrencySymbol();
 
-  async function load() {
-    const res = await apiFetch<FinanceData>('/api/finance');
+  async function load(sessionId?: string, counterOverride?: string) {
+    const counter = normalizeCounterCode(counterOverride ?? selectedCounter);
+    const params = new URLSearchParams();
+    params.set('counterCode', counter);
+    if (sessionId) params.set('sessionId', sessionId);
+    const res = await apiFetch<FinanceData>(`/api/finance?${params.toString()}`, {
+      headers: { 'X-Counter-Id': counter },
+    });
     setData(res);
     if (res.activeSummary) {
       setActualCash(res.activeSummary.totals.expectedCash);
+      closeIdempKeyRef.current = newIdempotencyKey();
     }
     if (!expForm.categoryId && res.expenseCategories.length > 0) {
       setExpForm((p) => ({ ...p, categoryId: res.expenseCategories[0].id }));
@@ -106,48 +126,61 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
     load().catch((e) => setError(e.message));
   }, []);
 
+  function switchCounter(rawCounter: string, sessionId?: string) {
+    const normalized = setCounterCode(rawCounter);
+    setSelectedCounter(normalized);
+    setCustomCounterInput(normalized);
+    openIdempKeyRef.current = newIdempotencyKey();
+    closeIdempKeyRef.current = newIdempotencyKey();
+    setError('');
+    load(sessionId, normalized).catch((e) => setError(e.message));
+  }
+
   async function handleOpenSession(e: React.FormEvent) {
     e.preventDefault();
-    if (submitting) return;
+    if (submitLockRef.current || submitting) return;
     setError('');
     const err = checkStrictDecimalInput(openingCash, 'currency', 'Opening cash', { allowZero: true });
     if (err) {
       setError(err);
       return;
     }
+    submitLockRef.current = true;
     setSubmitting(true);
     try {
-      const res = await apiFetch<{ sessionNumber: string }>('/api/cash-sessions/open', {
+      const res = await apiFetch<{ sessionNumber: string; counterCode?: string }>('/api/cash-sessions/open', {
         method: 'POST',
-        headers: { 'Idempotency-Key': openIdempKeyRef.current },
-        body: JSON.stringify({ openingCash: openingCash.trim() }),
+        headers: { 'Idempotency-Key': openIdempKeyRef.current, 'X-Counter-Id': selectedCounter },
+        body: JSON.stringify({ openingCash: openingCash.trim(), counterCode: selectedCounter }),
       });
       openIdempKeyRef.current = newIdempotencyKey();
-      setNotice(`Cash session ${res.sessionNumber} opened.`);
-      await load();
+      setNotice(`Cash session ${res.sessionNumber} opened on ${res.counterCode || selectedCounter}.`);
+      await load(undefined, selectedCounter);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to open session');
     } finally {
+      submitLockRef.current = false;
       setSubmitting(false);
     }
   }
 
   async function handleCloseSession(e: React.FormEvent) {
     e.preventDefault();
-    if (!data?.activeSummary || submitting) return;
+    if (!data?.activeSummary || submitLockRef.current || submitting) return;
     setError('');
     const err = checkStrictDecimalInput(actualCash, 'currency', 'Actual counted cash', { allowZero: true });
     if (err) {
       setError(err);
       return;
     }
+    submitLockRef.current = true;
     setSubmitting(true);
     try {
       const res = await apiFetch<{ sessionNumber: string; variance: string }>(
         `/api/cash-sessions/${data.activeSummary.session.id}/close`,
         {
           method: 'POST',
-          headers: { 'Idempotency-Key': closeIdempKeyRef.current },
+          headers: { 'Idempotency-Key': closeIdempKeyRef.current, 'X-Counter-Id': selectedCounter },
           body: JSON.stringify({ actualCash: actualCash.trim(), varianceReason, forceClose }),
         }
       );
@@ -155,65 +188,75 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
       setNotice(`Cash session ${res.sessionNumber} closed (Variance: ${formatBDT(res.variance)}).`);
       setVarianceReason('');
       setForceClose(false);
-      await load();
+      await load(undefined, selectedCounter);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to close session');
     } finally {
+      submitLockRef.current = false;
       setSubmitting(false);
     }
   }
 
   async function handleCreateExpense(e: React.FormEvent) {
     e.preventDefault();
-    if (submitting) return;
+    if (submitLockRef.current || submitting) return;
     setError('');
     const err = checkStrictDecimalInput(expForm.amount, 'currency', 'Expense amount');
     if (err) {
       setError(err);
       return;
     }
+    submitLockRef.current = true;
     setSubmitting(true);
     try {
       const res = await apiFetch<{ expenseNumber: string }>('/api/expenses', {
         method: 'POST',
-        headers: { 'Idempotency-Key': expenseIdempKeyRef.current },
-        body: JSON.stringify({ ...expForm, amount: expForm.amount.trim() }),
+        headers: { 'Idempotency-Key': expenseIdempKeyRef.current, 'X-Counter-Id': selectedCounter },
+        body: JSON.stringify({ ...expForm, amount: expForm.amount.trim(), counterCode: selectedCounter }),
       });
       expenseIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Expense ${res.expenseNumber} posted.`);
       setShowExpenseModal(false);
       setExpForm((p) => ({ ...p, name: '', amount: '', referenceNo: '', notes: '' }));
-      await load();
+      await load(undefined, selectedCounter);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Expense failed');
     } finally {
+      submitLockRef.current = false;
       setSubmitting(false);
     }
   }
 
   function handleReverseExpense(id: string, num: string) {
+    reverseExpIdempKeyRef.current = newIdempotencyKey();
     setReverseExpenseTarget({ id, num });
   }
 
   async function confirmReverseExpense(reason: string) {
-    if (!reverseExpenseTarget) return;
+    if (!reverseExpenseTarget || submitLockRef.current) return;
     setError('');
+    submitLockRef.current = true;
     try {
       await apiFetch(`/api/expenses/${reverseExpenseTarget.id}/reverse`, {
         method: 'POST',
-        body: JSON.stringify({ reason }),
+        headers: { 'Idempotency-Key': reverseExpIdempKeyRef.current, 'X-Counter-Id': selectedCounter },
+        body: JSON.stringify({ reason, counterCode: selectedCounter }),
       });
+      reverseExpIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Expense ${reverseExpenseTarget.num} reversed.`);
       setReverseExpenseTarget(null);
-      await load();
+      await load(undefined, selectedCounter);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Reversal failed');
+    } finally {
+      submitLockRef.current = false;
     }
   }
 
   if (!data) return <div className="p-6 text-sm text-slate-500">Loading cash sessions and expenses...</div>;
 
   const active = data.activeSummary;
+  const openSessions = data.openSessions || [];
 
   return (
     <div className="space-y-6">
@@ -221,22 +264,95 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
         <div>
           <h1 className="text-xl font-bold text-slate-900">Cash Sessions, Drawer Ledger & Expenses</h1>
           <p className="text-xs text-slate-500">
-            Physical drawer tracks actual cash movements only. Variances on closing generate an audited variance adjustment.
+            Each counter maintains its own independent physical cash drawer. Variances on closing generate an audited variance adjustment.
           </p>
         </div>
-        {user.permissions['expenses.manage'] && (
-          <button
-            type="button"
-            onClick={() => setShowExpenseModal(true)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
-          >
-            <Plus className="w-4 h-4" /> Record Expense
-          </button>
-        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-md px-2.5 py-1.5 text-xs">
+            <span className="text-slate-500 font-medium">This Counter:</span>
+            {['COUNTER-1', 'COUNTER-2', 'COUNTER-3'].map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => switchCounter(c)}
+                className={`px-2 py-0.5 rounded font-mono-num font-semibold ${
+                  selectedCounter === c ? 'bg-teal-700 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                }`}
+              >
+                {c}
+              </button>
+            ))}
+            <input
+              type="text"
+              aria-label="Custom Counter ID"
+              value={customCounterInput}
+              onChange={(e) => setCustomCounterInput(e.target.value.toUpperCase())}
+              onBlur={() => {
+                if (customCounterInput.trim()) switchCounter(customCounterInput);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && customCounterInput.trim()) {
+                  e.preventDefault();
+                  switchCounter(customCounterInput);
+                }
+              }}
+              className="w-24 px-1.5 py-0.5 border border-slate-200 rounded font-mono-num text-xs"
+            />
+          </div>
+          {user.permissions['expenses.manage'] && (
+            <button
+              type="button"
+              onClick={() => {
+                expenseIdempKeyRef.current = newIdempotencyKey();
+                setShowExpenseModal(true);
+              }}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
+            >
+              <Plus className="w-4 h-4" /> Record Expense
+            </button>
+          )}
+        </div>
       </div>
 
       {error && <div className="p-3 bg-red-50 border border-red-200 text-red-800 rounded-md text-xs">{error}</div>}
       {notice && <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-md text-xs">{notice}</div>}
+
+      {openSessions.length > 0 && (
+        <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-2">
+          <div className="text-xs font-semibold text-slate-700">
+            Active Open Counter Drawers ({openSessions.length})
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            {openSessions.map((osItem) => {
+              const cCode = osItem.session.counter_code || 'COUNTER-1';
+              const isSelected = active?.session.id === osItem.session.id;
+              return (
+                <button
+                  key={osItem.session.id}
+                  type="button"
+                  onClick={() => switchCounter(cCode, osItem.session.id)}
+                  className={`text-left p-3 rounded-md border transition-colors ${
+                    isSelected
+                      ? 'border-teal-600 bg-teal-50/50'
+                      : 'border-slate-200 hover:border-slate-300 bg-slate-50/40'
+                  }`}
+                >
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-mono-num font-bold text-slate-900">{cCode}</span>
+                    <span className="text-[11px] text-emerald-700 font-semibold">OPEN</span>
+                  </div>
+                  <div className="text-sm font-bold font-mono-num text-slate-900 mt-1">
+                    {formatBDT(osItem.totals.expectedCash)}
+                  </div>
+                  <div className="text-[11px] text-slate-500 mt-0.5 truncate">
+                    {osItem.session.session_number} · {osItem.session.opened_by_name}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Active Cash Session Panel */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
@@ -245,7 +361,9 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
             <>
               <div className="flex items-center justify-between border-b border-slate-200 pb-3">
                 <div>
-                  <div className="text-xs font-semibold text-emerald-700">OPEN SESSION</div>
+                  <div className="text-xs font-semibold text-emerald-700">
+                    OPEN SESSION · {active.session.counter_code || selectedCounter}
+                  </div>
                   <div className="text-base font-bold font-mono-num text-slate-900">
                     {active.session.session_number}
                   </div>
@@ -282,14 +400,17 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
               {user.permissions['cash.close'] && (
                 <form onSubmit={handleCloseSession} className="pt-3 border-t border-slate-200 space-y-3 text-xs">
                   <div className="font-semibold text-slate-800">Close Cash Session (Manual Physical Count)</div>
-                  <div>
+              <div>
                     <label className="block text-slate-600 mb-1">Actual Counted Cash ({currencySym})</label>
                     <input
                       type="text"
                       inputMode="decimal"
                       required
                       value={actualCash}
-                      onChange={(e) => setActualCash(e.target.value)}
+                      onChange={(e) => {
+                        closeIdempKeyRef.current = newIdempotencyKey();
+                        setActualCash(e.target.value);
+                      }}
                       className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num"
                     />
                   </div>
@@ -301,7 +422,10 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
                       type="text"
                       placeholder="Explain any cash shortage or overage..."
                       value={varianceReason}
-                      onChange={(e) => setVarianceReason(e.target.value)}
+                      onChange={(e) => {
+                        closeIdempKeyRef.current = newIdempotencyKey();
+                        setVarianceReason(e.target.value);
+                      }}
                       className="w-full px-2.5 py-2 border border-slate-300 rounded"
                     />
                   </div>
@@ -310,7 +434,10 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
                       <input
                         type="checkbox"
                         checked={forceClose}
-                        onChange={(e) => setForceClose(e.target.checked)}
+                        onChange={(e) => {
+                          closeIdempKeyRef.current = newIdempotencyKey();
+                          setForceClose(e.target.checked);
+                        }}
                       />
                       Admin Force-Close Session
                     </label>
@@ -321,16 +448,18 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
                     className="w-full inline-flex items-center justify-center gap-2 py-2 px-4 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md"
                   >
                     <Lock className="w-3.5 h-3.5" />
-                    {submitting ? 'Closing...' : 'Close & Reconcile Cash Session'}
+                    {submitting ? 'Closing...' : `Close & Reconcile (${active.session.counter_code || selectedCounter})`}
                   </button>
                 </form>
               )}
             </>
           ) : (
             <form onSubmit={handleOpenSession} className="space-y-3 text-xs">
-              <div className="text-sm font-bold text-slate-900">No Active Cash Session</div>
+              <div className="text-sm font-bold text-slate-900">
+                No Active Cash Session on {selectedCounter}
+              </div>
               <p className="text-slate-500">
-                Open a cash session with your starting physical drawer float before taking cash sales or paying cash expenses.
+                Open a cash session for <strong>{selectedCounter}</strong> with its starting physical drawer float before taking cash sales or paying cash expenses on this counter.
               </p>
               <div>
                 <label className="block text-slate-600 mb-1">Opening Cash Float ({currencySym})</label>
@@ -339,7 +468,10 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
                   inputMode="decimal"
                   required
                   value={openingCash}
-                  onChange={(e) => setOpeningCash(e.target.value)}
+                  onChange={(e) => {
+                    openIdempKeyRef.current = newIdempotencyKey();
+                    setOpeningCash(e.target.value);
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num"
                 />
               </div>
@@ -348,7 +480,7 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
                 disabled={!user.permissions['cash.open'] || submitting}
                 className="w-full py-2 px-4 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
               >
-                {submitting ? 'Opening...' : 'Open Cash Session'}
+                {submitting ? 'Opening...' : `Open Session (${selectedCounter})`}
               </button>
             </form>
           )}
@@ -406,6 +538,7 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
               <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
                 <tr>
                   <th className="text-left px-3 py-2">Session #</th>
+                  <th className="text-left px-3 py-2">Counter</th>
                   <th className="text-left px-3 py-2">Status</th>
                   <th className="text-right px-3 py-2">Expected</th>
                   <th className="text-right px-3 py-2">Actual</th>
@@ -416,6 +549,7 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
                 {data.sessions.map((s) => (
                   <tr key={s.id}>
                     <td className="px-3 py-2 font-mono-num font-medium">{s.session_number}</td>
+                    <td className="px-3 py-2 font-mono-num text-slate-600">{s.counter_code || 'COUNTER-1'}</td>
                     <td className="px-3 py-2">{s.status}</td>
                     <td className="px-3 py-2 text-right font-mono-num">{s.expected_cash ? formatBDT(s.expected_cash) : '—'}</td>
                     <td className="px-3 py-2 text-right font-mono-num">{s.actual_cash ? formatBDT(s.actual_cash) : '—'}</td>
@@ -489,7 +623,10 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
                 <label className="block text-slate-600 mb-1">Category</label>
                 <select
                   value={expForm.categoryId}
-                  onChange={(e) => setExpForm({ ...expForm, categoryId: e.target.value })}
+                  onChange={(e) => {
+                    expenseIdempKeyRef.current = newIdempotencyKey();
+                    setExpForm({ ...expForm, categoryId: e.target.value });
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded bg-white"
                 >
                   {data.expenseCategories.map((c) => (
@@ -503,7 +640,10 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
                   type="text"
                   required
                   value={expForm.name}
-                  onChange={(e) => setExpForm({ ...expForm, name: e.target.value })}
+                  onChange={(e) => {
+                    expenseIdempKeyRef.current = newIdempotencyKey();
+                    setExpForm({ ...expForm, name: e.target.value });
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded"
                 />
               </div>
@@ -516,7 +656,10 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
                     required
                     placeholder="0.00"
                     value={expForm.amount}
-                    onChange={(e) => setExpForm({ ...expForm, amount: e.target.value })}
+                    onChange={(e) => {
+                      expenseIdempKeyRef.current = newIdempotencyKey();
+                      setExpForm({ ...expForm, amount: e.target.value });
+                    }}
                     className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num"
                   />
                 </div>
@@ -524,7 +667,10 @@ export const FinancePage: React.FC<Props> = ({ user }) => {
                   <label className="block text-slate-600 mb-1">Payment Method</label>
                   <select
                     value={expForm.paymentMethod}
-                    onChange={(e) => setExpForm({ ...expForm, paymentMethod: e.target.value })}
+                    onChange={(e) => {
+                      expenseIdempKeyRef.current = newIdempotencyKey();
+                      setExpForm({ ...expForm, paymentMethod: e.target.value });
+                    }}
                     className="w-full px-2.5 py-2 border border-slate-300 rounded bg-white"
                   >
                     <option value="CASH">Cash (Drawer)</option>

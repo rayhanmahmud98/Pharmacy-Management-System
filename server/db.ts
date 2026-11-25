@@ -90,6 +90,21 @@ export function getPgConnectionDetails(): PgConnectionDetails {
 
 let _pool: pg.Pool | null = null;
 let _initPromise: Promise<void> | null = null;
+let _maintenanceRestoreInProgress = false;
+
+export function setDbMaintenanceMode(active: boolean): void {
+  _maintenanceRestoreInProgress = active;
+}
+
+export function isDbMaintenanceMode(): boolean {
+  return _maintenanceRestoreInProgress;
+}
+
+function createMaintenanceError(): Error & { code: string } {
+  const err = new Error('Database restore in progress. Please retry in a few seconds.') as Error & { code: string };
+  err.code = '57P03';
+  return err;
+}
 
 function createExecutorFromQueryable(
   queryable: { query: (text: string, values?: unknown[]) => Promise<pg.QueryResult> },
@@ -141,28 +156,54 @@ export function getRawPool(): pg.Pool {
 }
 
 export async function ensureDbReady(): Promise<void> {
+  if (_maintenanceRestoreInProgress) {
+    throw createMaintenanceError();
+  }
   if (_initPromise) return _initPromise;
   const pool = getRawPool();
   _initPromise = (async () => {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      // Prevent concurrent startup workers from racing schema creation
-      await client.query('SELECT pg_advisory_xact_lock(90421000)');
-      const exec = createExecutorFromQueryable(client, 0, client);
-      await initSchema(exec);
-      await client.query('COMMIT');
-    } catch (err) {
+    const maxAttempts = Number(process.env.PG_CONNECT_RETRIES || 6);
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      let client: pg.PoolClient | undefined;
       try {
-        await client.query('ROLLBACK');
-      } catch {
-        // ignore rollback failure
+        client = await pool.connect();
+        await client.query('BEGIN');
+        // Prevent concurrent startup workers from racing schema creation
+        await client.query('SELECT pg_advisory_xact_lock(90421000)');
+        const exec = createExecutorFromQueryable(client, 0, client);
+        await initSchema(exec);
+        await client.query('COMMIT');
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (client) {
+          try {
+            await client.query('ROLLBACK');
+          } catch {
+            // ignore rollback failure
+          }
+        }
+        const pgCode = (err as { code?: string })?.code;
+        const isTransient =
+          pgCode === 'ECONNREFUSED' ||
+          pgCode === 'ENOTFOUND' ||
+          pgCode === 'ETIMEDOUT' ||
+          pgCode === '57P03' || // cannot_connect_now (starting up)
+          pgCode === '57P01' || // admin_shutdown
+          pgCode === '08006' ||
+          pgCode === '08001';
+        if (!isTransient || attempt === maxAttempts) {
+          _initPromise = null;
+          throw err;
+        }
+        await new Promise((r) => setTimeout(r, Math.min(2000, attempt * 400)));
+      } finally {
+        client?.release();
       }
-      _initPromise = null;
-      throw err;
-    } finally {
-      client.release();
     }
+    _initPromise = null;
+    throw lastErr;
   })();
   return _initPromise;
 }
@@ -186,6 +227,9 @@ export function resetDbInitializationState(): void {
 }
 
 export async function checkDbHealth(): Promise<{ ok: boolean; database: string; latencyMs: number }> {
+  if (_maintenanceRestoreInProgress) {
+    throw createMaintenanceError();
+  }
   const start = Date.now();
   const pool = getRawPool();
   const res = await pool.query('SELECT current_database() AS db');
@@ -194,6 +238,17 @@ export async function checkDbHealth(): Promise<{ ok: boolean; database: string; 
     database: String(res.rows[0]?.db || ''),
     latencyMs: Date.now() - start,
   };
+}
+
+export async function cleanupExpiredOperationalState(): Promise<void> {
+  if (_maintenanceRestoreInProgress) return;
+  try {
+    const db = await getDb();
+    await db.execute('DELETE FROM sessions WHERE expires_at < NOW()');
+    await db.execute("DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '30 days'");
+  } catch {
+    // Best-effort housekeeping; never disrupt live requests
+  }
 }
 
 export function uuid(): string {
@@ -400,10 +455,21 @@ export function sanitizeHttpError(err: unknown): { status: number; message: stri
   const anyErr = err as { code?: string; constraint?: string; message?: string; statusCode?: number };
   if (anyErr?.code) {
     switch (anyErr.code) {
+      case 'ECONNREFUSED':
+      case 'ENOTFOUND':
+      case 'ETIMEDOUT':
+      case '57P01':
+      case '57P02':
+      case '57P03':
+      case '08000':
+      case '08001':
+      case '08003':
+      case '08006':
+        return { status: 503, message: 'Database connection temporarily unavailable. Please wait a moment and retry.' };
       case '23505': {
         const c = (anyErr.constraint || '').toLowerCase();
         if (c.includes('cash_sessions')) {
-          return { status: 409, message: 'A cash session is already OPEN. Close it before opening a new one.' };
+          return { status: 409, message: 'A cash session is already OPEN for this counter. Close it before opening a new one.' };
         }
         if (c.includes('username')) {
           return { status: 409, message: 'Username already exists.' };
@@ -840,6 +906,7 @@ export async function initSchema(db: DbExecutor): Promise<void> {
     CREATE TABLE IF NOT EXISTS cash_sessions (
       id TEXT PRIMARY KEY,
       session_number TEXT NOT NULL UNIQUE,
+      counter_code TEXT NOT NULL DEFAULT 'COUNTER-1',
       status TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED', 'FORCE_CLOSED')),
       opened_by TEXT NOT NULL REFERENCES users(id),
       opened_at TIMESTAMPTZ NOT NULL,
@@ -852,6 +919,7 @@ export async function initSchema(db: DbExecutor): Promise<void> {
       variance_reason TEXT NOT NULL DEFAULT '',
       notes TEXT NOT NULL DEFAULT ''
     );
+    ALTER TABLE cash_sessions ADD COLUMN IF NOT EXISTS counter_code TEXT NOT NULL DEFAULT 'COUNTER-1';
 
     CREATE TABLE IF NOT EXISTS cash_movements (
       id TEXT PRIMARY KEY,
@@ -966,8 +1034,9 @@ export async function initSchema(db: DbExecutor): Promise<void> {
       created_at TIMESTAMPTZ NOT NULL
     );
 
-    -- Concurrency & uniqueness constraints
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_cash_sessions_single_open ON cash_sessions ((1)) WHERE status = 'OPEN';
+    -- Concurrency & uniqueness constraints (independent open cash session per POS counter)
+    DROP INDEX IF EXISTS uq_cash_sessions_single_open;
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_cash_sessions_open_per_counter ON cash_sessions (counter_code) WHERE status = 'OPEN';
 
     -- Operational query indexes
     CREATE INDEX IF NOT EXISTS idx_medicines_brand ON medicines(brand_name);
@@ -976,8 +1045,10 @@ export async function initSchema(db: DbExecutor): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_medicines_barcode ON medicines(barcode);
     CREATE INDEX IF NOT EXISTS idx_medicine_units_medicine ON medicine_units(medicine_id);
     CREATE INDEX IF NOT EXISTS idx_batches_medicine_expiry ON batches(medicine_id, status, expiry_date);
+    CREATE INDEX IF NOT EXISTS idx_batches_status_expiry ON batches(status, expiry_date);
     CREATE INDEX IF NOT EXISTS idx_stock_movements_batch ON stock_movements(batch_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(sale_date, status);
+    CREATE INDEX IF NOT EXISTS idx_sales_returns_date ON sales_returns(return_date);
     CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
     CREATE INDEX IF NOT EXISTS idx_sale_lines_sale ON sale_lines(sale_id);
     CREATE INDEX IF NOT EXISTS idx_sale_batch_alloc_line ON sale_batch_allocations(sale_line_id);
@@ -990,6 +1061,7 @@ export async function initSchema(db: DbExecutor): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_payment_alloc_target ON payment_allocations(target_type, target_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at);
     CREATE INDEX IF NOT EXISTS idx_audit_seq ON audit_logs(seq);
     CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
     CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action, module);

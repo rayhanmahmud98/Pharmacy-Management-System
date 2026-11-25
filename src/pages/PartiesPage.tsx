@@ -85,7 +85,9 @@ export const PartiesPage: React.FC<Props> = ({ user }) => {
   const [reversePaymentTarget, setReversePaymentTarget] = useState<PaymentRow | null>(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const submitLockRef = useRef(false);
   const paymentIdempKeyRef = useRef(newIdempotencyKey());
+  const reversePayIdempKeyRef = useRef(newIdempotencyKey());
   const currencySym = getDisplayCurrencySymbol();
 
   async function load() {
@@ -107,13 +109,14 @@ export const PartiesPage: React.FC<Props> = ({ user }) => {
 
   async function handlePaymentSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!payModal || submittingPay) return;
+    if (!payModal || submitLockRef.current || submittingPay) return;
     setError('');
     const err = checkStrictDecimalInput(payAmount, 'currency', 'Payment amount');
     if (err) {
       setError(err);
       return;
     }
+    submitLockRef.current = true;
     setSubmittingPay(true);
     try {
       const res = await apiFetch<{
@@ -145,6 +148,7 @@ export const PartiesPage: React.FC<Props> = ({ user }) => {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Payment failed');
     } finally {
+      submitLockRef.current = false;
       setSubmittingPay(false);
     }
   }
@@ -220,22 +224,28 @@ export const PartiesPage: React.FC<Props> = ({ user }) => {
   }
 
   function handleReversePayment(p: PaymentRow) {
+    reversePayIdempKeyRef.current = newIdempotencyKey();
     setReversePaymentTarget(p);
   }
 
   async function confirmReversePayment(reason: string) {
-    if (!reversePaymentTarget) return;
+    if (!reversePaymentTarget || submitLockRef.current) return;
+    submitLockRef.current = true;
     setError('');
     try {
       await apiFetch(`/api/payments/${reversePaymentTarget.id}/reverse`, {
         method: 'POST',
+        headers: { 'Idempotency-Key': reversePayIdempKeyRef.current },
         body: JSON.stringify({ reason }),
       });
+      reversePayIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Payment ${reversePaymentTarget.payment_number} reversed.`);
       setReversePaymentTarget(null);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Payment reversal failed');
+    } finally {
+      submitLockRef.current = false;
     }
   }
 
@@ -495,7 +505,10 @@ export const PartiesPage: React.FC<Props> = ({ user }) => {
                 <label className="block text-slate-600 mb-1">Payment Method</label>
                 <select
                   value={payMethod}
-                  onChange={(e) => setPayMethod(e.target.value as typeof payMethod)}
+                  onChange={(e) => {
+                    paymentIdempKeyRef.current = newIdempotencyKey();
+                    setPayMethod(e.target.value as typeof payMethod);
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded bg-white"
                 >
                   <option value="CASH">Cash (Updates Physical Drawer)</option>
@@ -514,7 +527,10 @@ export const PartiesPage: React.FC<Props> = ({ user }) => {
                   required
                   placeholder="0.00"
                   value={payAmount}
-                  onChange={(e) => setPayAmount(e.target.value)}
+                  onChange={(e) => {
+                    paymentIdempKeyRef.current = newIdempotencyKey();
+                    setPayAmount(e.target.value);
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num"
                 />
               </div>
@@ -523,7 +539,10 @@ export const PartiesPage: React.FC<Props> = ({ user }) => {
                 <input
                   type="text"
                   value={payRef}
-                  onChange={(e) => setPayRef(e.target.value)}
+                  onChange={(e) => {
+                    paymentIdempKeyRef.current = newIdempotencyKey();
+                    setPayRef(e.target.value);
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded"
                 />
               </div>

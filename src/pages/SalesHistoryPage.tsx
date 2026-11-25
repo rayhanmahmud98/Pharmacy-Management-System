@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Printer, RotateCcw, Search } from 'lucide-react';
 import {
   apiFetch,
@@ -51,8 +51,12 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
   const [settlementType, setSettlementType] = useState<'CASH_REFUND' | 'MFS_REFUND' | 'CUSTOMER_CREDIT'>('CASH_REFUND');
   const [returnReason, setReturnReason] = useState('');
   const [reverseSaleTarget, setReverseSaleTarget] = useState<SaleRecord | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const submitLockRef = useRef(false);
+  const returnIdempKeyRef = useRef(newIdempotencyKey());
+  const reverseIdempKeyRef = useRef(newIdempotencyKey());
 
   async function load(q = search) {
     const res = await apiFetch<{ sales: SaleRecord[]; returns: SalesReturnRecord[] }>(
@@ -67,6 +71,7 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
   }, []);
 
   function openReturnModal(s: SaleRecord) {
+    returnIdempKeyRef.current = newIdempotencyKey();
     setReturnTarget(s);
     const init: typeof lineReturns = {};
     for (const l of s.lines) {
@@ -79,7 +84,7 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
 
   async function handleSubmitReturn(e: React.FormEvent) {
     e.preventDefault();
-    if (!returnTarget) return;
+    if (!returnTarget || submitLockRef.current || submitting) return;
     setError('');
 
     const lines: Array<{ saleLineId: string; qtyBase: string; disposition: string }> = [];
@@ -96,12 +101,14 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
       }
     }
 
+    submitLockRef.current = true;
+    setSubmitting(true);
     try {
       const res = await apiFetch<{ returnNumber: string; totalRefundValue: string; totalCogsReversed: string }>(
         '/api/sales-returns',
         {
           method: 'POST',
-          headers: { 'Idempotency-Key': newIdempotencyKey() },
+          headers: { 'Idempotency-Key': returnIdempKeyRef.current },
           body: JSON.stringify({
             saleId: returnTarget.id,
             settlementType,
@@ -110,6 +117,7 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
           }),
         }
       );
+      returnIdempKeyRef.current = newIdempotencyKey();
       setNotice(
         `Sales Return ${res.returnNumber} processed (${formatBDT(res.totalRefundValue)} · COGS reversed ${formatBDT(res.totalCogsReversed)}).`
       );
@@ -117,22 +125,30 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Return failed');
+    } finally {
+      submitLockRef.current = false;
+      setSubmitting(false);
     }
   }
 
   async function confirmReverseSale(reason: string) {
-    if (!reverseSaleTarget) return;
+    if (!reverseSaleTarget || submitLockRef.current) return;
+    submitLockRef.current = true;
     setError('');
     try {
       await apiFetch(`/api/sales/${reverseSaleTarget.id}/reverse`, {
         method: 'POST',
+        headers: { 'Idempotency-Key': reverseIdempKeyRef.current },
         body: JSON.stringify({ reason }),
       });
+      reverseIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Invoice ${reverseSaleTarget.invoice_number} reversed cleanly with compensating stock & financial movements.`);
       setReverseSaleTarget(null);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Reversal failed');
+    } finally {
+      submitLockRef.current = false;
     }
   }
 
@@ -237,7 +253,10 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
                     {s.status === 'COMPLETED' && user.permissions['sales.reverse'] && (
                       <button
                         type="button"
-                        onClick={() => setReverseSaleTarget(s)}
+                        onClick={() => {
+                          reverseIdempKeyRef.current = newIdempotencyKey();
+                          setReverseSaleTarget(s);
+                        }}
                         className="text-red-700 hover:underline font-medium"
                       >
                         Reverse
@@ -328,24 +347,26 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
                         disabled={maxRet <= 0}
                         placeholder={`Qty (${l.base_unit_name})`}
                         value={state.qtyBase}
-                        onChange={(e) =>
-                          setLineReturns({ ...lineReturns, [l.id]: { ...state, qtyBase: e.target.value } })
-                        }
+                        onChange={(e) => {
+                          returnIdempKeyRef.current = newIdempotencyKey();
+                          setLineReturns({ ...lineReturns, [l.id]: { ...state, qtyBase: e.target.value } });
+                        }}
                         className="w-full px-2 py-1.5 border border-slate-300 rounded font-mono-num"
                       />
                     </div>
                     <div className="sm:col-span-4">
                       <select
                         value={state.disposition}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          returnIdempKeyRef.current = newIdempotencyKey();
                           setLineReturns({
                             ...lineReturns,
                             [l.id]: {
                               ...state,
                               disposition: e.target.value as typeof state.disposition,
                             },
-                          })
-                        }
+                          });
+                        }}
                         className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white"
                       >
                         <option value="QUARANTINE">Quarantine (Do Not Sell)</option>
@@ -365,7 +386,10 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
                 <label className="block text-slate-600 mb-1">Refund / Settlement Type</label>
                 <select
                   value={settlementType}
-                  onChange={(e) => setSettlementType(e.target.value as typeof settlementType)}
+                  onChange={(e) => {
+                    returnIdempKeyRef.current = newIdempotencyKey();
+                    setSettlementType(e.target.value as typeof settlementType);
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded bg-white"
                 >
                   <option value="CASH_REFUND">Cash Refund from Drawer</option>
@@ -380,7 +404,10 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
                   required
                   placeholder="Inspection notes & return reason..."
                   value={returnReason}
-                  onChange={(e) => setReturnReason(e.target.value)}
+                  onChange={(e) => {
+                    returnIdempKeyRef.current = newIdempotencyKey();
+                    setReturnReason(e.target.value);
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded"
                 />
               </div>
@@ -390,8 +417,12 @@ export const SalesHistoryPage: React.FC<Props> = ({ user, settings }) => {
               <button type="button" onClick={() => setReturnTarget(null)} className="px-4 py-2 text-xs bg-slate-100 rounded-md">
                 Cancel
               </button>
-              <button type="submit" className="px-4 py-2 text-xs font-semibold text-white bg-amber-700 hover:bg-amber-800 rounded-md">
-                Process Inspected Return
+              <button
+                type="submit"
+                disabled={submitting}
+                className="px-4 py-2 text-xs font-semibold text-white bg-amber-700 hover:bg-amber-800 disabled:opacity-50 rounded-md"
+              >
+                {submitting ? 'Processing...' : 'Process Inspected Return'}
               </button>
             </div>
           </form>

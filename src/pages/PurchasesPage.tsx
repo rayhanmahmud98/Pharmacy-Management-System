@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import Decimal from 'decimal.js';
 import { Plus, RotateCcw, Search } from 'lucide-react';
 import {
@@ -69,6 +69,11 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
   const [reverseTarget, setReverseTarget] = useState<PurchaseRecord | null>(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const submitLockRef = useRef(false);
+  const purchaseIdempKeyRef = useRef(newIdempotencyKey());
+  const receiveIdempKeyRef = useRef<{ purchaseId: string; key: string } | null>(null);
+  const returnIdempKeyRef = useRef(newIdempotencyKey());
+  const reverseIdempKeyRef = useRef(newIdempotencyKey());
 
   const [supplierId, setSupplierId] = useState('');
   const [supplierInv, setSupplierInv] = useState('');
@@ -132,6 +137,7 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
       return;
     }
     setError('');
+    purchaseIdempKeyRef.current = newIdempotencyKey();
     setDraftLines((prev) => [
       ...prev,
       {
@@ -146,6 +152,7 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
 
   async function handleSubmitPurchase(e: React.FormEvent) {
     e.preventDefault();
+    if (submitLockRef.current || submitting) return;
     if (draftLines.length === 0) {
       setError('Add at least one medicine line first');
       return;
@@ -157,12 +164,13 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
         return;
       }
     }
+    submitLockRef.current = true;
     setError('');
     setSubmitting(true);
     try {
       const res = await apiFetch<{ purchaseNumber: string }>('/api/purchases', {
         method: 'POST',
-        headers: { 'Idempotency-Key': newIdempotencyKey() },
+        headers: { 'Idempotency-Key': purchaseIdempKeyRef.current },
         body: JSON.stringify({
           supplierId,
           supplierInvoiceNo: supplierInv,
@@ -172,6 +180,7 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
           lines: draftLines,
         }),
       });
+      purchaseIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Purchase ${res.purchaseNumber} saved (${status}).`);
       setShowNew(false);
       setDraftLines([]);
@@ -181,52 +190,70 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Purchase failed');
     } finally {
+      submitLockRef.current = false;
       setSubmitting(false);
     }
   }
 
   async function handleReceiveDraft(p: PurchaseRecord) {
+    if (submitLockRef.current || submitting) return;
+    if (!receiveIdempKeyRef.current || receiveIdempKeyRef.current.purchaseId !== p.id) {
+      receiveIdempKeyRef.current = { purchaseId: p.id, key: newIdempotencyKey() };
+    }
+    submitLockRef.current = true;
+    setSubmitting(true);
     setError('');
     try {
       await apiFetch(`/api/purchases/${p.id}/receive`, {
         method: 'POST',
-        headers: { 'Idempotency-Key': newIdempotencyKey() },
+        headers: { 'Idempotency-Key': receiveIdempKeyRef.current.key },
         body: JSON.stringify({ paidAmount: '0', paymentMethod: 'CASH' }),
       });
+      receiveIdempKeyRef.current = null;
       setNotice(`Purchase ${p.purchase_number} received into active batch inventory.`);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Receive failed');
+    } finally {
+      submitLockRef.current = false;
+      setSubmitting(false);
     }
   }
 
   async function confirmReversePurchase(reason: string) {
-    if (!reverseTarget) return;
+    if (!reverseTarget || submitLockRef.current) return;
+    submitLockRef.current = true;
     setError('');
     try {
       await apiFetch(`/api/purchases/${reverseTarget.id}/reverse`, {
         method: 'POST',
+        headers: { 'Idempotency-Key': reverseIdempKeyRef.current },
         body: JSON.stringify({ reason }),
       });
+      reverseIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Purchase ${reverseTarget.purchase_number} reversed.`);
       setReverseTarget(null);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Reversal failed');
+    } finally {
+      submitLockRef.current = false;
     }
   }
 
   async function handleReturnSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!returnTarget) return;
+    if (!returnTarget || submitLockRef.current || submitting) return;
     setError('');
     const lines = Object.entries(returnQuantities)
       .filter(([, q]) => Number(q) > 0)
       .map(([purchaseLineId, qtyBase]) => ({ purchaseLineId, qtyBase }));
+    submitLockRef.current = true;
+    setSubmitting(true);
     try {
       const res = await apiFetch<{ returnNumber: string }>('/api/purchase-returns', {
         method: 'POST',
-        headers: { 'Idempotency-Key': newIdempotencyKey() },
+        headers: { 'Idempotency-Key': returnIdempKeyRef.current },
         body: JSON.stringify({
           purchaseId: returnTarget.id,
           settlementType: returnSettlement,
@@ -234,6 +261,7 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
           lines,
         }),
       });
+      returnIdempKeyRef.current = newIdempotencyKey();
       setNotice(`Purchase Return ${res.returnNumber} recorded.`);
       setReturnTarget(null);
       setReturnQuantities({});
@@ -241,6 +269,9 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Purchase return failed');
+    } finally {
+      submitLockRef.current = false;
+      setSubmitting(false);
     }
   }
 
@@ -273,7 +304,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
           {user.permissions['purchases.create'] && (
             <button
               type="button"
-              onClick={() => setShowNew(true)}
+              onClick={() => {
+                purchaseIdempKeyRef.current = newIdempotencyKey();
+                setShowNew(true);
+              }}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md"
             >
               <Plus className="w-4 h-4" />
@@ -329,8 +363,9 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                   {p.status === 'DRAFT' && user.permissions['purchases.receive'] && (
                     <button
                       type="button"
+                      disabled={submitting}
                       onClick={() => handleReceiveDraft(p)}
-                      className="text-teal-700 hover:underline font-medium"
+                      className="text-teal-700 hover:underline font-medium disabled:opacity-50"
                     >
                       Receive Stock
                     </button>
@@ -338,7 +373,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                   {p.status === 'RECEIVED' && user.permissions['purchases.return'] && (
                     <button
                       type="button"
-                      onClick={() => setReturnTarget(p)}
+                      onClick={() => {
+                        returnIdempKeyRef.current = newIdempotencyKey();
+                        setReturnTarget(p);
+                      }}
                       className="inline-flex items-center gap-1 text-amber-700 hover:underline font-medium"
                     >
                       <RotateCcw className="w-3 h-3" /> Return
@@ -347,7 +385,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                   {p.status === 'RECEIVED' && user.permissions['purchases.reverse'] && (
                     <button
                       type="button"
-                      onClick={() => setReverseTarget(p)}
+                      onClick={() => {
+                        reverseIdempKeyRef.current = newIdempotencyKey();
+                        setReverseTarget(p);
+                      }}
                       className="text-red-700 hover:underline font-medium"
                     >
                       Reverse
@@ -379,7 +420,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                 <label className="block text-slate-600 mb-1">Supplier *</label>
                 <select
                   value={supplierId}
-                  onChange={(e) => setSupplierId(e.target.value)}
+                  onChange={(e) => {
+                    purchaseIdempKeyRef.current = newIdempotencyKey();
+                    setSupplierId(e.target.value);
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded bg-white"
                 >
                   {suppliers.map((s) => (
@@ -392,7 +436,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                 <input
                   type="text"
                   value={supplierInv}
-                  onChange={(e) => setSupplierInv(e.target.value)}
+                  onChange={(e) => {
+                    purchaseIdempKeyRef.current = newIdempotencyKey();
+                    setSupplierInv(e.target.value);
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded"
                 />
               </div>
@@ -400,7 +447,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                 <label className="block text-slate-600 mb-1">Action Mode</label>
                 <select
                   value={status}
-                  onChange={(e) => setStatus(e.target.value as 'DRAFT' | 'RECEIVED')}
+                  onChange={(e) => {
+                    purchaseIdempKeyRef.current = newIdempotencyKey();
+                    setStatus(e.target.value as 'DRAFT' | 'RECEIVED');
+                  }}
                   className="w-full px-2.5 py-2 border border-slate-300 rounded bg-white"
                 >
                   <option value="RECEIVED">Receive Immediately (Create Batches)</option>
@@ -518,7 +568,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                     type="text"
                     inputMode="decimal"
                     value={paidAmount}
-                    onChange={(e) => setPaidAmount(e.target.value)}
+                    onChange={(e) => {
+                      purchaseIdempKeyRef.current = newIdempotencyKey();
+                      setPaidAmount(e.target.value);
+                    }}
                     className="w-full px-2.5 py-2 border border-slate-300 rounded font-mono-num"
                   />
                 </div>
@@ -526,7 +579,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                   <label className="block text-slate-600 mb-1">Payment Method</label>
                   <select
                     value={paymentMethod}
-                    onChange={(e) => setPaymentMethod(e.target.value as typeof paymentMethod)}
+                    onChange={(e) => {
+                      purchaseIdempKeyRef.current = newIdempotencyKey();
+                      setPaymentMethod(e.target.value as typeof paymentMethod);
+                    }}
                     className="w-full px-2.5 py-2 border border-slate-300 rounded bg-white"
                   >
                     <option value="CASH">Cash</option>
@@ -573,7 +629,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                     inputMode="decimal"
                     placeholder={`Return (${l.base_unit_name})`}
                     value={returnQuantities[l.id] || ''}
-                    onChange={(e) => setReturnQuantities({ ...returnQuantities, [l.id]: e.target.value })}
+                    onChange={(e) => {
+                      returnIdempKeyRef.current = newIdempotencyKey();
+                      setReturnQuantities({ ...returnQuantities, [l.id]: e.target.value });
+                    }}
                     className="w-36 px-2 py-1.5 border border-slate-300 rounded font-mono-num"
                   />
                 </div>
@@ -583,7 +642,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                   <label className="block text-slate-600 mb-1">Settlement</label>
                   <select
                     value={returnSettlement}
-                    onChange={(e) => setReturnSettlement(e.target.value as typeof returnSettlement)}
+                    onChange={(e) => {
+                      returnIdempKeyRef.current = newIdempotencyKey();
+                      setReturnSettlement(e.target.value as typeof returnSettlement);
+                    }}
                     className="w-full px-2.5 py-2 border border-slate-300 rounded bg-white"
                   >
                     <option value="SUPPLIER_CREDIT">Supplier Credit (Reduce Payable)</option>
@@ -597,7 +659,10 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
                     type="text"
                     required
                     value={returnReason}
-                    onChange={(e) => setReturnReason(e.target.value)}
+                    onChange={(e) => {
+                      returnIdempKeyRef.current = newIdempotencyKey();
+                      setReturnReason(e.target.value);
+                    }}
                     className="w-full px-2.5 py-2 border border-slate-300 rounded"
                   />
                 </div>
@@ -607,8 +672,12 @@ export const PurchasesPage: React.FC<Props> = ({ user }) => {
               <button type="button" onClick={() => setReturnTarget(null)} className="px-4 py-2 text-xs bg-slate-100 rounded-md">
                 Cancel
               </button>
-              <button type="submit" className="px-4 py-2 text-xs font-semibold text-white bg-amber-700 hover:bg-amber-800 rounded-md">
-                Confirm Purchase Return
+              <button
+                type="submit"
+                disabled={submitting}
+                className="px-4 py-2 text-xs font-semibold text-white bg-amber-700 hover:bg-amber-800 disabled:opacity-50 rounded-md"
+              >
+                {submitting ? 'Processing...' : 'Confirm Purchase Return'}
               </button>
             </div>
           </form>

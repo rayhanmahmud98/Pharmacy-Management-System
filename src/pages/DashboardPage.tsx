@@ -13,6 +13,9 @@ interface DashboardData {
     supplierDueTotal: string;
     activeDrawerExpectedCash: string | null;
     activeCashSessionNumber: string | null;
+    activeCounterCode?: string | null;
+    openDrawerCount?: number;
+    totalOpenDrawerExpectedCash?: string;
   };
   alerts: {
     expiryWarningDays: number;
@@ -110,7 +113,10 @@ export const DashboardPage: React.FC<Props> = ({ onNavigate, canViewProfit }) =>
 
         <div className="bg-white border border-slate-200 rounded-lg p-4">
           <div className="text-xs font-medium text-slate-500 flex items-center justify-between">
-            <span>Physical Cash Drawer</span>
+            <span>
+              Physical Cash Drawer
+              {data.kpis.activeCounterCode ? ` (${data.kpis.activeCounterCode})` : ''}
+            </span>
             <Wallet className="w-4 h-4 text-slate-400" />
           </div>
           <div className="text-2xl font-bold text-slate-900 font-mono-num mt-1">
@@ -120,6 +126,9 @@ export const DashboardPage: React.FC<Props> = ({ onNavigate, canViewProfit }) =>
           </div>
           <div className="text-xs text-slate-500 mt-1">
             {data.kpis.activeCashSessionNumber || 'Open a session in Finance'}
+            {typeof data.kpis.openDrawerCount === 'number' && data.kpis.openDrawerCount > 1 && data.kpis.totalOpenDrawerExpectedCash
+              ? ` · ${data.kpis.openDrawerCount} open counters (${formatBDT(data.kpis.totalOpenDrawerExpectedCash)})`
+              : ''}
           </div>
         </div>
 

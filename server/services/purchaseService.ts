@@ -40,6 +40,8 @@ export async function createPurchase(
     paymentMethod?: 'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD' | 'OTHER';
     paymentReference?: string;
     notes?: string;
+    counterCode?: string | null;
+    cashSessionId?: string | null;
     lines: PurchaseLineInput[];
   },
   existingTx?: DbExecutor
@@ -327,7 +329,7 @@ export async function createPurchase(
         );
 
         if (method === 'CASH') {
-          const cashSessionId = await getActiveCashSessionId(tx);
+          const cashSessionId = await getActiveCashSessionId(tx, input.counterCode, input.cashSessionId, user.id);
           if (!cashSessionId) {
             throw new Error('Cannot pay supplier in CASH without an OPEN cash session');
           }
@@ -376,7 +378,8 @@ export async function receiveDraftPurchase(
   paidAmountStr = '0',
   paymentMethod: 'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD' | 'OTHER' = 'CASH',
   applyAdvance = true,
-  existingTx?: DbExecutor
+  existingTx?: DbExecutor,
+  options?: { counterCode?: string | null; cashSessionId?: string | null }
 ) {
   const paid = validateCurrencyInput(paidAmountStr || '0', 'Paid amount', { allowZero: true });
 
@@ -557,7 +560,7 @@ export async function receiveDraftPurchase(
         [uuid(), payId, purchaseId, paid.toFixed(2)]
       );
       if (paymentMethod === 'CASH') {
-        const cashSessionId = await getActiveCashSessionId(tx);
+        const cashSessionId = await getActiveCashSessionId(tx, options?.counterCode, options?.cashSessionId, user.id);
         if (!cashSessionId) throw new Error('Cannot pay cash without an OPEN cash session');
         await tx.execute(
           `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
@@ -616,6 +619,8 @@ export async function createPurchaseReturn(
     purchaseId: string;
     settlementType: 'SUPPLIER_CREDIT' | 'CASH_REFUND' | 'BANK_REFUND';
     reason: string;
+    counterCode?: string | null;
+    cashSessionId?: string | null;
     lines: Array<{ purchaseLineId: string; qtyBase: string }>;
   },
   existingTx?: DbExecutor
@@ -861,7 +866,7 @@ export async function createPurchaseReturn(
         pur.id,
       ]);
       if (input.settlementType === 'CASH_REFUND') {
-        const cashSessionId = await getActiveCashSessionId(tx);
+        const cashSessionId = await getActiveCashSessionId(tx, input.counterCode, input.cashSessionId, user.id);
         if (!cashSessionId) throw new Error('Cannot receive cash refund without an OPEN cash session');
         await tx.execute(
           `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
@@ -902,7 +907,8 @@ export async function reversePurchase(
   user: AuthUser,
   purchaseId: string,
   reason: string,
-  existingTx?: DbExecutor
+  existingTx?: DbExecutor,
+  options?: { counterCode?: string | null; cashSessionId?: string | null }
 ) {
   if (!reason?.trim()) throw new Error('Mandatory reason is required for purchase reversal');
   return withTransaction(async (tx) => {
@@ -985,8 +991,8 @@ export async function reversePurchase(
       }
     }
 
-    const allocs = await tx.query<{ id: string; method: string; amount: string }>(
-      `SELECT p.id, p.method, p.amount FROM payment_allocations pa
+    const allocs = await tx.query<{ id: string; payment_number: string; method: string; amount: string }>(
+      `SELECT p.id, p.payment_number, p.method, p.amount FROM payment_allocations pa
        JOIN payments p ON p.id = pa.payment_id
        WHERE pa.target_type = 'PURCHASE' AND pa.target_id = $1 AND p.status = 'POSTED'
        FOR UPDATE OF p`,
@@ -994,12 +1000,38 @@ export async function reversePurchase(
     );
 
     for (const p of allocs) {
+      const siblingCount = await tx.queryOne<{ cnt: number }>(
+        'SELECT COUNT(*)::int AS cnt FROM payment_allocations WHERE payment_id = $1',
+        [p.id]
+      );
+      const advLinked = await tx.queryOne<{ cnt: number }>(
+        "SELECT COUNT(*)::int AS cnt FROM party_advance_ledger WHERE source_type = 'PAYMENT' AND source_id = $1",
+        [p.id]
+      );
+      if (Number(siblingCount?.cnt ?? 0) > 1 || Number(advLinked?.cnt ?? 0) > 0) {
+        throw new Error(
+          `Cannot reverse purchase ${pur.purchase_number} while shared supplier payment ${p.payment_number} is still active. Reverse ${p.payment_number} first in Parties & Payments.`
+        );
+      }
+
       await tx.execute("UPDATE payments SET status = 'REVERSED', reversal_reason = $1 WHERE id = $2", [
         reason.trim(),
         p.id,
       ]);
       if (p.method === 'CASH') {
-        const cashSessionId = await getActiveCashSessionId(tx);
+        let preferredSessionId = options?.cashSessionId || null;
+        if (!preferredSessionId && !options?.counterCode) {
+          const origMove = await tx.queryOne<{ cash_session_id: string; status: string }>(
+            `SELECT cm.cash_session_id, cs.status
+             FROM cash_movements cm
+             JOIN cash_sessions cs ON cs.id = cm.cash_session_id
+             WHERE cm.reference_type = 'PURCHASE' AND cm.reference_id = $1
+             ORDER BY cm.created_at DESC LIMIT 1`,
+            [purchaseId]
+          );
+          if (origMove?.status === 'OPEN') preferredSessionId = origMove.cash_session_id;
+        }
+        const cashSessionId = await getActiveCashSessionId(tx, options?.counterCode, preferredSessionId, user.id);
         if (!cashSessionId) throw new Error('Open cash session required to reverse cash purchase payment');
         await tx.execute(
           `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)

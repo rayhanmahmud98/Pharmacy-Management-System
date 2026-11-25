@@ -41,10 +41,6 @@ export function verifyPassword(password: string, hash: string): boolean {
 }
 
 export function extractClientIp(req: Request): string {
-  const fwd = req.headers['x-forwarded-for'];
-  if (typeof fwd === 'string' && fwd.trim()) {
-    return fwd.split(',')[0].trim();
-  }
   return req.ip || req.socket?.remoteAddress || '127.0.0.1';
 }
 
@@ -314,7 +310,7 @@ export function requireCsrfProtection(req: Request, res: Response, next: NextFun
     return;
   }
 
-  if (!req.cookies?.[SESSION_COOKIE_NAME]) {
+  if (!req.cookies?.[SESSION_COOKIE_NAME] && !req.cookies?.['shifarx_session']) {
     next();
     return;
   }

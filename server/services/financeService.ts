@@ -11,12 +11,65 @@ import {
   validateCurrencyInput,
 } from '../../src/shared/decimalMath.ts';
 
-export async function getActiveCashSessionId(tx?: DbExecutor): Promise<string | null> {
+export function normalizeCounterCode(raw?: string | null): string {
+  const cleaned = String(raw ?? '').trim().toUpperCase();
+  if (!cleaned) return 'COUNTER-1';
+  if (!/^[A-Z0-9_-]{1,32}$/.test(cleaned)) {
+    throw new Error('Counter code must be 1-32 alphanumeric characters, hyphens, or underscores (e.g. COUNTER-1)');
+  }
+  return cleaned;
+}
+
+export async function getActiveCashSessionId(
+  tx?: DbExecutor,
+  counterCode?: string | null,
+  explicitSessionId?: string | null,
+  userId?: string | null
+): Promise<string | null> {
   const db = tx || (await getDb());
-  const row = await db.queryOne<{ id: string }>(
-    "SELECT id FROM cash_sessions WHERE status = 'OPEN' ORDER BY opened_at DESC LIMIT 1"
+
+  if (explicitSessionId && explicitSessionId.trim()) {
+    const row = await db.queryOne<{ id: string; status: string }>(
+      'SELECT id, status FROM cash_sessions WHERE id = $1',
+      [explicitSessionId.trim()]
+    );
+    if (!row) throw new Error('Selected cash session was not found');
+    if (row.status !== 'OPEN') throw new Error('Selected cash session is not OPEN');
+    return row.id;
+  }
+
+  if (counterCode && counterCode.trim()) {
+    const normalized = normalizeCounterCode(counterCode);
+    const row = await db.queryOne<{ id: string }>(
+      "SELECT id FROM cash_sessions WHERE status = 'OPEN' AND counter_code = $1 ORDER BY opened_at DESC LIMIT 1",
+      [normalized]
+    );
+    return row?.id ?? null;
+  }
+
+  const openRows = await db.query<{ id: string; counter_code: string; opened_by: string }>(
+    "SELECT id, counter_code, opened_by FROM cash_sessions WHERE status = 'OPEN' ORDER BY opened_at DESC"
   );
-  return row?.id ?? null;
+  if (openRows.length === 0) return null;
+  if (openRows.length === 1) return openRows[0].id;
+
+  if (userId) {
+    const mine = openRows.filter((r) => r.opened_by === userId);
+    if (mine.length === 1) return mine[0].id;
+  }
+
+  throw new Error(
+    `Multiple counter cash sessions are currently OPEN (${openRows.map((r) => r.counter_code).join(', ')}). Select your counter or specify cashSessionId.`
+  );
+}
+
+export async function getOpenCashSessionsSummary(tx?: DbExecutor) {
+  const db = tx || (await getDb());
+  const rows = await db.query<{ id: string }>(
+    "SELECT id FROM cash_sessions WHERE status = 'OPEN' ORDER BY counter_code ASC, opened_at ASC"
+  );
+  const summaries = await Promise.all(rows.map((r) => getCashSessionSummary(r.id, db)));
+  return summaries.filter((s): s is NonNullable<typeof s> => Boolean(s));
 }
 
 export async function getCashSessionSummary(sessionId: string, tx?: DbExecutor) {
@@ -54,9 +107,9 @@ export async function getCashSessionSummary(sessionId: string, tx?: DbExecutor) 
   let cashAdjustments = new Decimal(0);
 
   for (const m of movements) {
-    if (m.movement_type === 'OPENING_CASH') continue;
+    if (m.movement_type === 'OPENING_CASH' || m.movement_type === 'CASH_VARIANCE') continue;
     const amt = d(m.amount_signed);
-    if (m.movement_type === 'CASH_ADJUSTMENT' || m.movement_type === 'CASH_VARIANCE' || m.movement_type === 'REVERSAL') {
+    if (m.movement_type === 'CASH_ADJUSTMENT' || m.movement_type === 'REVERSAL') {
       cashAdjustments = cashAdjustments.add(amt);
     } else if (amt.gt(0)) {
       cashReceived = cashReceived.add(amt);
@@ -89,16 +142,21 @@ export async function openCashSession(
   user: AuthUser,
   openingCashStr: string,
   notes = '',
-  existingTx?: DbExecutor
+  existingTx?: DbExecutor,
+  counterCodeInput?: string | null
 ) {
   const openingCash = validateCurrencyInput(openingCashStr, 'Opening cash', { allowZero: true });
+  const counterCode = normalizeCounterCode(counterCodeInput || 'COUNTER-1');
 
   return withTransaction(async (tx) => {
     const existing = await tx.queryOne<{ session_number: string }>(
-      "SELECT session_number FROM cash_sessions WHERE status = 'OPEN' FOR UPDATE"
+      "SELECT session_number FROM cash_sessions WHERE status = 'OPEN' AND counter_code = $1 FOR UPDATE",
+      [counterCode]
     );
     if (existing) {
-      throw new Error(`Cash session ${existing.session_number} is already OPEN. Close it before opening a new one.`);
+      throw new Error(
+        `Cash session ${existing.session_number} is already OPEN for ${counterCode}. Close it before opening a new one.`
+      );
     }
 
     const id = uuid();
@@ -106,15 +164,15 @@ export async function openCashSession(
     const ts = nowIso();
 
     await tx.execute(
-      `INSERT INTO cash_sessions (id, session_number, status, opened_by, opened_at, opening_cash, notes)
-       VALUES ($1, $2, 'OPEN', $3, $4, $5, $6)`,
-      [id, num, user.id, ts, openingCash.toFixed(2), notes.trim()]
+      `INSERT INTO cash_sessions (id, session_number, counter_code, status, opened_by, opened_at, opening_cash, notes)
+       VALUES ($1, $2, $3, 'OPEN', $4, $5, $6, $7)`,
+      [id, num, counterCode, user.id, ts, openingCash.toFixed(2), notes.trim()]
     );
 
     await tx.execute(
       `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
        VALUES ($1, $2, 'OPENING_CASH', $3, 'CASH_SESSION', $4, $5, $6, $7)`,
-      [uuid(), id, openingCash.toFixed(2), id, notes.trim() || 'Opening cash float', user.id, ts]
+      [uuid(), id, openingCash.toFixed(2), id, notes.trim() || `Opening cash float (${counterCode})`, user.id, ts]
     );
 
     await recordAudit(tx, {
@@ -125,10 +183,10 @@ export async function openCashSession(
       targetType: 'CASH_SESSION',
       targetId: id,
       transactionRef: num,
-      afterState: { openingCash: openingCash.toFixed(2) },
+      afterState: { counterCode, openingCash: openingCash.toFixed(2) },
     });
 
-    return { id, sessionNumber: num };
+    return { id, sessionNumber: num, counterCode };
   }, existingTx);
 }
 
@@ -264,6 +322,8 @@ export async function recordPartyPayment(
     referenceNo?: string;
     notes?: string;
     targetDocId?: string | null;
+    counterCode?: string | null;
+    cashSessionId?: string | null;
   },
   existingTx?: DbExecutor
 ) {
@@ -383,7 +443,7 @@ export async function recordPartyPayment(
       ]);
 
       if (input.method === 'CASH') {
-        const cashSessionId = await getActiveCashSessionId(tx);
+        const cashSessionId = await getActiveCashSessionId(tx, input.counterCode, input.cashSessionId, user.id);
         if (!cashSessionId) throw new Error('Cannot collect CASH payment without an OPEN cash session');
         await tx.execute(
           `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
@@ -517,7 +577,7 @@ export async function recordPartyPayment(
       ]);
 
       if (input.method === 'CASH') {
-        const cashSessionId = await getActiveCashSessionId(tx);
+        const cashSessionId = await getActiveCashSessionId(tx, input.counterCode, input.cashSessionId, user.id);
         if (!cashSessionId) throw new Error('Cannot pay supplier in CASH without an OPEN cash session');
         await tx.execute(
           `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
@@ -562,7 +622,8 @@ export async function reversePayment(
   user: AuthUser,
   paymentId: string,
   reason: string,
-  existingTx?: DbExecutor
+  existingTx?: DbExecutor,
+  options?: { counterCode?: string | null; cashSessionId?: string | null }
 ) {
   if (!reason?.trim()) throw new Error('Mandatory reason is required to reverse a payment');
   return withTransaction(async (tx) => {
@@ -689,7 +750,19 @@ export async function reversePayment(
     }
 
     if (pay.method === 'CASH') {
-      const cashSessionId = await getActiveCashSessionId(tx);
+      let preferredSessionId = options?.cashSessionId || null;
+      if (!preferredSessionId && !options?.counterCode) {
+        const origMove = await tx.queryOne<{ cash_session_id: string; status: string }>(
+          `SELECT cm.cash_session_id, cs.status
+           FROM cash_movements cm
+           JOIN cash_sessions cs ON cs.id = cm.cash_session_id
+           WHERE cm.reference_type = 'PAYMENT' AND cm.reference_id = $1
+           ORDER BY cm.created_at DESC LIMIT 1`,
+          [pay.id]
+        );
+        if (origMove?.status === 'OPEN') preferredSessionId = origMove.cash_session_id;
+      }
+      const cashSessionId = await getActiveCashSessionId(tx, options?.counterCode, preferredSessionId, user.id);
       if (!cashSessionId) throw new Error('Open cash session required to reverse a CASH payment');
       const signed = pay.direction === 'IN' ? amt.neg().toFixed(2) : amt.toFixed(2);
       await tx.execute(
@@ -733,6 +806,8 @@ export async function createExpense(
     paymentMethod: 'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD' | 'OTHER';
     referenceNo?: string;
     notes?: string;
+    counterCode?: string | null;
+    cashSessionId?: string | null;
   },
   existingTx?: DbExecutor
 ) {
@@ -764,7 +839,7 @@ export async function createExpense(
     );
 
     if (input.paymentMethod === 'CASH') {
-      const cashSessionId = await getActiveCashSessionId(tx);
+      const cashSessionId = await getActiveCashSessionId(tx, input.counterCode, input.cashSessionId, user.id);
       if (!cashSessionId) throw new Error('Cannot pay CASH expense without an OPEN cash session');
       await tx.execute(
         `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)
@@ -792,7 +867,8 @@ export async function reverseExpense(
   user: AuthUser,
   expenseId: string,
   reason: string,
-  existingTx?: DbExecutor
+  existingTx?: DbExecutor,
+  options?: { counterCode?: string | null; cashSessionId?: string | null }
 ) {
   if (!reason?.trim()) throw new Error('Mandatory reason is required to reverse an expense');
   return withTransaction(async (tx) => {
@@ -809,7 +885,19 @@ export async function reverseExpense(
 
     const ts = nowIso();
     if (exp.payment_method === 'CASH') {
-      const cashSessionId = await getActiveCashSessionId(tx);
+      let preferredSessionId = options?.cashSessionId || null;
+      if (!preferredSessionId && !options?.counterCode) {
+        const origMove = await tx.queryOne<{ cash_session_id: string; status: string }>(
+          `SELECT cm.cash_session_id, cs.status
+           FROM cash_movements cm
+           JOIN cash_sessions cs ON cs.id = cm.cash_session_id
+           WHERE cm.reference_type = 'EXPENSE' AND cm.reference_id = $1
+           ORDER BY cm.created_at DESC LIMIT 1`,
+          [exp.id]
+        );
+        if (origMove?.status === 'OPEN') preferredSessionId = origMove.cash_session_id;
+      }
+      const cashSessionId = await getActiveCashSessionId(tx, options?.counterCode, preferredSessionId, user.id);
       if (!cashSessionId) throw new Error('Open cash session required to reverse CASH expense');
       await tx.execute(
         `INSERT INTO cash_movements (id, cash_session_id, movement_type, amount_signed, reference_type, reference_id, notes, created_by, created_at)

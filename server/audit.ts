@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import * as XLSX from 'xlsx';
+import { writeSheetsToXlsxBuffer } from './services/excelService.ts';
 import { nowIso, uuid, type DbExecutor } from './db.ts';
 
 export interface AuditInput {
@@ -291,7 +291,6 @@ export async function queryAuditLogs(db: DbExecutor, filters: AuditQueryFilters 
 
 export async function exportAuditLogsExcelBuffer(db: DbExecutor, filters: AuditQueryFilters = {}): Promise<Buffer> {
   const { logs } = await queryAuditLogs(db, { ...filters, limit: 5000, offset: 0 });
-  const wb = XLSX.utils.book_new();
   const formatted = logs.map((l) => ({
     Seq: l.seq,
     Timestamp_UTC: l.created_at,
@@ -309,7 +308,5 @@ export async function exportAuditLogsExcelBuffer(db: DbExecutor, filters: AuditQ
     After_State: l.after_state,
     Entry_Hash: l.entry_hash,
   }));
-  const ws = XLSX.utils.json_to_sheet(formatted);
-  XLSX.utils.book_append_sheet(wb, ws, 'Audit_Logs');
-  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  return writeSheetsToXlsxBuffer([{ name: 'Audit_Logs', rows: formatted }]);
 }

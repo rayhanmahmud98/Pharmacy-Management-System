@@ -1,8 +1,8 @@
 import Decimal from 'decimal.js';
-import * as XLSX from 'xlsx';
+import { writeSheetsToXlsxBuffer } from './excelService.ts';
 import { getDb, todayDate } from '../db.ts';
 import { d, qty, roundMoney, roundQty } from '../../src/shared/decimalMath.ts';
-import { getActiveCashSessionId, getCashSessionSummary } from './financeService.ts';
+import { getOpenCashSessionsSummary, normalizeCounterCode } from './financeService.ts';
 
 function addDays(baseIsoDate: string, days: number): string {
   const dt = new Date(`${baseIsoDate}T00:00:00Z`);
@@ -10,7 +10,7 @@ function addDays(baseIsoDate: string, days: number): string {
   return dt.toISOString().slice(0, 10);
 }
 
-export async function getDashboardStats() {
+export async function getDashboardStats(counterCode?: string | null) {
   const db = await getDb();
   const today = todayDate();
   const settings = await db.queryOne<{ expiry_warning_days: number }>(
@@ -27,7 +27,7 @@ export async function getDashboardStats() {
     supplierRows,
     allBatches,
     activeMeds,
-    activeSessionId,
+    openCashSessions,
   ] = await Promise.all([
     db.query<{ net_total: string; total_cogs: string }>(
       "SELECT net_total, total_cogs FROM sales WHERE sale_date = $1 AND status = 'COMPLETED'",
@@ -64,7 +64,7 @@ export async function getDashboardStats() {
       base_unit_name: string;
       min_stock_level: string;
     }>('SELECT id, brand_name, strength, base_unit_name, min_stock_level FROM medicines WHERE is_active = TRUE'),
-    getActiveCashSessionId(db),
+    getOpenCashSessionsSummary(db),
   ]);
 
   let todayNetSales = new Decimal(0);
@@ -132,7 +132,21 @@ export async function getDashboardStats() {
       sellable_stock: m.stock.toNumber(),
     }));
 
-  const activeCashSession = activeSessionId ? await getCashSessionSummary(activeSessionId, db) : null;
+  const normalizedCounter = counterCode?.trim() ? normalizeCounterCode(counterCode) : null;
+  const activeCashSession = normalizedCounter
+    ? openCashSessions.find((s) => String(s.session.counter_code || 'COUNTER-1') === normalizedCounter) || null
+    : openCashSessions[0] || null;
+  let totalOpenDrawerExpectedCash = new Decimal(0);
+  const openDrawers = openCashSessions.map((s) => {
+    totalOpenDrawerExpectedCash = totalOpenDrawerExpectedCash.add(d(s.totals.expectedCash));
+    return {
+      id: String(s.session.id),
+      sessionNumber: String(s.session.session_number),
+      counterCode: String(s.session.counter_code || 'COUNTER-1'),
+      openedByName: String(s.session.opened_by_name || ''),
+      expectedCash: s.totals.expectedCash,
+    };
+  });
 
   const grossProfitToday = roundMoney(
     todayNetSales.sub(todayRefundTotal).sub(todayTotalCogs.sub(todayCogsReversed))
@@ -149,6 +163,10 @@ export async function getDashboardStats() {
       supplierDueTotal: roundMoney(supplierDueTotal).toFixed(2),
       activeDrawerExpectedCash: activeCashSession?.totals.expectedCash ?? null,
       activeCashSessionNumber: (activeCashSession?.session?.session_number as string) ?? null,
+      activeCounterCode: (activeCashSession?.session?.counter_code as string) ?? normalizedCounter ?? null,
+      openDrawerCount: openDrawers.length,
+      totalOpenDrawerExpectedCash: roundMoney(totalOpenDrawerExpectedCash).toFixed(2),
+      openDrawers,
     },
     alerts: {
       expiryWarningDays: warnDays,
@@ -190,6 +208,32 @@ export async function getComprehensiveReport(filters: {
     purExtra += ` AND p.supplier_id = $${purParams.length}`;
   }
 
+  const retParams: Array<string> = [fromDate, toDate];
+  let retExtra = '';
+  if (filters.customerId) {
+    retParams.push(filters.customerId);
+    retExtra += ` AND sr.customer_id = $${retParams.length}`;
+  }
+  if (filters.userId) {
+    retParams.push(filters.userId);
+    retExtra += ` AND sr.created_by = $${retParams.length}`;
+  }
+
+  const lineParams: Array<string> = [fromDate, toDate];
+  let lineExtra = '';
+  if (filters.categoryId) {
+    lineParams.push(filters.categoryId);
+    lineExtra += ` AND m.category_id = $${lineParams.length}`;
+  }
+  if (filters.customerId) {
+    lineParams.push(filters.customerId);
+    lineExtra += ` AND s.customer_id = $${lineParams.length}`;
+  }
+  if (filters.userId) {
+    lineParams.push(filters.userId);
+    lineExtra += ` AND s.created_by = $${lineParams.length}`;
+  }
+
   const [
     salesRows,
     returnRows,
@@ -210,8 +254,10 @@ export async function getComprehensiveReport(filters: {
       saleParams
     ),
     db.query<{ total_refund_value: string; total_cogs_reversed: string }>(
-      'SELECT total_refund_value, total_cogs_reversed FROM sales_returns WHERE return_date >= $1 AND return_date <= $2',
-      [fromDate, toDate]
+      `SELECT sr.total_refund_value, sr.total_cogs_reversed
+       FROM sales_returns sr
+       WHERE sr.return_date >= $1 AND sr.return_date <= $2 ${retExtra}`,
+      retParams
     ),
     db.query<{
       id: string;
@@ -229,9 +275,8 @@ export async function getComprehensiveReport(filters: {
        JOIN sales s ON s.id = sl.sale_id
        JOIN medicines m ON m.id = sl.medicine_id
        LEFT JOIN categories c ON c.id = m.category_id
-       WHERE s.status = 'COMPLETED' AND s.sale_date >= $1 AND s.sale_date <= $2
-         ${filters.categoryId ? 'AND m.category_id = $3' : ''}`,
-      filters.categoryId ? [fromDate, toDate, filters.categoryId] : [fromDate, toDate]
+       WHERE s.status = 'COMPLETED' AND s.sale_date >= $1 AND s.sale_date <= $2 ${lineExtra}`,
+      lineParams
     ),
     db.query<Record<string, unknown>>(
       `SELECT p.*, s.name AS supplier_name, u.full_name AS created_by_name
@@ -413,34 +458,12 @@ export async function getComprehensiveReport(filters: {
 
 export async function exportReportToExcelBuffer(filters: { fromDate?: string; toDate?: string }): Promise<Buffer> {
   const report = await getComprehensiveReport(filters);
-  const wb = XLSX.utils.book_new();
-
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([report.profitSummary]), 'Profit_Summary');
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.json_to_sheet(report.salesRows as Array<Record<string, unknown>>),
-    'Sales_Ledger'
-  );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.json_to_sheet(report.salesByMedicine as Array<Record<string, unknown>>),
-    'Sales_By_Medicine'
-  );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.json_to_sheet(report.inventoryValuation as Array<Record<string, unknown>>),
-    'Inventory_Valuation'
-  );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.json_to_sheet(report.purchaseRows as Array<Record<string, unknown>>),
-    'Purchases'
-  );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.json_to_sheet(report.expensesRows as Array<Record<string, unknown>>),
-    'Expenses'
-  );
-
-  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  return writeSheetsToXlsxBuffer([
+    { name: 'Profit_Summary', rows: [report.profitSummary as unknown as Record<string, unknown>] },
+    { name: 'Sales_Ledger', rows: report.salesRows as Array<Record<string, unknown>> },
+    { name: 'Sales_By_Medicine', rows: report.salesByMedicine as Array<Record<string, unknown>> },
+    { name: 'Inventory_Valuation', rows: report.inventoryValuation as Array<Record<string, unknown>> },
+    { name: 'Purchases', rows: report.purchaseRows as Array<Record<string, unknown>> },
+    { name: 'Expenses', rows: report.expensesRows as Array<Record<string, unknown>> },
+  ]);
 }

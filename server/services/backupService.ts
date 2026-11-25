@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import * as XLSX from 'xlsx';
+import { parseXlsxFirstSheetToRows, writeSheetsToXlsxBuffer } from './excelService.ts';
 import {
   BACKUP_DIR,
   closeDb,
@@ -11,6 +11,7 @@ import {
   getDb,
   getPgConnectionDetails,
   nowIso,
+  setDbMaintenanceMode,
   todayDate,
   uuid,
   withTransaction,
@@ -28,12 +29,23 @@ import { reconcileInventoryLedger } from './inventoryService.ts';
 
 const execFileAsync = promisify(execFile);
 
+async function sha256File(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
 function resolvePgBinary(tool: 'pg_dump' | 'pg_restore' | 'psql'): string {
-  const candidates: string[] = [
-    tool,
-    `/usr/local/bin/${tool}`,
-    `/usr/bin/${tool}`,
-  ];
+  const candidates: string[] = [];
+  const customBinDir = (process.env.PG_BIN_DIR || '').trim();
+  if (customBinDir) {
+    candidates.push(path.join(customBinDir, process.platform === 'win32' ? `${tool}.exe` : tool));
+  }
+  candidates.push(tool, `/usr/local/bin/${tool}`, `/usr/bin/${tool}`);
 
   // Check standard Debian/Ubuntu PostgreSQL versioned paths
   if (fs.existsSync('/usr/lib/postgresql')) {
@@ -133,7 +145,7 @@ export async function createVerifiedBackup(
     if (stat.size <= 0) {
       throw new Error('pg_dump produced an empty backup file');
     }
-    const sha256 = crypto.createHash('sha256').update(fs.readFileSync(targetPath)).digest('hex');
+    const sha256 = await sha256File(targetPath);
 
     await withTransaction(async (tx) => {
       await tx.execute(
@@ -273,7 +285,7 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
     throw new Error(msg);
   }
 
-  const actualSha256 = crypto.createHash('sha256').update(fs.readFileSync(rec.file_path)).digest('hex');
+  const actualSha256 = await sha256File(rec.file_path);
   const expectedBuf = Buffer.from(rec.sha256.toLowerCase(), 'utf8');
   const actualBuf = Buffer.from(actualSha256.toLowerCase(), 'utf8');
   if (expectedBuf.length !== actualBuf.length || !crypto.timingSafeEqual(expectedBuf, actualBuf)) {
@@ -301,10 +313,12 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
 
   const preRestorePath = path.join(BACKUP_DIR, preRestore.filename);
 
-  // Close Node pool before dropping/recreating tables via pg_restore so active sockets do not block DDL
+  // Block incoming pool re-initialization while pg_restore drops/recreates tables
+  setDbMaintenanceMode(true);
   await closeDb();
   try {
     await executePgRestoreArchive(rec.file_path);
+    setDbMaintenanceMode(false);
 
     const restoredDb = await getDb();
     const auditVerification = await verifyAuditChain(restoredDb);
@@ -347,9 +361,11 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
   } catch (restoreErr) {
     const msg = (restoreErr as Error).message;
     try {
+      setDbMaintenanceMode(true);
       await closeDb();
       if (fs.existsSync(preRestorePath)) {
         await executePgRestoreArchive(preRestorePath);
+        setDbMaintenanceMode(false);
         await getDb();
         await recordRestoreFailureAudit(
           user,
@@ -362,11 +378,12 @@ export async function restoreFromBackup(user: AuthUser, backupId: string) {
       // Preserve primary error
     }
     throw restoreErr;
+  } finally {
+    setDbMaintenanceMode(false);
   }
 }
 
-export function buildMedicineImportTemplateBuffer(): Buffer {
-  const wb = XLSX.utils.book_new();
+export async function buildMedicineImportTemplateBuffer(): Promise<Buffer> {
   const sampleRows = [
     {
       medicine_code: 'MED-0101',
@@ -392,9 +409,7 @@ export function buildMedicineImportTemplateBuffer(): Buffer {
       selling_price_per_base: 9.0,
     },
   ];
-  const ws = XLSX.utils.json_to_sheet(sampleRows);
-  XLSX.utils.book_append_sheet(wb, ws, 'Medicines_Import');
-  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  return writeSheetsToXlsxBuffer([{ name: 'Medicines_Import', rows: sampleRows }]);
 }
 
 export interface ParsedImportRow {
@@ -426,10 +441,9 @@ export interface ParsedImportRow {
 }
 
 export async function parseAndValidateExcelImport(buffer: Buffer): Promise<ParsedImportRow[]> {
-  const wb = XLSX.read(buffer, { type: 'buffer' });
-  const sheetName = wb.SheetNames[0];
-  if (!sheetName) throw new Error('Excel workbook contains no sheets');
-  const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[sheetName], { defval: '' });
+  const rows = await parseXlsxFirstSheetToRows(buffer, {
+    requiredHeaders: ['brand_name', 'generic_name', 'base_unit'],
+  });
   const db = await getDb();
   const today = todayDate();
   const seenBarcodes = new Set<string>();

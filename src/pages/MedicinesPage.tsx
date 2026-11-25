@@ -252,8 +252,17 @@ export const MedicinesPage: React.FC<Props> = ({ user }) => {
 
   async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
     setError('');
+    if (!file.name.toLowerCase().endsWith('.xlsx')) {
+      setError('Only .xlsx Excel workbooks are supported. Please save your spreadsheet as .xlsx.');
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setError('Excel file exceeds the 5 MB upload limit.');
+      return;
+    }
     const buf = await file.arrayBuffer();
     const bytes = new Uint8Array(buf);
     let binary = '';
@@ -896,7 +905,7 @@ export const MedicinesPage: React.FC<Props> = ({ user }) => {
 
             <input
               type="file"
-              accept=".xlsx,.xls"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
               onChange={handleFileSelect}
               className="text-xs text-slate-700"
             />

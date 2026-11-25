@@ -472,8 +472,8 @@ export async function seedDatabaseIfEmpty(): Promise<void> {
     // 10. Open Cash Session
     const sessionId = uuid();
     await tx.execute(
-      `INSERT INTO cash_sessions (id, session_number, status, opened_by, opened_at, opening_cash, notes)
-       VALUES ($1, $2, 'OPEN', $3, $4, $5, $6)`,
+      `INSERT INTO cash_sessions (id, session_number, counter_code, status, opened_by, opened_at, opening_cash, notes)
+       VALUES ($1, $2, 'COUNTER-1', 'OPEN', $3, $4, $5, $6)`,
       [sessionId, `CSH-${datePart}-0001`, adminId, ts, '5000.00', 'Morning counter float']
     );
 

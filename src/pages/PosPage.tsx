@@ -6,7 +6,9 @@ import {
   checkStrictDecimalInput,
   formatMoney,
   formatQty,
+  getCounterCode,
   newIdempotencyKey,
+  setCounterCode,
 } from '../lib/api';
 import type { AuthUser, Medicine, PharmacySettings, SaleRecord } from '../types';
 import { ReceiptPrintModal } from '../components/ReceiptPrintModal';
@@ -48,6 +50,8 @@ export const PosPage: React.FC<Props> = ({ user, settings }) => {
   const [medicines, setMedicines] = useState<Medicine[]>([]);
   const [customers, setCustomers] = useState<CustomerOption[]>([]);
   const [selectedCustomerId, setSelectedCustomerId] = useState('');
+  const [counterCode, setCounterCodeState] = useState<string>(() => getCounterCode());
+  const [activeCounterSession, setActiveCounterSession] = useState<string | null>(null);
   const [cart, setCart] = useState<CartLine[]>([]);
   const [invoiceDiscount, setInvoiceDiscount] = useState('0');
   const [payments, setPayments] = useState<PaymentEntry[]>([
@@ -59,8 +63,17 @@ export const PosPage: React.FC<Props> = ({ user, settings }) => {
   const [successMsg, setSuccessMsg] = useState('');
   const [completedSale, setCompletedSale] = useState<SaleRecord | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const submitLockRef = useRef(false);
   const idempotencyKeyRef = useRef<string>(newIdempotencyKey());
   const currencySym = settings.currency_symbol || '৳';
+
+  async function loadCounterSession(counter = counterCode) {
+    const fin = await apiFetch<{ activeSummary: { session: { session_number: string } } | null }>(
+      `/api/finance?counterCode=${encodeURIComponent(counter)}`,
+      { headers: { 'X-Counter-Id': counter } }
+    );
+    setActiveCounterSession(fin.activeSummary?.session.session_number ?? null);
+  }
 
   async function loadCatalog(q = '') {
     const [medRes, partyRes] = await Promise.all([
@@ -76,7 +89,7 @@ export const PosPage: React.FC<Props> = ({ user, settings }) => {
   }
 
   useEffect(() => {
-    loadCatalog('').catch((e) => setError(e.message));
+    Promise.all([loadCatalog(''), loadCounterSession(counterCode)]).catch((e) => setError(e.message));
   }, []);
 
   useEffect(() => {
@@ -210,6 +223,7 @@ export const PosPage: React.FC<Props> = ({ user, settings }) => {
 
   async function handleCheckout(e: React.FormEvent) {
     e.preventDefault();
+    if (submitLockRef.current || submitting || cart.length === 0) return;
 
     // Strict client-side decimal checks before posting
     for (const l of cart) {
@@ -248,6 +262,7 @@ export const PosPage: React.FC<Props> = ({ user, settings }) => {
       }
     }
 
+    submitLockRef.current = true;
     setError('');
     setSuccessMsg('');
     setSubmitting(true);
@@ -256,8 +271,10 @@ export const PosPage: React.FC<Props> = ({ user, settings }) => {
         method: 'POST',
         headers: {
           'Idempotency-Key': idempotencyKeyRef.current,
+          'X-Counter-Id': counterCode,
         },
         body: JSON.stringify({
+          counterCode,
           customerId: selectedCustomerId || null,
           invoiceDiscount: invoiceDiscount || '0',
           notes,
@@ -283,10 +300,11 @@ export const PosPage: React.FC<Props> = ({ user, settings }) => {
       setInvoiceDiscount('0');
       setNotes('');
       setPayments([{ key: 'p1', method: 'CASH', amount: '', referenceNo: '' }]);
-      await loadCatalog(search);
+      await Promise.all([loadCatalog(search), loadCounterSession(counterCode)]);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Checkout failed');
     } finally {
+      submitLockRef.current = false;
       setSubmitting(false);
     }
   }
@@ -302,12 +320,35 @@ export const PosPage: React.FC<Props> = ({ user, settings }) => {
             Press <kbd className="px-1.5 py-0.5 bg-slate-200 rounded text-[11px] font-mono-num">F2</kbd> to focus search · Scan barcode + Enter to quick-add · Expired &amp; quarantined batches are excluded
           </p>
         </div>
-        {successMsg && (
-          <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-md text-xs font-medium">
-            <CheckCircle2 className="w-4 h-4" />
-            {successMsg}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-white border border-slate-300 rounded-md text-xs">
+            <label htmlFor="pos-counter-select" className="text-slate-500 font-medium">Counter:</label>
+            <select
+              id="pos-counter-select"
+              value={counterCode}
+              onChange={(e) => {
+                const next = setCounterCode(e.target.value);
+                setCounterCodeState(next);
+                idempotencyKeyRef.current = newIdempotencyKey();
+                loadCounterSession(next).catch((err) => setError(err.message));
+              }}
+              className="font-mono-num font-semibold text-slate-900 bg-transparent focus:outline-none"
+            >
+              {['COUNTER-1', 'COUNTER-2', 'COUNTER-3', 'COUNTER-4', ...( ['COUNTER-1', 'COUNTER-2', 'COUNTER-3', 'COUNTER-4'].includes(counterCode) ? [] : [counterCode] )].map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+            <span className={`font-mono-num font-semibold ${activeCounterSession ? 'text-emerald-700' : 'text-amber-700'}`}>
+              {activeCounterSession ? `· ${activeCounterSession}` : '· Drawer Closed'}
+            </span>
           </div>
-        )}
+          {successMsg && (
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-md text-xs font-medium">
+              <CheckCircle2 className="w-4 h-4" />
+              {successMsg}
+            </div>
+          )}
+        </div>
       </div>
 
       {error && (
@@ -648,7 +689,10 @@ export const PosPage: React.FC<Props> = ({ user, settings }) => {
                 type="text"
                 placeholder="Optional invoice notes..."
                 value={notes}
-                onChange={(e) => setNotes(e.target.value)}
+                onChange={(e) => {
+                  idempotencyKeyRef.current = newIdempotencyKey();
+                  setNotes(e.target.value);
+                }}
                 className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded"
               />
             </div>
@@ -701,6 +745,7 @@ export const PosPage: React.FC<Props> = ({ user, settings }) => {
                 idempotencyKeyRef.current = newIdempotencyKey();
                 setCart([]);
                 setInvoiceDiscount('0');
+                setNotes('');
                 setPayments([{ key: 'p1', method: 'CASH', amount: '', referenceNo: '' }]);
               }}
               className="px-4 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md"

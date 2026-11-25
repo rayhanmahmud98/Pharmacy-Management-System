@@ -53,6 +53,8 @@ import {
   createExpense,
   getActiveCashSessionId,
   getCashSessionSummary,
+  getOpenCashSessionsSummary,
+  normalizeCounterCode,
   openCashSession,
   recordPartyPayment,
   reverseExpense,
@@ -70,19 +72,43 @@ import {
   getComprehensiveReport,
   getDashboardStats,
 } from './services/reportService.ts';
+import {
+  MAX_XLSX_BASE64_CHARS,
+  MAX_XLSX_IMPORT_ROWS,
+  MAX_XLSX_UPLOAD_BYTES,
+} from './services/excelService.ts';
 import { d, qty, validateCurrencyInput, validateQuantityInput } from '../src/shared/decimalMath.ts';
 
 function getLanAddresses(port: number): string[] {
   const ifaces = os.networkInterfaces();
   const urls: string[] = [`http://localhost:${port}`];
+  const lanIps: string[] = [];
   for (const entries of Object.values(ifaces)) {
     for (const iface of entries || []) {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        urls.push(`http://${iface.address}:${port}`);
+      if (iface.family === 'IPv4' && !iface.internal && !iface.address.startsWith('169.254.')) {
+        lanIps.push(iface.address);
       }
     }
   }
+  lanIps.sort((a, b) => {
+    const aPrivate = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a) ? 0 : 1;
+    const bPrivate = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(b) ? 0 : 1;
+    return aPrivate - bPrivate || a.localeCompare(b);
+  });
+  for (const ip of lanIps) {
+    urls.push(`http://${ip}:${port}`);
+  }
   return urls;
+}
+
+function getCounterFromReq(req: express.Request): string | undefined {
+  const body = req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : null;
+  const raw =
+    (typeof body?.counterCode === 'string' && body.counterCode.trim()) ||
+    (typeof req.query.counterCode === 'string' && req.query.counterCode.trim()) ||
+    req.get('x-counter-id') ||
+    '';
+  return raw ? String(raw).trim() : undefined;
 }
 
 export function buildApiRouter() {
@@ -479,8 +505,8 @@ export function buildApiRouter() {
   router.get(
     '/dashboard',
     requireAuth,
-    handle(async (_req, res) => {
-      res.json(await getDashboardStats());
+    handle(async (req, res) => {
+      res.json(await getDashboardStats(getCounterFromReq(req)));
     })
   );
 
@@ -544,12 +570,23 @@ export function buildApiRouter() {
       const name = String(req.body.name || '').trim();
       if (!name) throw new Error('Category name is required');
       const id = uuid();
-      const db = await getDb();
-      await db.execute('INSERT INTO categories (id, name, description) VALUES ($1, $2, $3)', [
-        id,
-        name,
-        String(req.body.description || ''),
-      ]);
+      await withTransaction(async (tx) => {
+        await tx.execute('INSERT INTO categories (id, name, description) VALUES ($1, $2, $3)', [
+          id,
+          name,
+          String(req.body.description || ''),
+        ]);
+        await recordAudit(tx, {
+          userId: req.authUser!.id,
+          username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
+          action: 'CREATE_CATEGORY',
+          module: 'medicines',
+          targetType: 'CATEGORY',
+          targetId: id,
+          afterState: { name },
+        });
+      });
       res.status(201).json({ id, name });
     })
   );
@@ -562,13 +599,24 @@ export function buildApiRouter() {
       const name = String(req.body.name || '').trim();
       if (!name) throw new Error('Manufacturer name is required');
       const id = uuid();
-      const db = await getDb();
-      await db.execute('INSERT INTO manufacturers (id, name, country, phone) VALUES ($1, $2, $3, $4)', [
-        id,
-        name,
-        String(req.body.country || 'Bangladesh'),
-        String(req.body.phone || ''),
-      ]);
+      await withTransaction(async (tx) => {
+        await tx.execute('INSERT INTO manufacturers (id, name, country, phone) VALUES ($1, $2, $3, $4)', [
+          id,
+          name,
+          String(req.body.country || 'Bangladesh'),
+          String(req.body.phone || ''),
+        ]);
+        await recordAudit(tx, {
+          userId: req.authUser!.id,
+          username: req.authUser!.username,
+          ipAddress: extractClientIp(req),
+          action: 'CREATE_MANUFACTURER',
+          module: 'medicines',
+          targetType: 'MANUFACTURER',
+          targetId: id,
+          afterState: { name },
+        });
+      });
       res.status(201).json({ id, name });
     })
   );
@@ -578,8 +626,8 @@ export function buildApiRouter() {
     '/medicines/import/template',
     requireAuth,
     requirePermission('medicines.manage'),
-    handle((_req, res) => {
-      const buf = buildMedicineImportTemplateBuffer();
+    handle(async (_req, res) => {
+      const buf = await buildMedicineImportTemplateBuffer();
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="medinest_medicine_import_template.xlsx"');
       res.send(buf);
@@ -591,9 +639,17 @@ export function buildApiRouter() {
     requireAuth,
     requirePermission('medicines.manage'),
     handle(async (req, res) => {
-      const { fileBase64 } = req.body as { fileBase64?: string };
-      if (!fileBase64) throw new Error('Excel file payload is required');
+      const { fileBase64 } = req.body as { fileBase64?: unknown };
+      if (typeof fileBase64 !== 'string' || !fileBase64.trim()) {
+        throw new Error('Excel file payload is required');
+      }
+      if (fileBase64.length > MAX_XLSX_BASE64_CHARS) {
+        throw new Error(`Excel file exceeds maximum upload size of ${Math.round(MAX_XLSX_UPLOAD_BYTES / (1024 * 1024))} MB`);
+      }
       const buf = Buffer.from(fileBase64, 'base64');
+      if (buf.length === 0 || buf.length > MAX_XLSX_UPLOAD_BYTES) {
+        throw new Error(`Excel file must be a non-empty .xlsx workbook up to ${Math.round(MAX_XLSX_UPLOAD_BYTES / (1024 * 1024))} MB`);
+      }
       const preview = await parseAndValidateExcelImport(buf);
       res.json({ rows: preview });
     })
@@ -606,6 +662,9 @@ export function buildApiRouter() {
     handle(async (req, res) => {
       const { rows } = req.body as { rows?: Parameters<typeof executeExcelImport>[1] };
       if (!rows || !Array.isArray(rows)) throw new Error('Rows array required');
+      if (rows.length > MAX_XLSX_IMPORT_ROWS) {
+        throw new Error(`Import batch exceeds maximum allowed limit of ${MAX_XLSX_IMPORT_ROWS} rows`);
+      }
       const result = await executeExcelImport(req.authUser!, rows);
       res.json(result);
     })
@@ -764,7 +823,9 @@ export function buildApiRouter() {
       if (req.body.status === 'RECEIVED' && !req.authUser!.permissions['purchases.receive']) {
         throw new Error('Permission denied: receiving stock requires purchases.receive');
       }
-      await withIdempotency(req, res, 'POST:/purchases', 201, (tx) => createPurchase(req.authUser!, req.body, tx));
+      await withIdempotency(req, res, 'POST:/purchases', 201, (tx) =>
+        createPurchase(req.authUser!, { ...req.body, counterCode: getCounterFromReq(req) }, tx)
+      );
     })
   );
 
@@ -775,12 +836,16 @@ export function buildApiRouter() {
     handle(async (req, res) => {
       const id = String(req.params.id);
       await withIdempotency(req, res, `POST:/purchases/${id}/receive`, 200, async (tx) => {
-        const { paidAmount, paymentMethod, applyAdvance } = req.body as {
+        const { paidAmount, paymentMethod, applyAdvance, cashSessionId } = req.body as {
           paidAmount?: string;
           paymentMethod?: 'CASH' | 'BKASH' | 'NAGAD' | 'ROCKET' | 'BANK' | 'CARD' | 'OTHER';
           applyAdvance?: boolean;
+          cashSessionId?: string;
         };
-        await receiveDraftPurchase(req.authUser!, id, paidAmount, paymentMethod, applyAdvance, tx);
+        await receiveDraftPurchase(req.authUser!, id, paidAmount, paymentMethod, applyAdvance, tx, {
+          counterCode: getCounterFromReq(req),
+          cashSessionId: cashSessionId || null,
+        });
         return { ok: true };
       });
     })
@@ -801,8 +866,14 @@ export function buildApiRouter() {
     requireAuth,
     requirePermission('purchases.reverse'),
     handle(async (req, res) => {
-      await reversePurchase(req.authUser!, String(req.params.id), String(req.body.reason || ''));
-      res.json({ ok: true });
+      const id = String(req.params.id);
+      await withIdempotency(req, res, `POST:/purchases/${id}/reverse`, 200, async (tx) => {
+        await reversePurchase(req.authUser!, id, String(req.body.reason || ''), tx, {
+          counterCode: getCounterFromReq(req),
+          cashSessionId: typeof req.body.cashSessionId === 'string' ? req.body.cashSessionId : null,
+        });
+        return { ok: true };
+      });
     })
   );
 
@@ -812,7 +883,7 @@ export function buildApiRouter() {
     requirePermission('purchases.return'),
     handle(async (req, res) => {
       await withIdempotency(req, res, 'POST:/purchase-returns', 201, (tx) =>
-        createPurchaseReturn(req.authUser!, req.body, tx)
+        createPurchaseReturn(req.authUser!, { ...req.body, counterCode: getCounterFromReq(req) }, tx)
       );
     })
   );
@@ -975,7 +1046,9 @@ export function buildApiRouter() {
     requireAuth,
     requirePermission('pos.sell'),
     handle(async (req, res) => {
-      await withIdempotency(req, res, 'POST:/sales', 201, (tx) => completeSale(req.authUser!, req.body, tx));
+      await withIdempotency(req, res, 'POST:/sales', 201, (tx) =>
+        completeSale(req.authUser!, { ...req.body, counterCode: getCounterFromReq(req) }, tx)
+      );
     })
   );
 
@@ -984,8 +1057,14 @@ export function buildApiRouter() {
     requireAuth,
     requirePermission('sales.reverse'),
     handle(async (req, res) => {
-      await reverseSale(req.authUser!, String(req.params.id), String(req.body.reason || ''));
-      res.json({ ok: true });
+      const id = String(req.params.id);
+      await withIdempotency(req, res, `POST:/sales/${id}/reverse`, 200, async (tx) => {
+        await reverseSale(req.authUser!, id, String(req.body.reason || ''), tx, {
+          counterCode: getCounterFromReq(req),
+          cashSessionId: typeof req.body.cashSessionId === 'string' ? req.body.cashSessionId : null,
+        });
+        return { ok: true };
+      });
     })
   );
 
@@ -995,7 +1074,7 @@ export function buildApiRouter() {
     requirePermission('sales.return'),
     handle(async (req, res) => {
       await withIdempotency(req, res, 'POST:/sales-returns', 201, (tx) =>
-        createSalesReturn(req.authUser!, req.body, tx)
+        createSalesReturn(req.authUser!, { ...req.body, counterCode: getCounterFromReq(req) }, tx)
       );
     })
   );
@@ -1169,7 +1248,9 @@ export function buildApiRouter() {
     requireAuth,
     requirePermission('payments.record'),
     handle(async (req, res) => {
-      await withIdempotency(req, res, 'POST:/payments', 201, (tx) => recordPartyPayment(req.authUser!, req.body, tx));
+      await withIdempotency(req, res, 'POST:/payments', 201, (tx) =>
+        recordPartyPayment(req.authUser!, { ...req.body, counterCode: getCounterFromReq(req) }, tx)
+      );
     })
   );
 
@@ -1178,8 +1259,14 @@ export function buildApiRouter() {
     requireAuth,
     requirePermission('payments.reverse'),
     handle(async (req, res) => {
-      await reversePayment(req.authUser!, String(req.params.id), String(req.body.reason || ''));
-      res.json({ ok: true });
+      const id = String(req.params.id);
+      await withIdempotency(req, res, `POST:/payments/${id}/reverse`, 200, async (tx) => {
+        await reversePayment(req.authUser!, id, String(req.body.reason || ''), tx, {
+          counterCode: getCounterFromReq(req),
+          cashSessionId: typeof req.body.cashSessionId === 'string' ? req.body.cashSessionId : null,
+        });
+        return { ok: true };
+      });
     })
   );
 
@@ -1187,11 +1274,26 @@ export function buildApiRouter() {
   router.get(
     '/finance',
     requireAuth,
-    handle(async (_req, res) => {
+    handle(async (req, res) => {
       const db = await getDb();
-      const activeId = await getActiveCashSessionId(db);
-      const [activeSummary, sessions, expenseCategories, expenses] = await Promise.all([
+      const requestedCounter = getCounterFromReq(req);
+      const currentCounter = normalizeCounterCode(requestedCounter || 'COUNTER-1');
+      const requestedSessionId = req.query.sessionId ? String(req.query.sessionId) : null;
+
+      let activeId: string | null = null;
+      if (requestedSessionId) {
+        const sRow = await db.queryOne<{ id: string }>(
+          "SELECT id FROM cash_sessions WHERE id = $1 AND status = 'OPEN'",
+          [requestedSessionId]
+        );
+        activeId = sRow?.id ?? null;
+      } else {
+        activeId = await getActiveCashSessionId(db, currentCounter);
+      }
+
+      const [activeSummary, openSessions, sessions, expenseCategories, expenses] = await Promise.all([
         activeId ? getCashSessionSummary(activeId, db) : Promise.resolve(null),
+        getOpenCashSessionsSummary(db),
         db.query(
           `SELECT cs.*, u1.full_name as opened_by_name, u2.full_name as closed_by_name
            FROM cash_sessions cs
@@ -1208,7 +1310,7 @@ export function buildApiRouter() {
            ORDER BY e.created_at DESC LIMIT 100`
         ),
       ]);
-      res.json({ activeSummary, sessions, expenseCategories, expenses });
+      res.json({ currentCounter, activeSummary, openSessions, sessions, expenseCategories, expenses });
     })
   );
 
@@ -1218,8 +1320,8 @@ export function buildApiRouter() {
     requirePermission('cash.open'),
     handle(async (req, res) => {
       await withIdempotency(req, res, 'POST:/cash-sessions/open', 201, (tx) => {
-        const { openingCash, notes } = req.body as { openingCash?: string; notes?: string };
-        return openCashSession(req.authUser!, openingCash || '0', notes || '', tx);
+        const { openingCash, notes } = req.body as { openingCash?: string; notes?: string; counterCode?: string };
+        return openCashSession(req.authUser!, openingCash || '0', notes || '', tx, getCounterFromReq(req));
       });
     })
   );
@@ -1241,7 +1343,9 @@ export function buildApiRouter() {
     requireAuth,
     requirePermission('expenses.manage'),
     handle(async (req, res) => {
-      await withIdempotency(req, res, 'POST:/expenses', 201, (tx) => createExpense(req.authUser!, req.body, tx));
+      await withIdempotency(req, res, 'POST:/expenses', 201, (tx) =>
+        createExpense(req.authUser!, { ...req.body, counterCode: getCounterFromReq(req) }, tx)
+      );
     })
   );
 
@@ -1250,8 +1354,14 @@ export function buildApiRouter() {
     requireAuth,
     requirePermission('expenses.reverse'),
     handle(async (req, res) => {
-      await reverseExpense(req.authUser!, String(req.params.id), String(req.body.reason || ''));
-      res.json({ ok: true });
+      const id = String(req.params.id);
+      await withIdempotency(req, res, `POST:/expenses/${id}/reverse`, 200, async (tx) => {
+        await reverseExpense(req.authUser!, id, String(req.body.reason || ''), tx, {
+          counterCode: getCounterFromReq(req),
+          cashSessionId: typeof req.body.cashSessionId === 'string' ? req.body.cashSessionId : null,
+        });
+        return { ok: true };
+      });
     })
   );
 
@@ -1267,6 +1377,7 @@ export function buildApiRouter() {
         categoryId: req.query.categoryId ? String(req.query.categoryId) : undefined,
         supplierId: req.query.supplierId ? String(req.query.supplierId) : undefined,
         customerId: req.query.customerId ? String(req.query.customerId) : undefined,
+        userId: req.query.userId ? String(req.query.userId) : undefined,
       });
       if (!req.authUser!.permissions['reports.profit']) {
         data.profitSummary = {
@@ -1767,6 +1878,10 @@ export function buildApiRouter() {
       res.json(result);
     })
   );
+
+  router.use((_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found' });
+  });
 
   return router;
 }
